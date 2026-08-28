@@ -6,7 +6,7 @@
 
 | 目录 | 说明 | 接入方式 |
 | --- | --- | --- |
-| `lanhu-vision-mcp/` | 蓝湖设计稿抽取 + 视觉验证（UI 缺陷检测 / E2E 失败归因）的零依赖 stdio MCP server | 见其内 `README.md` 与 `.mcp.json` |
+| `lanhu-vision-mcp/` | 蓝湖设计稿读取（官方 API + 分组枚举）+ 视觉理解/验收（UI 缺陷检测 / E2E 归因）的零依赖 stdio MCP server | 见其内 `README.md` 与 `.mcp.json` |
 
 ## 约定
 

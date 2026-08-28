@@ -3,3 +3,6 @@
 
 # Node 依赖（若某 MCP 需本地装包）
 **/node_modules/
+
+# TypeScript 编译产物
+**/dist/

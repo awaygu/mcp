@@ -1,37 +1,44 @@
 {
   "name": "lanhu-vision-mcp",
-  "version": "1.0.0",
-  "description": "MCP server that lets coding agents read Lanhu (蓝湖) design specs and verify rendered UI with a vision model. Zero runtime dependencies — only Node built-ins.",
+  "version": "2.0.0",
+  "description": "蓝湖设计稿 MCP Server — 官方 API 读稿 + 分组枚举 + 视觉理解/验收",
   "type": "module",
+  "main": "dist/index.js",
   "bin": {
-    "lanhu-vision-mcp": "server.mjs"
-  },
-  "scripts": {
-    "start": "node server.mjs",
-    "verify": "node verify.mjs",
-    "login": "node lanhu-login.mjs"
+    "lanhu-vision-mcp": "dist/index.js"
   },
   "files": [
-    "server.mjs",
-    "verify.mjs",
-    "scrape-lanhu.mjs",
-    "lanhu-login.mjs",
+    "dist",
     "README.md"
   ],
-  "engines": {
-    "node": ">=18"
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "login": "node lanhu-login.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "lanhu",
+    "design-to-code",
+    "vision"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "zod": "^3.24.4"
   },
   "optionalDependencies": {
     "playwright": "^1.49.0"
   },
-  "license": "MIT",
-  "keywords": [
-    "mcp",
-    "lanhu",
-    "blue-lake",
-    "vision",
-    "ui-testing",
-    "design-to-code",
-    "e2e-triage"
-  ]
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
 }

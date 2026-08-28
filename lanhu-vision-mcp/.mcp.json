@@ -2,13 +2,13 @@
   "mcpServers": {
     "lanhu-vision": {
       "command": "node",
-      "args": ["./server.mjs"],
+      "args": ["./dist/index.js"],
       "env": {
         "DEEPSEEK_API_KEY": "sk-xxx",
         "VISION_BASE_URL": "https://api.deepseek.com",
         "LANHU_VISION_MODEL": "deepseek-v4-flash-vision-exp",
         "LANHU_CODEGEN_MODEL": "deepseek-chat",
-        "LANHU_API_KEY": "optional-lanhu-enterprise-key"
+        "LANHU_STORAGE_STATE": "./.auth/lanhu-storage-state.json"
       }
     }
   }

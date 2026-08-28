@@ -21,7 +21,7 @@ const LOGIN_URL = process.env.LANHU_LOGIN_URL || 'https://lanhuapp.com/';
 const OUT = process.env.LANHU_STORAGE_STATE || '.auth/lanhu-storage-state.json';
 
 async function main() {
-  const browser = await chromium.launch({ headless: false });
+  const browser = await chromium.launch({ headless: false, channel: 'chrome' });
   const context = await browser.newContext();
   const page = await context.newPage();
   console.log(`请在打开的浏览器中登录蓝湖：${LOGIN_URL}`);
