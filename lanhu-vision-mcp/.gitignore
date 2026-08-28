@@ -1,0 +1,2 @@
+# 普通账号登录态（含 cookie/localStorage，含凭据，勿提交）
+.auth/
