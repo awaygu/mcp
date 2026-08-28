@@ -45,6 +45,12 @@ export function normalizeShape(shape: Record<string, any>): DesignLayer {
     h,
   };
   if (shape.name) layer.name = shape.name;
+  // 切图 URL（hasExportImage 的图层才有，artboard/bitmapLayer 均放在 shape.image）
+  if (shape.image?.imageUrl) {
+    layer.imageUrl = shape.image.imageUrl;
+    if (shape.image.svgUrl) layer.svgUrl = shape.image.svgUrl;
+  }
+  if (shape.hasExportImage) layer.hasExportImage = true;
   if (layer.type === 'text') {
     const rawText = shape.text;
     layer.text = (typeof rawText === 'string' ? rawText : (textStyle?.content ?? rawText?.value ?? '')) || undefined;

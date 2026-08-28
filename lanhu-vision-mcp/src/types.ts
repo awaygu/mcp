@@ -19,6 +19,10 @@ export interface DesignLayer {
   // 非 text 图层
   fill?: string;
   radius?: number;
+  // 切图（hasExportImage 的图层）：开发时下载引用
+  imageUrl?: string;
+  svgUrl?: string;
+  hasExportImage?: boolean;
 }
 
 export interface DesignMeta {
@@ -40,6 +44,8 @@ export interface DesignResult {
   visionAnalysis?: unknown;
   coverImageBase64?: string;
   screenshotBase64?: string;
+  // 切图清单（hasExportImage 的图层，开发时下载引用）
+  slices?: SliceInfo[];
 }
 
 export interface SectorDesign {
@@ -52,6 +58,17 @@ export interface SectorInfo {
   name: string;
   designCount: number;
   designs: SectorDesign[];
+}
+
+// 切图信息（一个设计稿的导出图层）
+export interface SliceInfo {
+  name: string;
+  imageUrl: string;     // PNG
+  svgUrl?: string;      // SVG
+  x: number;
+  y: number;
+  w: number;
+  h: number;
 }
 
 export interface Credentials {

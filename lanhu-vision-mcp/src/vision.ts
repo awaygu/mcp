@@ -3,7 +3,7 @@ import { request as httpsRequest } from 'node:https';
 import { request as httpRequest } from 'node:http';
 
 const MODEL = process.env.LANHU_VISION_MODEL || 'deepseek-v4-flash-vision-exp';
-const API_KEY = process.env.DEEPSEEK_API_KEY || '';
+const API_KEY = process.env.LLM_API_KEY || '';
 const BASE_URL = (process.env.VISION_BASE_URL || 'https://api.deepseek.com').replace(/\/$/, '');
 
 // 视觉模型理解设计稿的 prompt（analyze 用）

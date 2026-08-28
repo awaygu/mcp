@@ -5,8 +5,9 @@ opencode）获得三件事：
 
 - **读蓝湖的眼睛**：通过蓝湖官方 API（Cookie 直调，无需浏览器）取结构化图层树
   （x/y/宽高/色值/字号/圆角/文本），精确数值来自结构化数据，**不靠视觉模型 OCR 截图上的小字**。
-- **按项目/分组组织**：`lanhu_list_sectors` 列项目分组，`lanhu_read_sector` 按分组批量读，
-  支持「项目 → 分组（需求）→ 设计稿」的完整层级。
+- **按项目/分组组织**：`lanhu_list_directory` 一次拉全团队目录（**无需链接**，项目→分组一页地图），
+  `lanhu_read_sector` 按分组批量读，支持「团队 → 项目 → 分组（需求）→ 设计稿」完整层级。
+- **下载切图**：`lanhu_download_slices` 把设计稿切图素材拉到本地 assets，供开发引用。
 - **视觉理解 + 验收**：`analyze` 用配置的视觉模型理解设计稿封面图；`lanhu_verify_render` /
   `vision_defect_check` / `vision_e2e_triage` 做渲染对比、UI 缺陷检测、E2E 失败归因。
 
@@ -39,7 +40,7 @@ node lanhu-login.mjs
 
 ### 2. 配置视觉模型（analyze / 验收需要）
 
-配置 `DEEPSEEK_API_KEY`（视觉模型 Key），可选 `LANHU_VISION_MODEL`。
+配置 `LLM_API_KEY`（视觉模型 Key），可选 `LANHU_VISION_MODEL`。
 
 ### 3. 接入 Agent（项目根 `.mcp.json`）
 
@@ -50,25 +51,26 @@ node lanhu-login.mjs
       "command": "node",
       "args": ["./mcp/lanhu-vision-mcp/dist/index.js"],
       "env": {
-        "DEEPSEEK_API_KEY": "${DEEPSEEK_API_KEY}",
+        "LLM_API_KEY": "${LLM_API_KEY}",
         "VISION_BASE_URL": "https://api.deepseek.com",
         "LANHU_VISION_MODEL": "deepseek-v4-flash-vision-exp",
-        "LANHU_STORAGE_STATE": "D:/gutaiwei/dream-site/mcp/lanhu-vision-mcp/.auth/lanhu-storage-state.json"
+        "LANHU_STORAGE_STATE": "./mcp/lanhu-vision-mcp/.auth/lanhu-storage-state.json"
       }
     }
   }
 }
 ```
 
-`${DEEPSEEK_API_KEY}` 从 shell 环境变量展开，避免密钥入库。
+`${LLM_API_KEY}` 从 shell 环境变量展开，避免密钥入库。
 
 ## 工具一览
 
 | 工具 | 作用 | 关键入参 |
 |---|---|---|
 | `lanhu_fetch_design` | 读单个设计稿图层树（+可选视觉理解） | `url` / `mode`(api/scrape/mock) / `analyze` / `storageState` |
-| `lanhu_list_sectors` | 列项目下所有分组（一个分组=一个需求） | `url` / `storageState` |
-| `lanhu_read_sector` | 按分组名批量读该分组所有稿的图层树 | `url` / `sector` / `storageState` |
+| `lanhu_list_directory` | 一次拉全团队目录（项目→分组，**无需链接**）。约 1.6k tokens | `storageState` |
+| `lanhu_read_sector` | 按分组名批量读该分组所有稿的图层树 | `url`(链接/UUID) / `sector` / `storageState` |
+| `lanhu_download_slices` | 下载切图到本地目录（单稿或分组批量，三层去重） | `url` / `outputPath` / `sector?` / `sliceNames?` / `skipExisting?` / `format`(png/svg) |
 | `lanhu_verify_render` | 渲染页 vs 设计稿 语义对比 | `actualImageBase64` / `designImageBase64` |
 | `vision_defect_check` | 整页/局部 UI 缺陷检测 | `imageBase64` / `language` |
 | `vision_e2e_triage` | E2E 失败截图+DOM 归因 | `screenshotBase64` / `domSnapshot` / `errorText` |
@@ -119,12 +121,102 @@ lanhu_list_sectors({
 ```
 lanhu_read_sector({
   url: "https://lanhuapp.com/web/#/item/project/detailDetach?pid=xxx&image_id=yyy",
-  sector: "S2通行证",            // 分组名，从 lanhu_list_sectors 获取
+  sector: "S2通行证",            // 分组名，从 lanhu_list_directory 看到
   storageState: ".auth/lanhu-storage-state.json"
 })
 ```
 
 返回 `{ sector, designCount, designs: [{ name, viewport, layers, meta }] }`，一次读回该分组所有稿。
+
+### 不知道蓝湖链接，按活动名找分组（一页目录）
+
+当你说"帮我看看海底主题活动有几个设计稿"时，AI 无需你给链接，一次拉全团队目录直接定位：
+
+```
+lanhu_list_directory({ storageState: ".auth/lanhu-storage-state.json" })
+```
+
+返回一张完整目录（约 1.6k tokens，并行拉取约 2 秒）：
+
+```js
+{
+  teamId, projectCount: 8, sectorCount: 163,
+  directory: [
+    { project: "Dreamlive H5/Web 4",
+      projectId: "b54e3d95-e07d-4195-ac89-83d6c8b3fa92",
+      sectors: [
+        { name: "S2通行证", designCount: 18 },
+        { name: "海底主题活动", designCount: 5 },
+        // ...
+      ] },
+    // ...更多项目
+  ]
+}
+```
+
+AI 在这份目录里按分组名匹配"海底主题活动" → 拿到所在项目的 `projectId` →
+传给 `lanhu_read_sector({ url: projectId, sector: "海底主题活动" })` 读稿。
+没匹配上则如实回答未找到，或问用户补充。
+
+> `lanhu_read_sector` 的 `url` 参数同时接受**蓝湖链接**和**项目 UUID**（来自 `lanhu_list_directory` 的 `projectId`）。
+> `lanhu_list_directory` 的 `team_id` 从 `storageState` 的 localStorage 自动读取，无需配置。
+> 只到分组层（含 designCount），不展开设计稿名——保持轻量；稿名在读 sector 时才按需拉。
+
+### 下载切图到本地项目（开发引用素材）
+
+实现某个设计稿时，把稿里标记导出的切图（icon/图/头像框等）拉到本地 assets。两种范围、三层去重：
+
+**单稿下载**：
+
+```
+lanhu_download_slices({
+  url: "https://lanhuapp.com/web/#/item/project/detailDetach?pid=xxx&image_id=yyy",
+  outputPath: "src/assets/masked-ball/",
+  format: "png"                             // 或 "svg"
+})
+```
+
+**分组批量下载**（跨稿去重，公共 icon 只下一次）：
+
+```
+lanhu_download_slices({
+  url: "b54e3d95-...",                      // 项目 UUID 或该分组任一稿链接
+  sector: "S2通行证",                         // 分组名（从 lanhu_list_directory 看到）
+  outputPath: "src/assets/s2-passport/"
+})
+```
+拉该分组所有稿的切图合并去重。实测 20 稿 194 切图 → URL 去重后 133 张，省 61 张重复。
+
+**只下指定切图**（sliceNames 过滤）：
+
+```
+lanhu_download_slices({
+  url: "...",
+  outputPath: "...",
+  sliceNames: ["关闭icon", "返回btn"]        // 只下这几个名字的切图
+})
+```
+
+返回：
+```js
+{
+  scope: "S2通行证",        // 单稿=稿名，分组=分组名
+  outputDir: "/abs/.../src/assets/s2-passport",
+  downloaded: 133,          // 实际下载张数
+  skipped: { dup: 61, exist: 0 },  // URL 去重跳过 / 本地已存在跳过
+  failed: [],               // 下载失败明细（不再静默跳过）
+  slices: [{ name, file, bytes, w, h }]  // 全部已落盘+已存在的切片
+}
+```
+
+三层去重（默认全开，可独立开关）：
+1. **URL 去重** —— 蓝湖切图 URL 按图内容 hash 命名，同 URL = 同图，只下一次（解决跨稿+稿内重复）
+2. **skipExisting** —— 本地已存在同名文件就跳过（`skipExisting:false` 可强制重下；默认 true）
+3. **sliceNames** —— 只下指定名字的切图（同名不同 URL 都下，因为它们是不同的图）
+
+文件名为「图层名 + 短 hash + 扩展名」（清洗非法字符 `/ \ : * ? " < > |`、防重名），AI 拿到 `file` 路径即可在代码里引用。切图来自蓝湖公开 CDN，无需 cookie 即可下载。
+
+> **关于倍率/平台**：蓝湖客户端可按 `@2x/@3x` 或安卓 `mipmap-xxxhdpi` 选倍率，但官方 API 返回的切图 URL 是单一默认值（安卓端最高分辨率 xxxhdpi/4x）。H5 用 CSS 控制显示尺寸，直接用最高清原图即可，本工具不做平台/倍率选择——如需低倍率图，自行缩放处理。
 
 ### 验收（做完页面后）
 
@@ -149,12 +241,11 @@ vision_e2e_triage({ screenshotBase64: "<失败截图>", domSnapshot: "<DOM>", er
 
 | 变量 | 必填 | 默认 | 说明 |
 |---|---|---|---|
-| `DEEPSEEK_API_KEY` | analyze/验收时必填 | — | 视觉模型 Key |
+| `LLM_API_KEY` | analyze/验收时必填 | — | 视觉模型 Key |
 | `VISION_BASE_URL` | 否 | `https://api.deepseek.com` | 视觉模型端点（验证时可指向 mock） |
 | `LANHU_VISION_MODEL` | 否 | `deepseek-v4-flash-vision-exp` | 视觉模型名 |
-| `LANHU_CODEGEN_MODEL` | 否 | `deepseek-chat` | 预留：代码生成引擎名（由 Agent 自行调用） |
 | `LANHU_COOKIE` | 官方 api 模式必填（或传 storageState） | — | 蓝湖登录 Cookie 串 |
-| `LANHU_STORAGE_STATE` | 官方 api 模式必填（或传 cookie） | — | playwright storageState 文件路径，自动提取 cookie |
+| `LANHU_STORAGE_STATE` | 官方 api 模式必填（或传 cookie） | — | playwright storageState 文件路径，自动提取 cookie（相对路径相对 MCP 子进程 cwd，即工作区根目录） |
 | `LANHU_SCRAPE_DEBUG` | 否 | — | 设为 `1` 时打印拦截到的蓝湖接口与字段名（scrape 校准用） |
 | `LANHU_MOCK` | 否 | — | 设为 `1` 时 fetch_design 返回内置示例（无需联网） |
 
@@ -187,7 +278,7 @@ COPY . .
 RUN npm install && npm run build
 CMD ["node", "dist/index.js"]
 ```
-构建：`docker build -t lanhu-vision-mcp .`，运行时通过 `-e DEEPSEEK_API_KEY=...` 注入密钥。
+构建：`docker build -t lanhu-vision-mcp .`，运行时通过 `-e LLM_API_KEY=...` 注入密钥。
 
 ## 接入各 coding Agent
 
@@ -206,11 +297,15 @@ CMD ["node", "dist/index.js"]
 
 ```
 你可用 lanhu-vision MCP：
-1. 实现某个需求/分组前，先 lanhu_list_sectors 看分组，再 lanhu_read_sector 批量读该分组所有稿。
-2. 实现单个 UI 前 lanhu_fetch_design 取结构化图层树（色值/字号从数据取，不要靠截图 OCR 小字）；
+1. 不知道蓝湖链接时，lanhu_list_directory 一次拉全团队目录（项目→分组），
+   在里面按分组名匹配用户说的活动 → 拿到 projectId 传给 lanhu_read_sector。
+   没匹配则如实回答未找到或问用户。无需让用户补链接，无需自己下钻。
+2. 有链接或项目 UUID 时，lanhu_read_sector({url: 链接或UUID, sector: 分组名}) 批量读该分组所有稿。
+3. 实现单个 UI 前 lanhu_fetch_design 取结构化图层树（色值/字号从数据取，不要靠截图 OCR 小字）；
    需要整体视觉理解时加 analyze:true 让视觉模型理解封面图。
-3. 实现后把渲染页截图传给 lanhu_verify_render 做对比，或 vision_defect_check 做缺陷检测。
-4. E2E 失败时把截图+DOM 传给 vision_e2e_triage 拿根因。
+4. 需要切图素材时 lanhu_download_slices 下载到项目 assets 目录，代码里引用返回的 file 路径。
+5. 实现后把渲染页截图传给 lanhu_verify_render 做对比，或 vision_defect_check 做缺陷检测。
+6. E2E 失败时把截图+DOM 传给 vision_e2e_triage 拿根因。
 视觉模型的结论只当线索，涉及钱/权限/用户数据的流程必须人审。
 ```
 
