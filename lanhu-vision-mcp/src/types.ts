@@ -16,9 +16,20 @@ export interface DesignLayer {
   fontWeight?: number;
   color?: string;
   fontFamily?: string;
+  lineHeight?: number | string;   // 'auto' 或 px 值
+  letterSpacing?: number;         // px
+  align?: string;                 // 水平对齐 left|center|right|justify
+  verticalAlign?: string;
+  italic?: boolean;
+  underline?: boolean;
+  linethrough?: boolean;
   // 非 text 图层
   fill?: string;
+  gradient?: { stops: Array<{ color: string; position: number }> };
   radius?: number;
+  // 图层透明度（仅无 fill/gradient/color 的图层导出，如 image 切图——有颜色的图层透明度已烘进 rgba
+  // alpha，再叠此字段会双重叠加；image 图层 Agent 需自行写 CSS opacity）
+  opacity?: number;
   // 切图（hasExportImage 的图层）：开发时下载引用
   imageUrl?: string;
   svgUrl?: string;
@@ -35,7 +46,7 @@ export interface DesignMeta {
 }
 
 export interface DesignResult {
-  source: 'api' | 'scrape' | 'mock';
+  source: 'api' | 'mock';
   url?: string;
   name?: string;
   viewport: { width: number; height: number };
@@ -43,7 +54,6 @@ export interface DesignResult {
   meta: DesignMeta;
   visionAnalysis?: unknown;
   coverImageBase64?: string;
-  screenshotBase64?: string;
   // 切图清单（hasExportImage 的图层，开发时下载引用）
   slices?: SliceInfo[];
 }
@@ -73,5 +83,4 @@ export interface SliceInfo {
 
 export interface Credentials {
   cookie?: string;
-  storageState?: string;
 }

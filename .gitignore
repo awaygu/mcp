@@ -6,3 +6,5 @@
 
 # TypeScript 编译产物
 **/dist/
+# 各 MCP 的本地登录态/密钥（不提交）
+.mcp-local/

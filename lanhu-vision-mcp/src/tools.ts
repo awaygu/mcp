@@ -1,8 +1,8 @@
 // tools.ts — 注册所有 MCP 工具（用官方 SDK + zod）
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { fetchDesignViaApi, readSector, listDirectory, downloadSlices } from './lanhu-client.js';
-import { scrapeLanhu } from './scrape.js';
+import { readFileSync } from 'node:fs';
+import { fetchDesignViaApi, readSector, listDirectory, listUserTeams, downloadSlices, checkAuth } from './lanhu-client.js';
 import { callVision, DESIGN_ANALYZE_PROMPT } from './vision.js';
 import type { Credentials, DesignResult } from './types.js';
 
@@ -22,10 +22,23 @@ function jsonContent(obj: unknown) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(obj, null, 2) }] };
 }
 
-function credentials(args: { cookie?: string; storageState?: string }): Credentials {
+// 从 LANHU_COOKIE_FILE 指定文件读 cookie（文件内容就是完整 cookie 串，可含换行/空白，会自动 trim）
+// 文件不存在或未设置时返回 undefined，交由 resolveCookie 给出明确报错
+function readCookieFile(filePath?: string): string | undefined {
+  if (!filePath) return undefined;
+  try {
+    const raw = readFileSync(filePath, 'utf8');
+    const cookie = raw.trim();
+    return cookie || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function credentials(args: { cookie?: string }): Credentials {
   return {
-    cookie: args.cookie || process.env.LANHU_COOKIE,
-    storageState: args.storageState || process.env.LANHU_STORAGE_STATE,
+    // cookie 优先级：显式入参 > 环境变量直填 LANHU_COOKIE > 从 LANHU_COOKIE_FILE 指定文件读
+    cookie: args.cookie || process.env.LANHU_COOKIE || readCookieFile(process.env.LANHU_COOKIE_FILE),
   };
 }
 
@@ -35,37 +48,18 @@ export function registerTools(server: McpServer): void {
     'lanhu_fetch_design',
     {
       description:
-        '读取蓝湖设计稿的结构化图层树（精确 x/y/宽高/色值/字号/圆角/文本）。mode：api=官方Cookie接口(默认,无需浏览器) / scrape=Playwright爬取兜底 / mock=内置示例。analyze=true 时用配置的视觉模型理解设计稿封面图。',
+        '读取蓝湖设计稿的结构化图层树（精确 x/y/宽高/色值/字号/圆角/文本）。mode：api=官方Cookie接口(默认,无需浏览器) / mock=内置示例。analyze=true 时用配置的视觉模型理解设计稿封面图。',
       inputSchema: {
-        mode: z.enum(['api', 'scrape', 'mock']).default('api').describe('抽取后端'),
+        mode: z.enum(['api', 'mock']).default('api').describe('抽取后端'),
         url: z.string().optional().describe('蓝湖设计稿链接，如 https://lanhuapp.com/web/#/item/project/detailDetach?pid=xxx&image_id=yyy'),
-        cookie: z.string().optional().describe('登录 cookie 串（也可用 LANHU_COOKIE）'),
-        storageState: z.string().optional().describe('playwright storageState 文件路径（也可用 LANHU_STORAGE_STATE）'),
+        cookie: z.string().optional().describe('登录 cookie 串（也可用 LANHU_COOKIE / LANHU_COOKIE_FILE）'),
         analyze: z.boolean().optional().describe('true 时用视觉模型理解封面图，返回 visionAnalysis'),
-        screenshot: z.boolean().optional().describe('mode=scrape 时是否返回截屏 base64'),
-        viewport: z.object({ width: z.number(), height: z.number() }).optional().describe('mode=scrape 视口'),
         mock: z.boolean().optional().describe('true 时返回内置示例'),
       },
     },
     async (args) => {
-      if (process.env.LANHU_MOCK === '1' || args.mock) {
+      if (process.env.LANHU_MOCK === '1' || args.mock || args.mode === 'mock') {
         return jsonContent(MOCK_DESIGN);
-      }
-
-      if (args.mode === 'scrape') {
-        if (!args.url) throw new Error('scrape 模式需要 url');
-        const needShot = !!(args.screenshot || args.analyze);
-        const r = await scrapeLanhu(args.url, {
-          ...credentials(args),
-          viewport: args.viewport,
-          screenshot: needShot,
-        });
-        if (args.analyze && r.screenshotBase64) {
-          const analysis = await callVision({ images: [r.screenshotBase64], text: DESIGN_ANALYZE_PROMPT, detail: 'high' });
-          const { screenshotBase64, ...rest } = r;
-          return jsonContent({ ...rest, visionAnalysis: analysis });
-        }
-        return jsonContent(r);
       }
 
       // mode === 'api'（默认）
@@ -153,18 +147,45 @@ export function registerTools(server: McpServer): void {
     }
   );
 
-  // 5. 列全团队目录（一页地图：项目 → 分组，无需链接）
+  // cookie 探活：判断当前 cookie 是否有效。任何蓝湖工具返回 401/空数据/疑似过期时主动调它二次确认。
+  server.registerTool(
+    'lanhu_check_auth',
+    {
+      description:
+        '探活当前蓝湖 cookie 是否有效。调一次 user_teams 接口：返回 { ok:true, teamCount, teams } 表示 cookie 有效；返回 { ok:false, reason, hint } 表示失效（reason=cookie_expired/http_xxx/network_error）。用法：①任何蓝湖工具报 401 或返回空数据时，先调本工具确认是否 cookie 过期；②ok=true 但某次调用仍 401 → 是那个具体资源无权访问，重新登录无效，需联系设计者开权限；③ok=false(reason=cookie_expired) 或首次使用无 cookie → 真过期/未配置，提示用户二选一续期：方式1 浏览器 F12 → Network → 复制 Cookie 头写入 .mcp-local/lanhu.cookie；方式2 双击 lanhu-login.bat 或跑 npm run login 自动写入。完成后重试。',
+      inputSchema: {
+        cookie: z.string().optional(),
+      },
+    },
+    async (args) => jsonContent(await checkAuth(credentials(args)))
+  );
+
+  // 列账号所属团队（多团队发现入口）
+  server.registerTool(
+    'lanhu_list_teams',
+    {
+      description:
+        '列出当前账号加入的全部蓝湖团队（teamId/名称/角色/是否所有者/成员数）。多团队场景先用它发现团队，拿到 teamId 传给 lanhu_list_directory。不传任何参数即可；返回精简字段，省略敏感项。',
+      inputSchema: {
+        cookie: z.string().optional(),
+      },
+    },
+    async (args) => jsonContent(await listUserTeams(credentials(args)))
+  );
+
+  // 5. 列团队目录（项目→分组）
   server.registerTool(
     'lanhu_list_directory',
     {
       description:
-        '一次拉全团队目录（项目 → 分组层），无需蓝湖链接。用于「我不知道链接，想找某活动有几个设计稿」——AI 在这份目录里按分组名匹配，拿到 projectId 后传给 lanhu_read_sector。只到分组层（含 designCount），不展开设计稿名。并行拉取约 2 秒，约 1.6k tokens。',
+        '一次拉团队目录（项目 → 分组层）。用于「想找某活动有几个设计稿」——AI 在这份目录里按分组名匹配，拿到 projectId 后传给 lanhu_read_sector。只到分组层（含 designCount），不展开设计稿名。团队定位优先级：有蓝湖链接传 url（从 tid 提取，最准）；无链接传 teamId（来自 lanhu_list_teams）；两者都没有则报错（无默认团队回退）。并行拉取约 2 秒，约 1.6k tokens。',
       inputSchema: {
+        url: z.string().optional().describe('蓝湖链接（任意稿链接即可，从中提取 tid 定位团队）；比 teamId 更准'),
+        teamId: z.string().optional().describe('团队 id（来自 lanhu_list_teams）；无 url 时用'),
         cookie: z.string().optional(),
-        storageState: z.string().optional(),
       },
     },
-    async (args) => jsonContent(await listDirectory(credentials(args)))
+    async (args) => jsonContent(await listDirectory({ ...credentials(args), ...(args.url ? { url: args.url } : {}), ...(args.teamId ? { teamId: args.teamId } : {}) }))
   );
 
   // 6. 按分组批量读
@@ -176,7 +197,6 @@ export function registerTools(server: McpServer): void {
         url: z.string().describe('蓝湖设计稿链接 或 项目 UUID（来自 lanhu_list_directory 的 projectId）'),
         sector: z.string().describe('分组名或分组 id（从 lanhu_list_directory 看到）'),
         cookie: z.string().optional(),
-        storageState: z.string().optional(),
       },
     },
     async (args) => jsonContent(await readSector(args.url, args.sector, credentials(args)))
@@ -197,7 +217,6 @@ export function registerTools(server: McpServer): void {
         sliceNames: z.array(z.string()).optional().describe('只下载指定名字的切图（同名不同 URL 都下，因为它们是不同的图）'),
         skipExisting: z.boolean().optional().describe('本地已存在同名文件则跳过，默认 true（避免重下公共 icon）'),
         cookie: z.string().optional(),
-        storageState: z.string().optional(),
       },
     },
     async (args) => jsonContent(

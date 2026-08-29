@@ -21,22 +21,31 @@ TypeScript 实现，基于官方 MCP SDK（`@modelcontextprotocol/sdk` + `zod`�
 ## 安装 & 构建
 
 ```bash
-npm install      # 装 SDK + zod；playwright 为可选依赖（scrape 兜底用）
+npm install      # 装 SDK + zod
 npm run build    # tsc 编译到 dist/
 ```
 
 ## 快速开始
 
-### 1. 准备蓝湖登录凭证（官方 API 只需要 Cookie）
+### 1. 准备蓝湖 Cookie（仅需 Cookie）
+
+从浏览器 F12 → Network → 任意请求的 `Cookie` 头复制，写入本地文件 `.mcp-local/lanhu.cookie`（已 gitignore，不入仓库）。
+多团队场景：cookie 即可列团队（`lanhu_list_teams`）+ 从链接 tid 定位（`lanhu_list_directory({url})`）。
+
+> 也可改用环境变量 `LANHU_COOKIE` 直填 cookie 串；或跑登录脚本自动续期（见下）。
+
+**小白登录（双击即用，推荐）**：Windows 下双击 `lanhu-login.bat`，自动装依赖 → 弹浏览器 → 你登录 → 回终端按 Enter，cookie 自动写入 `.mcp-local/lanhu.cookie`。
+
+**命令行登录**：
 
 ```bash
-# 一次性登录，保存 playwright storageState（含 cookie，官方 API 从中提取 cookie）
 npm i playwright              # 仅 lanhu-login.mjs 需要
+npx playwright install chromium
 node lanhu-login.mjs
-#   → 弹出浏览器手动登录蓝湖，回终端按 Enter，写到 .auth/lanhu-storage-state.json（已 gitignore）
+#   → 弹出浏览器手动登录蓝湖，回终端按 Enter，把 cookie 串写入 .mcp-local/lanhu.cookie（已 gitignore）
 ```
 
-或直接从浏览器 F12 → Network → 任意请求的 `Cookie` 头复制，配到 `LANHU_COOKIE`。
+**cookie 过期后**：重新跑一次上面的 `lanhu-login.bat` 或 `node lanhu-login.mjs` 即可。AI 检测到过期时会提示你。
 
 ### 2. 配置视觉模型（analyze / 验收需要）
 
@@ -54,22 +63,25 @@ node lanhu-login.mjs
         "LLM_API_KEY": "${LLM_API_KEY}",
         "VISION_BASE_URL": "https://api.deepseek.com",
         "LANHU_VISION_MODEL": "deepseek-v4-flash-vision-exp",
-        "LANHU_STORAGE_STATE": "./mcp/lanhu-vision-mcp/.auth/lanhu-storage-state.json"
+        "LANHU_COOKIE_FILE": "./.mcp-local/lanhu.cookie"
       }
     }
   }
 }
 ```
 
-`${LLM_API_KEY}` 从 shell 环境变量展开，避免密钥入库。
+`LANHU_COOKIE_FILE` 指向本地 cookie 文件（内容为完整 cookie 串，已 gitignore）；
+`${LLM_API_KEY}` 从 shell 环境变量展开。两者都不入库。
 
 ## 工具一览
 
 | 工具 | 作用 | 关键入参 |
 |---|---|---|
-| `lanhu_fetch_design` | 读单个设计稿图层树（+可选视觉理解） | `url` / `mode`(api/scrape/mock) / `analyze` / `storageState` |
-| `lanhu_list_directory` | 一次拉全团队目录（项目→分组，**无需链接**）。约 1.6k tokens | `storageState` |
-| `lanhu_read_sector` | 按分组名批量读该分组所有稿的图层树 | `url`(链接/UUID) / `sector` / `storageState` |
+| `lanhu_check_auth` | 探活 cookie 是否有效（401 二次确认） | `cookie` |
+| `lanhu_fetch_design` | 读单个设计稿图层树（+可选视觉理解） | `url` / `mode`(api/mock) / `analyze` / `cookie` |
+| `lanhu_list_teams` | 列出账号加入的全部团队（多团队发现入口） | `cookie` |
+| `lanhu_list_directory` | 一次拉团队目录（项目→分组）。约 1.6k tokens | `url?`(提 tid) / `teamId?` / `cookie` |
+| `lanhu_read_sector` | 按分组名批量读该分组所有稿的图层树 | `url`(链接/UUID) / `sector` / `cookie` |
 | `lanhu_download_slices` | 下载切图到本地目录（单稿或分组批量，三层去重） | `url` / `outputPath` / `sector?` / `sliceNames?` / `skipExisting?` / `format`(png/svg) |
 | `lanhu_verify_render` | 渲染页 vs 设计稿 语义对比 | `actualImageBase64` / `designImageBase64` |
 | `vision_defect_check` | 整页/局部 UI 缺陷检测 | `imageBase64` / `language` |
@@ -77,15 +89,29 @@ node lanhu-login.mjs
 
 ## 使用示例
 
-> 示例中的 `storageState` 均可用 `cookie` 串替代，或省略（走环境变量 `LANHU_STORAGE_STATE` / `LANHU_COOKIE`）。
+> 示例中的 `cookie` 参数均可省略——省略时走环境变量 `LANHU_COOKIE` 或 `LANHU_COOKIE_FILE` 指定的文件。
+
+### cookie 过期怎么办（AI 判断流程）
+
+任何蓝湖工具报 `HTTP 401` 或返回异常空数据时，AI 会先调 `lanhu_check_auth` 探活来区分原因：
+
+```
+lanhu_check_auth({})
+```
+
+- 返回 `{ ok:true, teamCount, teams }` → cookie 仍有效，刚才的 401 是**无权访问该资源**（稿没对你分享）。重新登录无效，需联系设计者开权限。
+- 返回 `{ ok:false, reason:"cookie_expired", hint:"..." }` → cookie 确实过期。提示用户运行**`lanhu-login.bat`**或 `npm run login` 续期。
+- `reason:"http_xxx"` → 蓝湖其它 HTTP 错误，稍后重试或检查网络。
+- `reason:"network_error"` → 网络不通。
+
+> 401 不一定是 cookie 过期：全局接口 401 多半是 cookie 问题；单个稿 401 而 `check_auth` 通过，则是权限问题。`check_auth` 让 AI 不再一刀切误报过期。
 
 ### 读单个设计稿
 
 ```
 lanhu_fetch_design({
   mode: "api",                 // 默认，官方 Cookie 接口
-  url: "https://lanhuapp.com/web/#/item/project/detailDetach?pid=xxx&image_id=yyy",
-  storageState: ".auth/lanhu-storage-state.json"
+  url: "https://lanhuapp.com/web/#/item/project/detailDetach?pid=xxx&image_id=yyy"
 })
 ```
 
@@ -97,7 +123,6 @@ lanhu_fetch_design({
 lanhu_fetch_design({
   mode: "api",
   url: "https://lanhuapp.com/web/#/item/project/detailDetach?pid=xxx&image_id=yyy",
-  storageState: ".auth/lanhu-storage-state.json",
   analyze: true                 // 下载封面图 → 喂给视觉模型 → 返回 visionAnalysis 文字描述
 })
 ```
@@ -105,24 +130,39 @@ lanhu_fetch_design({
 `analyze` 会返回 `visionAnalysis`（布局/组件/配色/字体的文字理解），**封面图 base64 不进上下文**，
 只在 server 内部喂给视觉模型。结合图层树的精确数值做双重验证。
 
-### 列项目分组
+### 列账号所属团队（多团队发现）
 
 ```
-lanhu_list_sectors({
-  url: "https://lanhuapp.com/web/#/item/project/detailDetach?pid=xxx&image_id=yyy",
-  storageState: ".auth/lanhu-storage-state.json"
+lanhu_list_teams({})
+```
+
+返回 `{ teamCount, teams: [{ teamId, name, role, isOwner, memberNum }] }`。
+多团队时先列团队，拿 `teamId` 传给 `lanhu_list_directory`；省略敏感字段（phone/company/tax_id_no 等）。
+
+### 列项目分组（团队目录定位）
+
+团队定位优先级：`url`（提 tid，最准）> `teamId`（来自 list_teams）。两者都没有则报错。
+
+```
+// 有蓝湖链接——直接传 url，从 tid 定位团队（最准，推荐）
+lanhu_list_directory({
+  url: "https://lanhuapp.com/web/#/item/project/detailDetach?pid=xxx&image_id=yyy&tid=zzz"
+})
+
+// 没链接——先 lanhu_list_teams 拿 teamId
+lanhu_list_directory({
+  teamId: "21e6d63c-..."
 })
 ```
 
-返回 `{ sectorCount, sectors: [{ name, designCount, designs: [{name, image_id}] }] }`。
+返回 `{ teamId, projectCount, sectorCount, directory: [{ project, projectId, sectors: [{ name, designCount }] }] }`。
 
 ### 按分组批量读（完成某个需求）
 
 ```
 lanhu_read_sector({
   url: "https://lanhuapp.com/web/#/item/project/detailDetach?pid=xxx&image_id=yyy",
-  sector: "S2通行证",            // 分组名，从 lanhu_list_directory 看到
-  storageState: ".auth/lanhu-storage-state.json"
+  sector: "S2通行证"            // 分组名，从 lanhu_list_directory 看到
 })
 ```
 
@@ -133,7 +173,8 @@ lanhu_read_sector({
 当你说"帮我看看海底主题活动有几个设计稿"时，AI 无需你给链接，一次拉全团队目录直接定位：
 
 ```
-lanhu_list_directory({ storageState: ".auth/lanhu-storage-state.json" })
+// 需先 lanhu_list_teams 拿 teamId（或传任意该团队蓝湖链接的 url）
+lanhu_list_directory({ teamId: "21e6d63c-..." })
 ```
 
 返回一张完整目录（约 1.6k tokens，并行拉取约 2 秒）：
@@ -159,7 +200,7 @@ AI 在这份目录里按分组名匹配"海底主题活动" → 拿到所在项�
 没匹配上则如实回答未找到，或问用户补充。
 
 > `lanhu_read_sector` 的 `url` 参数同时接受**蓝湖链接**和**项目 UUID**（来自 `lanhu_list_directory` 的 `projectId`）。
-> `lanhu_list_directory` 的 `team_id` 从 `storageState` 的 localStorage 自动读取，无需配置。
+> `lanhu_list_directory` 的 `team_id` 两级定位：`url` 入参提取的 tid > `teamId` 入参。两者都没有则报错（实测 `tenantId=0` 返回空目录而非默认团队，不能兜底）。有链接传 `url` 最准；没链接用 `lanhu_list_teams` 拿 `teamId`。
 > 只到分组层（含 designCount），不展开设计稿名——保持轻量；稿名在读 sector 时才按需拉。
 
 ### 下载切图到本地项目（开发引用素材）
@@ -231,11 +272,11 @@ vision_e2e_triage({ screenshotBase64: "<失败截图>", domSnapshot: "<DOM>", er
 | mode | 说明 | 依赖 |
 |---|---|---|
 | `api`（默认） | 蓝湖官方 Cookie 接口：`GET /api/project/image` → `json_url` 图层树 + `detail.url` 封面图 | 仅 Cookie |
-| `scrape` | Playwright 爬取兜底（拦截 FigmaJSON / DOM 包围盒） | playwright + 浏览器 |
 | `mock` | 内置示例图层树 | 无 |
 
-官方 `api` 模式是主力：不依赖浏览器渲染画布，直接拿 `detail.url` 封面图（完整设计稿截图），
-比截图/爬 DOM 稳、快、准。`scrape` 只作无 API 时的兜底。
+官方 `api` 模式直调蓝湖数据接口拿 `detail.url` 封面图（完整设计稿截图）+ 标注 JSON，
+不走前端渲染画布，稳、快、准。已移除 `scrape`（playwright 爬取）模式——蓝湖前端鉴权 + 阿里云风控
+让浏览器拦截路径不可靠，官方 API 才是正路。
 
 ## 环境变量
 
@@ -244,10 +285,12 @@ vision_e2e_triage({ screenshotBase64: "<失败截图>", domSnapshot: "<DOM>", er
 | `LLM_API_KEY` | analyze/验收时必填 | — | 视觉模型 Key |
 | `VISION_BASE_URL` | 否 | `https://api.deepseek.com` | 视觉模型端点（验证时可指向 mock） |
 | `LANHU_VISION_MODEL` | 否 | `deepseek-v4-flash-vision-exp` | 视觉模型名 |
-| `LANHU_COOKIE` | 官方 api 模式必填（或传 storageState） | — | 蓝湖登录 Cookie 串 |
-| `LANHU_STORAGE_STATE` | 官方 api 模式必填（或传 cookie） | — | playwright storageState 文件路径，自动提取 cookie（相对路径相对 MCP 子进程 cwd，即工作区根目录） |
-| `LANHU_SCRAPE_DEBUG` | 否 | — | 设为 `1` 时打印拦截到的蓝湖接口与字段名（scrape 校准用） |
+| `LANHU_COOKIE` | 官方 api 模式必填（与 `LANHU_COOKIE_FILE` 二选一） | — | 蓝湖登录 Cookie 串（F12 复制） |
+| `LANHU_COOKIE_FILE` | 同上 | — | cookie 文件路径（内容为完整 cookie 串，已 gitignore）；`lanhu-login.bat` 续期时自动写入此文件 |
 | `LANHU_MOCK` | 否 | — | 设为 `1` 时 fetch_design 返回内置示例（无需联网） |
+
+> cookie 解析优先级：**工具入参 `cookie` > 环境变量 `LANHU_COOKIE` > 文件 `LANHU_COOKIE_FILE`**。
+> ⚠️ 注意：若曾设置过 `LANHU_COOKIE` 环境变量，它会**压制文件内容**——用 `lanhu-login.bat` 续期后新 cookie 写入了文件，但旧环境变量仍在生效，请求会持续 401。此时需删除/更新该环境变量，或清掉它改用文件方式。
 
 ## 开发 / 类型检查
 
@@ -297,6 +340,7 @@ CMD ["node", "dist/index.js"]
 
 ```
 你可用 lanhu-vision MCP：
+0. 多团队先 `lanhu_list_teams` 列出账号加入的全部团队，拿 `teamId`；单团队可跳过直接进 1。
 1. 不知道蓝湖链接时，lanhu_list_directory 一次拉全团队目录（项目→分组），
    在里面按分组名匹配用户说的活动 → 拿到 projectId 传给 lanhu_read_sector。
    没匹配则如实回答未找到或问用户。无需让用户补链接，无需自己下钻。
@@ -306,6 +350,11 @@ CMD ["node", "dist/index.js"]
 4. 需要切图素材时 lanhu_download_slices 下载到项目 assets 目录，代码里引用返回的 file 路径。
 5. 实现后把渲染页截图传给 lanhu_verify_render 做对比，或 vision_defect_check 做缺陷检测。
 6. E2E 失败时把截图+DOM 传给 vision_e2e_triage 拿根因。
+7. 任何蓝湖工具报 HTTP 401 或返回异常空数据时，先调 lanhu_check_auth 探活：
+   - ok:true → cookie 有效，是那个资源无权访问，提示用户联系设计者开权限（不要让用户重新登录）。
+   - ok:false(reason=cookie_expired) → 真过期，提示用户双击 `lanhu-login.bat` 或跑 npm run login 续期，完成后重试。
+   - ok:false(reason=network_error) → 网络问题，稍后重试。
+   不要在没探活前就断定 cookie 过期——单资源 401 多半是权限问题，重新登录无效。
 视觉模型的结论只当线索，涉及钱/权限/用户数据的流程必须人审。
 ```
 
