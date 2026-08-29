@@ -3,13 +3,14 @@
 export type LayerKind = 'text' | 'image' | 'rect';
 
 export interface DesignLayer {
-  id: string;
+  id?: string;                    // 仅 mock 示例使用；api 模式清洗后不输出（Agent 用 name+坐标定位）
   type: LayerKind;
   x: number;
   y: number;
   w: number;
   h: number;
   name?: string;
+  parentPath?: string;            // 父容器名链（'/'分隔），还原被过滤容器层的分组语义
   // text 图层
   text?: string;
   fontSize?: number;
@@ -32,13 +33,14 @@ export interface DesignLayer {
   opacity?: number;
   // 切图（hasExportImage 的图层）：开发时下载引用
   imageUrl?: string;
-  svgUrl?: string;
   hasExportImage?: boolean;
 }
 
 export interface DesignMeta {
   rawLayerCount: number;
   totalLayerCount: number;
+  droppedLayerCount?: number;     // 清洗过滤掉的无样式容器层数
+  payloadBytes?: number;          // 清洗后 layers JSON 字节数（Agent 感知数据大小）
   docName?: string;
   capturedFrom?: string;
   fallback?: string;
@@ -74,7 +76,6 @@ export interface SectorInfo {
 export interface SliceInfo {
   name: string;
   imageUrl: string;     // PNG
-  svgUrl?: string;      // SVG
   x: number;
   y: number;
   w: number;

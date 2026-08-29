@@ -6,7 +6,7 @@ opencode）获得三件事：
 - **读蓝湖的眼睛**：通过蓝湖官方 API（Cookie 直调，无需浏览器）取结构化图层树
   （x/y/宽高/色值/字号/圆角/文本），精确数值来自结构化数据，**不靠视觉模型 OCR 截图上的小字**。
 - **按项目/分组组织**：`lanhu_list_directory` 一次拉全团队目录（**无需链接**，项目→分组一页地图），
-  `lanhu_read_sector` 按分组批量读，支持「团队 → 项目 → 分组（需求）→ 设计稿」完整层级。
+  `lanhu_read_sector` 按分组列稿目录（不含图层树，防上下文爆炸），支持「团队 → 项目 → 分组（需求）→ 设计稿」完整层级。
 - **下载切图**：`lanhu_download_slices` 把设计稿切图素材拉到本地 assets，供开发引用。
 - **视觉理解 + 验收**：`analyze` 用配置的视觉模型理解设计稿封面图；`lanhu_verify_render` /
   `vision_defect_check` / `vision_e2e_triage` 做渲染对比、UI 缺陷检测、E2E 失败归因。
@@ -81,8 +81,8 @@ node lanhu-login.mjs
 | `lanhu_fetch_design` | 读单个设计稿图层树（+可选视觉理解） | `url` / `mode`(api/mock) / `analyze` / `cookie` |
 | `lanhu_list_teams` | 列出账号加入的全部团队（多团队发现入口） | `cookie` |
 | `lanhu_list_directory` | 一次拉团队目录（项目→分组）。约 1.6k tokens | `url?`(提 tid) / `teamId?` / `cookie` |
-| `lanhu_read_sector` | 按分组名批量读该分组所有稿的图层树 | `url`(链接/UUID) / `sector` / `cookie` |
-| `lanhu_download_slices` | 下载切图到本地目录（单稿或分组批量，三层去重） | `url` / `outputPath` / `sector?` / `sliceNames?` / `skipExisting?` / `format`(png/svg) |
+| `lanhu_read_sector` | 按分组名列出稿目录（稿名/尺寸/层数，不含图层树——全量会撑爆上下文） | `url`(链接/UUID) / `sector` / `cookie` |
+| `lanhu_download_slices` | 下载切图到本地目录（单稿或分组批量，三层去重，下载即压 2x） | `url` / `outputPath` / `sector?` / `sliceNames?` / `skipExisting?` |
 | `lanhu_verify_render` | 渲染页 vs 设计稿 语义对比 | `actualImageBase64` / `designImageBase64` |
 | `vision_defect_check` | 整页/局部 UI 缺陷检测 | `imageBase64` / `language` |
 | `vision_e2e_triage` | E2E 失败截图+DOM 归因 | `screenshotBase64` / `domSnapshot` / `errorText` |
@@ -116,6 +116,7 @@ lanhu_fetch_design({
 ```
 
 返回 `{ name, viewport, layers(精确坐标/色值/字号/文本), meta }`。
+layers 已清洗：过滤无样式纯容器层（实测省 20-30% 体积），每层带 `parentPath`（有语义的父容器名链）保分组语义；`meta.payloadBytes/droppedLayerCount` 报告数据体积与过滤量。
 
 ### 读 + 视觉理解设计稿（双重验证）
 
@@ -128,7 +129,9 @@ lanhu_fetch_design({
 ```
 
 `analyze` 会返回 `visionAnalysis`（布局/组件/配色/字体的文字理解），**封面图 base64 不进上下文**，
-只在 server 内部喂给视觉模型。结合图层树的精确数值做双重验证。
+只在 server 内部喂给视觉模型——且喂前已压到 **1x JPEG**（4x 封面 1.6MB → 约 100KB 内）。
+`lanhu_verify_render` / `vision_defect_check` / `vision_e2e_triage` 的入参截图也会在 server 端统一压到最长边 1568 再发模型。
+结合图层树的精确数值做双重验证。
 
 ### 列账号所属团队（多团队发现）
 
@@ -157,7 +160,7 @@ lanhu_list_directory({
 
 返回 `{ teamId, projectCount, sectorCount, directory: [{ project, projectId, sectors: [{ name, designCount }] }] }`。
 
-### 按分组批量读（完成某个需求）
+### 按分组看稿目录（完成某个需求）
 
 ```
 lanhu_read_sector({
@@ -166,7 +169,7 @@ lanhu_read_sector({
 })
 ```
 
-返回 `{ sector, designCount, designs: [{ name, viewport, layers, meta }] }`，一次读回该分组所有稿。
+返回 `{ sector, designCount, designs: [{ image_id, name, viewport, layerCount }] }`——只含稿目录（稿名/尺寸/层数），**不含图层树**。全量 layers 实测 26 稿约 395KB，会撑爆 Agent 上下文，故故意不返回；按稿名挑出要实现的目标后，用 `lanhu_fetch_design` 逐张读图层树。
 
 ### 不知道蓝湖链接，按活动名找分组（一页目录）
 
@@ -212,8 +215,7 @@ AI 在这份目录里按分组名匹配"海底主题活动" → 拿到所在项�
 ```
 lanhu_download_slices({
   url: "https://lanhuapp.com/web/#/item/project/detailDetach?pid=xxx&image_id=yyy",
-  outputPath: "src/assets/masked-ball/",
-  format: "png"                             // 或 "svg"
+  outputPath: "src/assets/masked-ball/"
 })
 ```
 
@@ -257,7 +259,15 @@ lanhu_download_slices({
 
 文件名为「图层名 + 短 hash + 扩展名」（清洗非法字符 `/ \ : * ? " < > |`、防重名），AI 拿到 `file` 路径即可在代码里引用。切图来自蓝湖公开 CDN，无需 cookie 即可下载。
 
-> **关于倍率/平台**：蓝湖客户端可按 `@2x/@3x` 或安卓 `mipmap-xxxhdpi` 选倍率，但官方 API 返回的切图 URL 是单一默认值（安卓端最高分辨率 xxxhdpi/4x）。H5 用 CSS 控制显示尺寸，直接用最高清原图即可，本工具不做平台/倍率选择——如需低倍率图，自行缩放处理。
+> **关于倍率/平台**：蓝湖客户端可按 `@2x/@3x` 或安卓 `mipmap-xxxhdpi` 选倍率，但官方 API 返回的切图 URL 是单一默认值（安卓端最高分辨率 xxxhdpi/4x）。本工具**下载时自动压缩到 2x**（按设计尺寸 ×2 resize + PNG 调色板压缩，实测 138KB → 24KB），H5 用 CSS 控制显示尺寸。返回的 `slices[].w/h` 仍是设计坐标，落盘像素 = w×2 / h×2。
+
+**存量 4x 图批量压缩**（对之前下载的旧目录）：
+
+```bash
+node scripts/compress-images.mjs src/assets/xxx/ [--factor 0.5] [--dry-run]
+```
+
+⚠️ 2x 目录不要重复跑（会变 1x）。`lanhu_download_slices` 下载即压，无需再跑脚本。
 
 ### 验收（做完页面后）
 
@@ -344,8 +354,8 @@ CMD ["node", "dist/index.js"]
 1. 不知道蓝湖链接时，lanhu_list_directory 一次拉全团队目录（项目→分组），
    在里面按分组名匹配用户说的活动 → 拿到 projectId 传给 lanhu_read_sector。
    没匹配则如实回答未找到或问用户。无需让用户补链接，无需自己下钻。
-2. 有链接或项目 UUID 时，lanhu_read_sector({url: 链接或UUID, sector: 分组名}) 批量读该分组所有稿。
-3. 实现单个 UI 前 lanhu_fetch_design 取结构化图层树（色值/字号从数据取，不要靠截图 OCR 小字）；
+2. 有链接或项目 UUID 时，lanhu_read_sector({url: 链接或UUID, sector: 分组名}) 看该分组的稿目录（稿名/尺寸/层数，不含图层树），按稿名挑出要实现的目标。
+3. 实现单个 UI 前用 lanhu_fetch_design 逐张读目标稿的结构化图层树（一次只读当前要实现的那 1 张，不要批量读；色值/字号从数据取，不要靠截图 OCR 小字）；
    需要整体视觉理解时加 analyze:true 让视觉模型理解封面图。
 4. 需要切图素材时 lanhu_download_slices 下载到项目 assets 目录，代码里引用返回的 file 路径。
 5. 实现后把渲染页截图传给 lanhu_verify_render 做对比，或 vision_defect_check 做缺陷检测。

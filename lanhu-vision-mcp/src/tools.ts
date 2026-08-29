@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { readFileSync } from 'node:fs';
 import { fetchDesignViaApi, readSector, listDirectory, listUserTeams, downloadSlices, checkAuth } from './lanhu-client.js';
 import { callVision, DESIGN_ANALYZE_PROMPT } from './vision.js';
+import { shrinkForVision } from './image.js';
 import type { Credentials, DesignResult } from './types.js';
 
 const MOCK_DESIGN: DesignResult = {
@@ -42,13 +43,25 @@ function credentials(args: { cookie?: string }): Credentials {
   };
 }
 
+// 视觉工具入参图统一 shrink 到最长边 1568 + JPEG：截图/设计稿 base64 常是 2-4x 大图，
+// 先压小再发模型省请求体积与 token；非图片 base64 原样透传（模型自己报错）
+async function shrinkB64(b64: string): Promise<string> {
+  try {
+    const small = await shrinkForVision(Buffer.from(b64, 'base64'));
+    return `data:image/jpeg;base64,${small.toString('base64')}`;
+  } catch {
+    return b64;
+  }
+}
+
 export function registerTools(server: McpServer): void {
   // 1. 读设计稿
   server.registerTool(
     'lanhu_fetch_design',
     {
       description:
-        '读取蓝湖设计稿的结构化图层树（精确 x/y/宽高/色值/字号/圆角/文本）。mode：api=官方Cookie接口(默认,无需浏览器) / mock=内置示例。analyze=true 时用配置的视觉模型理解设计稿封面图。',
+        '读取蓝湖设计稿的结构化图层树（精确 x/y/宽高/色值/字号/圆角/文本）。mode：api=官方Cookie接口(默认,无需浏览器) / mock=内置示例。analyze=true 时用配置的视觉模型理解设计稿封面图。' +
+        '使用纪律：一次只读当前要实现的那 1 张稿；不要为「了解全貌」批量读稿——分组稿目录用 lanhu_read_sector，它足够定位；返回的 layers 含精确数值，色值/字号从数据取，禁止靠视觉模型 OCR 小字。',
       inputSchema: {
         mode: z.enum(['api', 'mock']).default('api').describe('抽取后端'),
         url: z.string().optional().describe('蓝湖设计稿链接，如 https://lanhuapp.com/web/#/item/project/detailDetach?pid=xxx&image_id=yyy'),
@@ -69,7 +82,8 @@ export function registerTools(server: McpServer): void {
         needCover: !!args.analyze,
       });
       if (args.analyze && r.coverImageBase64) {
-        const analysis = await callVision({ images: [r.coverImageBase64], text: DESIGN_ANALYZE_PROMPT, detail: 'high' });
+        // 封面在 client 里已压到 viewport 1x JPEG，这里带 mime 前缀喂模型
+        const analysis = await callVision({ images: [`data:image/jpeg;base64,${r.coverImageBase64}`], text: DESIGN_ANALYZE_PROMPT, detail: 'high' });
         const { coverImageBase64, ...rest } = r;
         return jsonContent({ ...rest, visionAnalysis: analysis });
       }
@@ -95,8 +109,8 @@ export function registerTools(server: McpServer): void {
         '{"matchScore":<0-100>,"verdict":"pass|need_fix|fail",' +
         '"diffs":[{"location":"","issue":"","severity":"minor|major|critical"}],' +
         '"suggestions":["..."]}. Only output JSON.';
-      const images = [args.actualImageBase64];
-      if (args.designImageBase64) images.push(args.designImageBase64);
+      const images = [await shrinkB64(args.actualImageBase64)];
+      if (args.designImageBase64) images.push(await shrinkB64(args.designImageBase64));
       return jsonContent(await callVision({ images, text, detail: args.detail || 'high' }));
     }
   );
@@ -119,7 +133,7 @@ export function registerTools(server: McpServer): void {
         '{"defects":[{"type":"overlap|overflow|missing_asset|contrast|misalign|other",' +
         '"severity":"minor|major|critical","location":"","description":""}],' +
         '"summary":"","pass":<true|false>}. Only output JSON.';
-      return jsonContent(await callVision({ images: [args.imageBase64], text, detail: args.detail || 'auto' }));
+      return jsonContent(await callVision({ images: [await shrinkB64(args.imageBase64)], text, detail: args.detail || 'auto' }));
     }
   );
 
@@ -139,7 +153,7 @@ export function registerTools(server: McpServer): void {
         'A test failed. Analyze the screenshot and (optional) DOM snapshot + error text. ' +
         'Output JSON: {"rootCause":"","category":"selector|timing|layout|data|auth|other",' +
         '"confidence":<0-1>,"fixSuggestion":"","relatedFiles":[""]}. Only output JSON.';
-      const images = args.screenshotBase64 ? [args.screenshotBase64] : [];
+      const images = args.screenshotBase64 ? [await shrinkB64(args.screenshotBase64)] : [];
       const full = images.length ? text : 'No screenshot provided. ' + text;
       const dom = args.domSnapshot ? `\n\nDOM snapshot:\n${args.domSnapshot}` : '';
       const err = args.errorText ? `\n\nError text:\n${args.errorText}` : '';
@@ -188,11 +202,13 @@ export function registerTools(server: McpServer): void {
     async (args) => jsonContent(await listDirectory({ ...credentials(args), ...(args.url ? { url: args.url } : {}), ...(args.teamId ? { teamId: args.teamId } : {}) }))
   );
 
-  // 6. 按分组批量读
+  // 6. 按分组读稿目录
   server.registerTool(
     'lanhu_read_sector',
     {
-      description: '读取蓝湖项目下某个分组（需求）的所有设计稿图层树。先用 lanhu_list_directory 看全局目录定位分组名和项目，再传 projectId + 分组名。',
+      description:
+        '列出蓝湖项目下某个分组（需求）的所有设计稿目录：稿名/尺寸/层数，不含图层树（全量 layers 会撑爆上下文，故意不返回）。' +
+        '用途：先用 lanhu_list_directory 定位分组，再用本工具看分组里有哪几张稿，按稿名挑出要实现的目标，最后用 lanhu_fetch_design 逐张读图层树实现。',
       inputSchema: {
         url: z.string().describe('蓝湖设计稿链接 或 项目 UUID（来自 lanhu_list_directory 的 projectId）'),
         sector: z.string().describe('分组名或分组 id（从 lanhu_list_directory 看到）'),
@@ -211,7 +227,6 @@ export function registerTools(server: McpServer): void {
       inputSchema: {
         url: z.string().describe('设计稿 URL（含 image_id）或纯 image_id；分组模式传项目 UUID 或该分组任一稿链接'),
         outputPath: z.string().describe('本地输出目录，如 src/assets/activity-xxx/'),
-        format: z.enum(['png', 'svg']).optional().describe('切图格式，默认 png'),
         projectId: z.string().optional().describe('项目 UUID（传纯 image_id 时必填；传 URL 自动提取）'),
         sector: z.string().optional().describe('分组名或分组 id：传了就下载该分组所有稿的切图（跨稿合并去重）'),
         sliceNames: z.array(z.string()).optional().describe('只下载指定名字的切图（同名不同 URL 都下，因为它们是不同的图）'),
@@ -222,7 +237,6 @@ export function registerTools(server: McpServer): void {
     async (args) => jsonContent(
       await downloadSlices(args.url, args.outputPath, {
         ...credentials(args),
-        ...(args.format ? { format: args.format } : {}),
         ...(args.projectId ? { projectId: args.projectId } : {}),
         ...(args.sector ? { sector: args.sector } : {}),
         ...(args.sliceNames ? { sliceNames: args.sliceNames } : {}),

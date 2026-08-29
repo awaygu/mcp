@@ -5,6 +5,7 @@ import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { normalizeSketch } from './normalize.js';
+import { compressSlicePng, coverTo1xJpeg } from './image.js';
 import type { Credentials, DesignLayer, DesignMeta, DesignResult, SectorInfo, SliceInfo } from './types.js';
 
 const LANHU_API_BASE = 'https://lanhuapp.com';
@@ -202,6 +203,7 @@ async function fetchDesignByImageId(
   }
 
   // 3) 拿封面图（完整设计截图，仅 needCover 时下载；headersFor 保证 CDN 不带 Cookie）
+  // 4x 封面单张可达 1.6MB：压到 viewport 1x JPEG 再返回，喂视觉模型不再二次处理
   let coverImageBase64: string | undefined;
   if (opts.needCover) {
     const coverUrl = detail.url || versions[0]?.url;
@@ -209,7 +211,8 @@ async function fetchDesignByImageId(
       const imgRes = await fetch(coverUrl, { headers: headersFor(coverUrl, cookie) });
       if (imgRes.ok) {
         const buf = Buffer.from(await imgRes.arrayBuffer());
-        coverImageBase64 = buf.toString('base64');
+        const small = await coverTo1xJpeg(buf, canvasWidth, canvasHeight);
+        coverImageBase64 = small.toString('base64');
       }
     }
   }
@@ -235,7 +238,6 @@ function collectSlices(node: any): SliceInfo[] {
       out.push({
         name: String(n.name || 'slice'),
         imageUrl: n.image.imageUrl,
-        ...(n.image.svgUrl ? { svgUrl: n.image.svgUrl } : {}),
         x: Math.round(Number(f.x ?? 0)),
         y: Math.round(Number(f.y ?? 0)),
         w: Math.round(Number(f.width ?? 0)),
@@ -383,7 +385,8 @@ export async function listSectorsByProject(
   };
 }
 
-// 按分组名批量读该分组下所有设计稿的图层树
+// 按分组名列出该分组下所有设计稿的目录（不含图层树——26 稿全量 layers 实测 395KB 会撑爆
+// Agent 上下文；改为目录定位，AI 按稿名挑中目标后用 fetch_design 逐张读）
 // url 参数接受蓝湖 URL 或项目 UUID
 export async function readSector(
   url: string,
@@ -392,7 +395,7 @@ export async function readSector(
 ): Promise<{
   sector: string;
   designCount: number;
-  designs: Array<{ image_id: string; name: string; viewport: { width: number; height: number }; layers: DesignLayer[]; meta: DesignMeta }>;
+  designs: Array<{ image_id: string; name: string; viewport: { width: number; height: number }; layerCount: number }>;
 }> {
   const projectId = resolveProjectId(url);
   const list = await listSectorsByProject(projectId, opts);
@@ -402,7 +405,7 @@ export async function readSector(
   }
   const cookie = resolveCookie(opts);
 
-  // 并行抓取该分组所有稿（彼此独立的 API 必须并行，禁止串行 await）；单稿失败不整体挂，记入 failed
+  // 并行抓取该分组所有稿拿 viewport + 层数（独立 API 并行，禁止串行 await）；单稿失败不整体挂，记入 failed
   const failed: Array<{ image_id: string; name: string; error: string }> = [];
   const okDesigns = (
     await Promise.all(
@@ -410,7 +413,7 @@ export async function readSector(
         fetchDesignByImageId(d.image_id, projectId, cookie, {})
           .then((r) => ({
             ok: true as const,
-            value: { image_id: d.image_id, name: d.name, viewport: r.viewport, layers: r.layers, meta: r.meta },
+            value: { image_id: d.image_id, name: d.name, viewport: r.viewport, layerCount: r.layers.length },
           }))
           .catch((e: any) => {
             failed.push({ image_id: d.image_id, name: d.name, error: e?.message || String(e) });
@@ -434,7 +437,6 @@ export async function downloadSlices(
   urlOrImageId: string,
   outputPath: string,
   opts: Credentials & {
-    format?: 'png' | 'svg';
     projectId?: string;
     sector?: string;
     sliceNames?: string[];
@@ -449,7 +451,6 @@ export async function downloadSlices(
   slices: Array<{ name: string; file: string; bytes: number; w: number; h: number }>;
   designErrors?: string[]; // 分组模式下读取失败的稿（尽力而为：其余稿照常下载）
 }> {
-  const useSvg = opts.format === 'svg';
   const skipExist = opts.skipExisting !== false; // 默认 true
   const nameFilter = opts.sliceNames?.length ? new Set(opts.sliceNames) : null;
 
@@ -509,7 +510,7 @@ export async function downloadSlices(
   const pending: SliceInfo[] = [];
   let dupCount = 0;
   for (const s of rawSlices) {
-    const src = useSvg && s.svgUrl ? s.svgUrl : s.imageUrl;
+    const src = s.imageUrl;
     if (!src) continue;
     if (nameFilter && !nameFilter.has(s.name)) continue;   // sliceNames 过滤
     if (seenUrl.has(src)) { dupCount++; continue; }        // URL 去重
@@ -522,11 +523,10 @@ export async function downloadSlices(
   let existCount = 0;
 
   for (const s of pending) {
-    const src = useSvg && s.svgUrl ? s.svgUrl : s.imageUrl;
-    const ext = useSvg && s.svgUrl ? 'svg' : 'png';
+    const src = s.imageUrl;
     const cleanName = String(s.name).replace(/[/\\:*?"<>|]/g, '_').replace(/\s+/g, '_');
     const hash = shortHash(src);
-    const fileName = `${cleanName}_${hash}.${ext}`;
+    const fileName = `${cleanName}_${hash}.png`;
     const filePath = path.join(dir, fileName);
 
     // skipExisting：本地已存在就跳过（不重复下载）
@@ -548,8 +548,11 @@ export async function downloadSlices(
       continue;
     }
     const buf = Buffer.from(await res.arrayBuffer());
-    writeFileSync(filePath, buf);
-    out.push({ name: s.name, file: filePath, bytes: buf.length, w: s.w, h: s.h });
+    // CDN 切图固定 4x（实测 pixel = design frame × 4）：压到设计尺寸的 2x 落盘
+    let final: Buffer = buf;
+    try { final = await compressSlicePng(buf, s.w, s.h); } catch { final = buf; }
+    writeFileSync(filePath, final);
+    out.push({ name: s.name, file: filePath, bytes: final.length, w: s.w, h: s.h });
   }
 
   return {

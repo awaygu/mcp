@@ -37,7 +37,6 @@ export function normalizeShape(shape: Record<string, any>): DesignLayer {
   const type = String(shape.type ?? shape.shapeType ?? (shape.text != null ? 'text' : 'rect')).toLowerCase();
   const textStyle = shape.text && typeof shape.text === 'object' ? shape.text.style : null;
   const layer: DesignLayer = {
-    id: String(shape.id ?? shape.guid ?? Math.random().toString(36).slice(2)),
     type: /text|label|font/i.test(type) ? 'text' : /image|bitmap|img/i.test(type) ? 'image' : 'rect',
     x,
     y,
@@ -46,10 +45,7 @@ export function normalizeShape(shape: Record<string, any>): DesignLayer {
   };
   if (shape.name) layer.name = shape.name;
   // 切图 URL（hasExportImage 的图层才有，artboard/bitmapLayer 均放在 shape.image）
-  if (shape.image?.imageUrl) {
-    layer.imageUrl = shape.image.imageUrl;
-    if (shape.image.svgUrl) layer.svgUrl = shape.image.svgUrl;
-  }
+  if (shape.image?.imageUrl) layer.imageUrl = shape.image.imageUrl;
   if (shape.hasExportImage) layer.hasExportImage = true;
   // 合成图层 opacity × fill opacity × color.a 进最终 alpha（只取 color.value 会丢图层透明度）
   // 注意：opacity=0 是合法值（隐藏图层/透明填充），用 ?? 兜底而非 || 1，否则 0 会被误判成 1；
@@ -123,23 +119,44 @@ export function normalizeShape(shape: Record<string, any>): DesignLayer {
 }
 
 // 把抓取到的 sketch JSON 归一化为 { layers, meta }（递归遍历嵌套 layers 树）
+// 清洗策略：①无样式纯容器层（无 fill/文本/切图/圆角/透明度）过滤不输出，省 30-67% 体积；
+// ②保留扁平数组但加 parentPath（容器名链）保分组语义；③meta 报 payloadBytes 供调用方感知数据大小
 export function normalizeSketch(json: Record<string, any>): { layers: DesignLayer[]; meta: DesignMeta } {
   const arr = findLayerArray(json) || [];
   const layers: DesignLayer[] = [];
-  const walk = (items: unknown[]) => {
+  let droppedCount = 0;
+  // isContentful：有视觉信息的图层才输出（容器名不丢，进子层 parentPath）
+  const isContentful = (l: DesignLayer): boolean =>
+    !!(l.fill || l.gradient || l.color || l.text || l.imageUrl || l.hasExportImage || l.radius || l.opacity != null);
+  // parentPath 只收有语义的容器名：自动生成名（Frame_xxx/Group_xxx/编组N/矩形N 等）对 AI 无信息量，
+  // 且实测会吃掉过滤省下的字节
+  const meaningfulName = (name: string): boolean => !/^(frame|group|编组|矩形|椭圆|形状|切片|蒙版|layer|rect|image|vector|line)[\s_-]?\d*$/i.test(name.trim());
+  const walk = (items: unknown[], path: string[]) => {
     for (const s of items) {
       if (!s || typeof s !== 'object') continue;
-      layers.push(normalizeShape(s as Record<string, any>));
-      const children = (s as Record<string, any>).layers;
-      if (Array.isArray(children) && children.length) walk(children);
+      const shape = s as Record<string, any>;
+      const shapeName = String(shape.name || '');
+      const childPath = shapeName && meaningfulName(shapeName) ? [...path, shapeName] : path;
+      const layer = normalizeShape(shape);
+      if (layer.w > 0 && layer.h > 0) {
+        if (isContentful(layer)) {
+          if (path.length) layer.parentPath = path.join('/');
+          layers.push(layer);
+        } else {
+          droppedCount++;
+        }
+      }
+      const children = shape.layers;
+      if (Array.isArray(children) && children.length) walk(children, childPath);
     }
   };
-  walk(arr);
-  const filtered = layers.filter((l) => l.w > 0 && l.h > 0);
+  walk(arr, []);
   const meta: DesignMeta = {
     rawLayerCount: arr.length,
-    totalLayerCount: filtered.length,
+    totalLayerCount: layers.length,
+    droppedLayerCount: droppedCount,
+    payloadBytes: Buffer.byteLength(JSON.stringify(layers)),
     docName: json?.artboard?.name ?? json?.document?.name ?? json?.name ?? json?.title ?? undefined,
   };
-  return { layers: filtered, meta };
+  return { layers, meta };
 }
