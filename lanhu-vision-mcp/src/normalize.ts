@@ -47,28 +47,31 @@ export function normalizeShape(shape: Record<string, any>): DesignLayer {
   // 切图 URL（hasExportImage 的图层才有，artboard/bitmapLayer 均放在 shape.image）
   if (shape.image?.imageUrl) layer.imageUrl = shape.image.imageUrl;
   if (shape.hasExportImage) layer.hasExportImage = true;
-  // 合成图层 opacity × fill opacity × color.a 进最终 alpha（只取 color.value 会丢图层透明度）
-  // 注意：opacity=0 是合法值（隐藏图层/透明填充），用 ?? 兜底而非 || 1，否则 0 会被误判成 1；
-  // 脏数据（opacity 为非数字字符串 → NaN）视为 1，不吞掉图层
+  // 合成 opacity × fill.opacity × color.a；opacity=0 合法故用 ?? 兜底，NaN 视为 1 不吞图层
   const rawOpacity = shape.opacity == null ? 1 : Number(shape.opacity);
   const layerOpacity = Number.isFinite(rawOpacity) ? rawOpacity : 1;
-  // 从 fill0 里取 fill 自身透明度与 color.a。文本路径的 textStyle.color 是裸 color 对象（无嵌套 .color），
-  // 故支持两种形状：fill0.color.a（fill 路径）/ fill0.a（文本 color 路径）。
+  // 两种形状：fill0.color.a（fill 路径）/ fill0.a（文本 color 路径，textStyle.color 是裸 color 对象）
   const fillOpacityOf = (fill0: any): number => Number(fill0?.opacity ?? 1) || 0;
   const colorAlphaOf = (fill0: any): number => {
     if (fill0 == null) return 1;
     const a = fill0.color?.a ?? fill0.a; // fill 形状：{color:{a}}；文本 color 形状：{a}
     return Number(a ?? 1) || 0;
   };
-  // 合成 alpha 后重建颜色串：eff<1 时统一输出 rgba（hex/rgb 都转，透明度不丢——蓝湖界面可见的
-  // 60% 文字透明度在 color.a 字段里，蓝湖自产代码会丢，这里补上）；eff>=1 原样保留。
+  // eff<1 统一转 rgba：蓝湖界面可见的 60% 文字透明度在 color.a 里，其自产代码会丢
   const applyAlpha = (rawValue: unknown, fill0?: any): string | undefined => {
     if (typeof rawValue !== 'string') return undefined;
     const eff = colorAlphaOf(fill0) * layerOpacity * fillOpacityOf(fill0);
     if (eff >= 1) return rawValue; // 不透明，原样
     const a = Number(eff.toFixed(4));
-    const m = /rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/.exec(rawValue);
-    if (m) return `rgba(${m[1]},${m[2]},${m[3]},${a})`;
+    // 整数字节 rgb(a)：rgba(1,2,3) / rgba(1,2,3,.5)
+    const rgbInt = /^rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)$/.exec(rawValue.trim());
+    if (rgbInt) return `rgba(${rgbInt[1]},${rgbInt[2]},${rgbInt[3]},${a})`;
+    // 百分比 rgb(a)：rgba(100%,50%,0%,.8) — 蓝湖少见，但归一化器需兼容，避免透明度被静默丢弃
+    const rgbPct = /^rgba?\((\d+(?:\.\d+)?)%,\s*(\d+(?:\.\d+)?)%,\s*(\d+(?:\.\d+)?)%(?:,\s*([\d.]+))?\)$/.exec(rawValue.trim());
+    if (rgbPct) {
+      const pct2Byte = (p: string) => Math.min(255, Math.max(0, Math.round(parseFloat(p) * 2.55)));
+      return `rgba(${pct2Byte(rgbPct[1])},${pct2Byte(rgbPct[2])},${pct2Byte(rgbPct[3])},${a})`;
+    }
     // hex（#RGB/#RRGGBB）：解析转 rgba，避免 fill/图层透明度被静默丢弃
     const hx = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(rawValue.trim());
     if (hx) {
@@ -76,7 +79,9 @@ export function normalizeShape(shape: Record<string, any>): DesignLayer {
       if (h.length === 3) h = h.split('').map((c) => c + c).join('');
       return `rgba(${parseInt(h.slice(0, 2), 16)},${parseInt(h.slice(2, 4), 16)},${parseInt(h.slice(4, 6), 16)},${a})`;
     }
-    return rawValue; // 其它格式无法解析，原样
+    // 其它格式（hsl/named/带空格…）：留痕但仍返回原值，避免丢颜色；透明度未能叠入，用 stderr 告警
+    console.error(`[normalize] applyAlpha 无法解析颜色：${rawValue}，透明度 alpha=${a} 未叠入`);
+    return rawValue;
   };
   if (layer.type === 'text') {
     const rawText = shape.text;
@@ -111,25 +116,21 @@ export function normalizeShape(shape: Record<string, any>): DesignLayer {
     }
     layer.radius = Number(style.borderRadius ?? style.cornerRadius ?? 0) || undefined;
   }
-  // 导出图层透明度：仅当透明度没地方烘（无 fill/gradient/color 的图层，典型是 image 切图）时导出，
-  // 供 Agent 自行叠 CSS opacity。有颜色的图层透明度已烘进 rgba alpha，再导出会导致 eff² 双重叠加。
+  // 只在透明度无处可烘时导出（无 fill/gradient/color，典型是 image 切图）；已烘进 rgba 的再导出会 eff² 双重叠加
   const hasBakedColor = !!(layer.fill || layer.gradient || layer.color);
   if (layerOpacity < 1 && !hasBakedColor) layer.opacity = Number(layerOpacity.toFixed(4));
   return layer;
 }
 
-// 把抓取到的 sketch JSON 归一化为 { layers, meta }（递归遍历嵌套 layers 树）
-// 清洗策略：①无样式纯容器层（无 fill/文本/切图/圆角/透明度）过滤不输出，省 30-67% 体积；
-// ②保留扁平数组但加 parentPath（容器名链）保分组语义；③meta 报 payloadBytes 供调用方感知数据大小
+// 清洗：过滤无样式纯容器层（省 30-67% 体积），保留扁平数组但加 parentPath 保分组语义
 export function normalizeSketch(json: Record<string, any>): { layers: DesignLayer[]; meta: DesignMeta } {
   const arr = findLayerArray(json) || [];
   const layers: DesignLayer[] = [];
   let droppedCount = 0;
-  // isContentful：有视觉信息的图层才输出（容器名不丢，进子层 parentPath）
+  // 有视觉信息才输出；容器名不丢，进子层 parentPath
   const isContentful = (l: DesignLayer): boolean =>
     !!(l.fill || l.gradient || l.color || l.text || l.imageUrl || l.hasExportImage || l.radius || l.opacity != null);
-  // parentPath 只收有语义的容器名：自动生成名（Frame_xxx/Group_xxx/编组N/矩形N 等）对 AI 无信息量，
-  // 且实测会吃掉过滤省下的字节
+  // 自动生成名（Frame_xxx/编组N…）对 AI 无信息量，且会吃掉过滤省下的字节
   const meaningfulName = (name: string): boolean => !/^(frame|group|编组|矩形|椭圆|形状|切片|蒙版|layer|rect|image|vector|line)[\s_-]?\d*$/i.test(name.trim());
   const walk = (items: unknown[], path: string[]) => {
     for (const s of items) {

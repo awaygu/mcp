@@ -8,7 +8,7 @@ opencode）获得三件事：
 - **按项目/分组组织**：`lanhu_list_directory` 一次拉全团队目录（**无需链接**，项目→分组一页地图），
   `lanhu_read_sector` 按分组列稿目录（不含图层树，防上下文爆炸），支持「团队 → 项目 → 分组（需求）→ 设计稿」完整层级。
 - **下载切图**：`lanhu_download_slices` 把设计稿切图素材拉到本地 assets，供开发引用。
-- **视觉理解 + 验收**：`analyze` 用配置的视觉模型理解设计稿封面图；`lanhu_verify_render` /
+- **视觉理解 + 验收**：`lanhu_fetch_design` 在配置了视觉模型时**默认自动**理解设计稿封面图（返回 `visionAnalysis`），无需每次手带 `analyze`；`lanhu_verify_render` /
   `vision_defect_check` / `vision_e2e_triage` 做渲染对比、UI 缺陷检测、E2E 失败归因。
 
 TypeScript 实现，基于官方 MCP SDK（`@modelcontextprotocol/sdk` + `zod`）。
@@ -51,6 +51,8 @@ node lanhu-login.mjs
 
 配置 `LLM_API_KEY`（视觉模型 Key），可选 `LANHU_VISION_MODEL`。
 
+配好后 `lanhu_fetch_design` 会**默认带上视觉理解**（`analyze` 自动为 `true`）；想省掉这次视觉调用传 `analyze:false`，或设 `LANHU_AUTO_ANALYZE=0` 全局关闭。
+
 ### 3. 接入 Agent（项目根 `.mcp.json`）
 
 ```json
@@ -78,14 +80,15 @@ node lanhu-login.mjs
 | 工具 | 作用 | 关键入参 |
 |---|---|---|
 | `lanhu_check_auth` | 探活 cookie 是否有效（401 二次确认） | `cookie` |
-| `lanhu_fetch_design` | 读单个设计稿图层树（+可选视觉理解） | `url` / `mode`(api/mock) / `analyze` / `cookie` |
+| `lanhu_fetch_design` | 读单个设计稿图层树（+视觉理解，配置了视觉模型时默认开） | `url` 或 `imageId+projectId` / `mode`(api/mock) / `analyze?` / `cookie` |
 | `lanhu_list_teams` | 列出账号加入的全部团队（多团队发现入口） | `cookie` |
 | `lanhu_list_directory` | 一次拉团队目录（项目→分组）。约 1.6k tokens | `url?`(提 tid) / `teamId?` / `cookie` |
 | `lanhu_read_sector` | 按分组名列出稿目录（稿名/尺寸/层数，不含图层树——全量会撑爆上下文） | `url`(链接/UUID) / `sector` / `cookie` |
-| `lanhu_download_slices` | 下载切图到本地目录（单稿或分组批量，三层去重，下载即压 2x） | `url` / `outputPath` / `sector?` / `sliceNames?` / `skipExisting?` |
-| `lanhu_verify_render` | 渲染页 vs 设计稿 语义对比 | `actualImageBase64` / `designImageBase64` |
-| `vision_defect_check` | 整页/局部 UI 缺陷检测 | `imageBase64` / `language` |
-| `vision_e2e_triage` | E2E 失败截图+DOM 归因 | `screenshotBase64` / `domSnapshot` / `errorText` |
+| `lanhu_download_slices` | 下载切图到本地目录（单稿或分组批量，三层去重，并发下载，下载即压 2x） | `url` / `outputPath` / `sector?` / `sliceNames?` / `skipExisting?` |
+| `lanhu_verify_spec` | **设计稿验收**：图层树期望值 ↔ 页面计算样式，逐字段 diff 出偏差清单 | `designUrl` / `pageUrl` / `waitFor?` / `maxDiffs?` |
+| `lanhu_verify_render` | 渲染页 vs 设计稿 语义对比（主观线索，不作验收结论；不传 designImageBase64 时退化为单图一致性检查） | `actualImageBase64` / `designImageBase64?` / `context?`(已知刻意差异，跳过不报) |
+| `vision_defect_check` | 整页/局部 UI 缺陷检测（12 类缺陷枚举） | `imageBase64` / `context?` / `language?` |
+| `vision_e2e_triage` | E2E 失败截图+DOM 归因（期望-实际差异分析） | `expectedBehavior?`(强烈建议传) / `testSteps?` / `screenshotBase64?` / `domSnapshot?` / `errorText?` |
 
 ## 使用示例
 
@@ -128,10 +131,64 @@ lanhu_fetch_design({
 })
 ```
 
-`analyze` 会返回 `visionAnalysis`（布局/组件/配色/字体的文字理解），**封面图 base64 不进上下文**，
+**`analyze` 默认自动开启**：已配置视觉模型（模型名 + `LLM_API_KEY`/`MT_API_KEY`）时，不传 `analyze` 也等价于 `analyze: true`；
+未配置视觉能力时默认 `false`。显式传 `true`/`false` 始终优先于自动判断。
+想保留图层树、跳过视觉调用，显式传 `analyze: false`，或设 `LANHU_AUTO_ANALYZE=0` 全局关闭自动分析。
+
+`analyze` 会返回 `visionAnalysis`（纯语义理解：page_type/版面区块/组件清单(position 用档位词+区块名)/视觉叠放层级/imagery(每张背景图的内容+与文字的关系+真伪占位)/氛围/动效暗示；精确数值一律不输出，由 layers 提供），**封面图 base64 不进上下文**，
 只在 server 内部喂给视觉模型——且喂前已压到 **1x JPEG**（4x 封面 1.6MB → 约 100KB 内）。
+视觉分析失败（模型超时/鉴权失败/无封面图）不再让整次读稿失败，而是原样返回图层树并附 `visionError` 字段说明原因。
 `lanhu_verify_render` / `vision_defect_check` / `vision_e2e_triage` 的入参截图也会在 server 端统一压到最长边 1568 再发模型。
 结合图层树的精确数值做双重验证。
+
+### 设计稿验收（lanhu_verify_spec）
+
+替代人工走查的主手段：**不靠模型看图，靠数值比对**。
+
+```
+lanhu_verify_spec({
+  designUrl: "https://lanhuapp.com/web/#/item/project/detailDetach?pid=xxx&image_id=yyy",
+  pageUrl: "http://localhost:5173/task-center",
+  waitFor: ".task-list"        // 等接口数据渲染完再采，可选
+})
+```
+
+流程：设计稿图层树取**期望值** → Playwright 打开页面采 `getComputedStyle` 取**实际值** → 逐字段 diff → 输出偏差清单。
+比对字段：`x / y / width / height`（容差 1px）、`color / fill`（通道差 ≤2 且 alpha 差 ≤0.02）、`fontSize`（容差 0.5）、`fontWeight`、`lineHeight`（容差 1px）、`text`。
+偏差按 `minor / major / critical` 分级，带 `delta`。
+
+**H5 webview 验收口径**（内嵌 Android/iOS webview 的移动端项目）：
+- **宽度严格、高度宽松**：`x` / 非文本层 `width` 严比对；`y` / `height` 因状态栏占位与内容动态渲染，整体偏移属预期，差异一律降 `minor`。
+- **状态栏不渲染**：设计稿顶部状态栏层（命名或顶部整条几何特征）比对前剔除；页面整体竖直偏移 `dy` 回 `offset` 字段并标注为预期，不报缺陷。
+- **文案语义接近即可**：文本差异默认降 `minor`（warning）；配了视觉模型时批量做语义等价判定，仅当确为不同含义才升 `major`。
+- **前置去噪**：`opacity=0`、零尺寸、蒙版/标注/备份组(`*备份`)/占位/切图导出件等无效图层比对前剔除，不污染匹配与未匹配统计。
+- **_fill 在父级背景实现_**：页面叶子节点背景透明时向上回退 3 级祖先背景色；命中即跳过；叶子全透明仍未命中则封顶 `major`，不刷 critical。
+
+**元素匹配打分**：文案精确相等 > 纯几何 IoU ≥0.5。
+统一候选池 + **全局贪心**分配，不按图层顺序逐个挑——顺序贪心在重复 key 下会先到先得、整队错位。
+不依赖任何 DOM 标注属性，开发无需在页面写 `data-design`；密集/重叠区域的归属歧义由「样式清单比对」安全网兜底（见下）。
+
+**整体偏移估算**（页面与设计稿常差一个状态栏高度，不校正会让所有 IoU 归零）：
+用**真实位置匹配对**（IoU≥0.5，与文案/语言无关）RANSAC 反推整体偏移 → 再用校正后的偏移重跑几何轮补齐漏配。
+不依赖文案锚点，故设计稿与页面语言不同（简/繁/英）也能估准（实测 EN/ZH 均收敛到 dx≈0, dy≈-35）。
+
+**样式清单比对（永远在线的安全网，无需任何标注）**：
+不做元素配对，只比「设计稿文字样式集合」vs「页面文字样式集合」，元组 = `fontSize / 字重 / 色值`。
+它**不比文案**，因此跨语言、跨迭代文案差异都不会让它失盲——是逐元素配对的主信号兜底，也是开发无需在页面写标注属性的前提下仍能发现样式漂移的抓手。
+结果落在返回的 `inventory` 字段：`missingOnPage`（设计稿有、页面无 → 元素缺失/样式被覆盖）与
+`notInDesign`（页面有、设计稿无 → 样式漂移/硬编码），每项附示例图层名/选择器便于定位。
+> 实测（任务中心稿，零标注）：`inventory` 以 7 类差异定位到真缺陷集群——任务名 `<p>` 被 `:last-child` 误伤（`10px/700` 共 16 处）、
+> Go/Claim 按钮字号漂移（`14px→12px` 共 7 处）；而配对模式同条件下输出 55 条偏差，信噪比显著提升。
+
+> 注意：**纯几何匹配对同尺寸重叠的大矩形区分力弱**（如白色卡片矩形易误配到相邻橙色进度条）。
+> 这类归属歧义不靠 DOM 标注解决，而是交给「样式清单比对」安全网按样式集合兜底——它不做几何匹配，天然不受大矩形误配影响。
+
+> 真实项目实测（任务中心线上稿 375×1078 / 339 层 vs 本地 dev 页面）：
+> 去噪+宽松化后 EN 偏差 50 条（critical 6）、ZH 26 条（critical 3）；抓到 1 类真缺陷并定位根因——
+> 任务名 `<p>` 被 `p:last-child` 降级规则误伤（期望 14px/700/#232129，实际 10px/400/#262529，7 个任务项全中）。
+> 前提是设计稿与页面**同语言、同迭代**；跨语言/跨迭代时文本对不上，偏差里大部分是噪音（已降级为 warning）。
+
+当前为最小可用版本：只跑默认态、按设计稿 viewport 单一视口、不评分。
 
 ### 列账号所属团队（多团队发现）
 
@@ -295,12 +352,39 @@ vision_e2e_triage({ screenshotBase64: "<失败截图>", domSnapshot: "<DOM>", er
 | `LLM_API_KEY` | analyze/验收时必填 | — | 视觉模型 Key |
 | `VISION_BASE_URL` | 否 | `https://api.deepseek.com` | 视觉模型端点（验证时可指向 mock） |
 | `LANHU_VISION_MODEL` | 否 | `deepseek-v4-flash-vision-exp` | 视觉模型名 |
+| `LANHU_AUTO_ANALYZE` | 否 | — | 设为 `0` 关闭 `lanhu_fetch_design` 的自动视觉分析（配置齐全时也默认不开） |
+| `LANHU_VISION_MAX_TOKENS` | 否 | `4096` | 输出上限。JSON Output 模式下不设会被截断 |
+| `LANHU_VISION_MAX_EDGE` | 否 | `1568` | 入参图压缩的最长边。DeepSeek 进模型前统一缩到约 800×800 等效像素、每张封顶 384 token，设 `1024` 可省流量 |
+| `LANHU_VISION_TIMEOUT_MS` | 否 | `120000` | 单次视觉模型请求超时（毫秒） |
+| `VISION_USE_V1` | 否 | — | 设为 `0` 时端点用文档原生的 `/chat/completions`，默认 `/v1/chat/completions` |
+| `LANHU_SLICE_CONCURRENCY` | 否 | `6` | 切图下载并发数（分组批量下载时生效） |
 | `LANHU_COOKIE` | 官方 api 模式必填（与 `LANHU_COOKIE_FILE` 二选一） | — | 蓝湖登录 Cookie 串（F12 复制） |
 | `LANHU_COOKIE_FILE` | 同上 | — | cookie 文件路径（内容为完整 cookie 串，已 gitignore）；`lanhu-login.bat` 续期时自动写入此文件 |
 | `LANHU_MOCK` | 否 | — | 设为 `1` 时 fetch_design 返回内置示例（无需联网） |
 
 > cookie 解析优先级：**工具入参 `cookie` > 环境变量 `LANHU_COOKIE` > 文件 `LANHU_COOKIE_FILE`**。
 > ⚠️ 注意：若曾设置过 `LANHU_COOKIE` 环境变量，它会**压制文件内容**——用 `lanhu-login.bat` 续期后新 cookie 写入了文件，但旧环境变量仍在生效，请求会持续 401。此时需删除/更新该环境变量，或清掉它改用文件方式。
+
+## DeepSeek 视觉接入规范（已对齐）
+
+按 [图像理解](https://api-docs.deepseek.com/zh-cn/guides/vision) 与 [JSON Output](https://api-docs.deepseek.com/zh-cn/guides/json_mode) 文档实现：
+
+| 规范要求 | 实现 |
+|---|---|
+| 模型名 `deepseek-v4-flash-vision-exp`（唯一支持图片的实验模型） | 默认模型名；其它模型传图会 400 |
+| 图片只能出现在 `user` 消息 | 只发 `user` 消息，`image_url` 块、`detail` 放在 `image_url` 对象内 |
+| 单图 ≤ 32 MiB、请求体 ≤ 48 MiB | 发请求前按 base64 长度预估拦截，超限直接报可读错误（不浪费一次调用） |
+| JSON Output 要求 prompt 含小写 `json` 字样 + 给出 JSON 样例 | `callVision` 自动校验并补齐；四个工具的 prompt 都自带 JSON 结构样例 |
+| JSON Output 必须设 `max_tokens` 防截断 | 默认 4096，`LANHU_VISION_MAX_TOKENS` 可调 |
+| JSON Output 有概率返回空 content（官方已知问题） | 最多 3 次尝试 + 退避重试 |
+| 图片进模型前被缩到约 800×800 等效像素、每张封顶 384 token | 送图前先压到 `LANHU_VISION_MAX_EDGE`（默认 1568，DeepSeek 场景建议 1024） |
+
+两个自适应降级（避免实验性模型/代理差异直接把调用打死）：
+
+- HTTP 404 → 自动在 `/v1/chat/completions` 与 `/chat/completions` 之间切换一次；
+- HTTP 400 且错误指向 `response_format` → 剥掉 JSON Output，退回纯提示词约束再解析。
+
+> ⚠️ 401 `Authentication Fails`：说明 `LLM_API_KEY` / `MT_API_KEY` 不是 **DeepSeek 平台**的 key（其它厂商的 `sk-` key 打不通 api.deepseek.com）。去 <https://platform.deepseek.com/api_keys> 申请后替换。
 
 ## 开发 / 类型检查
 
@@ -356,7 +440,7 @@ CMD ["node", "dist/index.js"]
    没匹配则如实回答未找到或问用户。无需让用户补链接，无需自己下钻。
 2. 有链接或项目 UUID 时，lanhu_read_sector({url: 链接或UUID, sector: 分组名}) 看该分组的稿目录（稿名/尺寸/层数，不含图层树），按稿名挑出要实现的目标。
 3. 实现单个 UI 前用 lanhu_fetch_design 逐张读目标稿的结构化图层树（一次只读当前要实现的那 1 张，不要批量读；色值/字号从数据取，不要靠截图 OCR 小字）；
-   需要整体视觉理解时加 analyze:true 让视觉模型理解封面图。
+   配了视觉模型时会自带 visionAnalysis（版面/组件的文字理解），想省掉这次视觉调用就传 analyze:false。
 4. 需要切图素材时 lanhu_download_slices 下载到项目 assets 目录，代码里引用返回的 file 路径。
 5. 实现后把渲染页截图传给 lanhu_verify_render 做对比，或 vision_defect_check 做缺陷检测。
 6. E2E 失败时把截图+DOM 传给 vision_e2e_triage 拿根因。

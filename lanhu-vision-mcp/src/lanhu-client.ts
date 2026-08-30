@@ -1,5 +1,5 @@
 // lanhu-client.ts — 蓝湖官方 API 客户端（Cookie 直调，无需浏览器）
-// 端点：/api/project/image(稿详情+json_url) · /api/project/project_sectors+images(分组) · /api/account/user_teams(团队) · /workbench abstractfile/list(团队目录)
+// 端点：/api/project/image(稿详情+json_url) · /api/project/project_sectors+images(分组) · /api/account/user_teams(团队) · /workbench abstractfile/list(目录)
 
 import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -10,13 +10,12 @@ import type { Credentials, DesignLayer, DesignMeta, DesignResult, SectorInfo, Sl
 
 const LANHU_API_BASE = 'https://lanhuapp.com';
 
-// cookie 续期/首次配置指引（两种方式，所有过期/缺失提示统一引用）
-// 方式1：F12 复制 cookie（快，技术同学）；方式2：跑登录脚本（小白，自动写入）
+// 所有 cookie 过期/缺失提示统一引用这段（方式1 F12 复制，方式2 跑登录脚本）
 const RELOGIN_HINT =
   '方式1：浏览器登录蓝湖后按 F12 → Network → 点任意请求 → 复制 Cookie 头整串，写入 .mcp-local/lanhu.cookie（或设 LANHU_COOKIE 环境变量）；' +
   '方式2：双击 lanhu-login.bat（或运行 npm run login），浏览器登录后按 Enter 自动写入 cookie。完成后让 AI 重试。';
 
-// team_id 回退：入参 > URL tid；都缺则报错（tenantId=0 返回空目录，不能兜底）
+// 都缺则报错：tenantId=0 会返回空目录，不能兜底
 function resolveTeamId(opts: { teamId?: string; url?: string }): string {
   if (opts.teamId) return opts.teamId;
   if (opts.url) {
@@ -26,8 +25,7 @@ function resolveTeamId(opts: { teamId?: string; url?: string }): string {
   throw new Error('无法定位团队：请传 teamId（来自 lanhu_list_teams）或 url（蓝湖链接提 tid）；纯 cookie 不带 teamId/url 时无法列目录');
 }
 
-// 打 user_teams 接口拿原始团队列表（listUserTeams 与 checkAuth 共用，避免重复 fetch/解析）
-// 不做鉴权判断，只返回 { status, teams }；上层各自决定怎么处理错误
+// 不做鉴权判断，只返 { status, teams }，上层各自决定怎么处理错误
 async function fetchUserTeams(cookie: string): Promise<{ status: number; teams: any[] }> {
   const res = await fetch(`${LANHU_API_BASE}/api/account/user_teams?need_open_related=true`, {
     headers: apiHeaders(cookie),
@@ -37,7 +35,7 @@ async function fetchUserTeams(cookie: string): Promise<{ status: number; teams: 
   return { status: res.status, teams: json?.result || json?.data || [] };
 }
 
-// 列账号所属全部团队（/api/account/user_teams），只返回选 teamId 需要的字段，省略敏感项
+// 只返回选 teamId 需要的字段，省略敏感项
 export async function listUserTeams(
   opts: Credentials
 ): Promise<{
@@ -46,7 +44,7 @@ export async function listUserTeams(
 }> {
   const cookie = resolveCookie(opts);
   const { status, teams } = await fetchUserTeams(cookie);
-  // 401/错误体不静默为空，避免调用方误以为账号无团队（auth 作用域：401=cookie 过期/缺字段）
+  // 401 不静默为空，否则调用方会误以为账号无团队
   assertStatusOk(status, 'auth', '团队列表');
   return {
     teamCount: teams.length,
@@ -80,12 +78,11 @@ function resolveCookie(opts: Credentials): string {
 // 接受蓝湖 URL 或项目 UUID，统一返回 project_id
 function resolveProjectId(urlOrId: string): string {
   if (!urlOrId) throw new Error('需要蓝湖 URL 或项目 UUID');
-  // 看起来是 URL（含 / 或 ?），走解析
   if (/[/?]/.test(urlOrId)) {
     const { projectId } = parseLanhuUrl(urlOrId);
     if (projectId) return projectId;
   }
-  // 否则当 UUID（蓝湖 pid 是 8-4-4-4-12 格式）
+  // 蓝湖 pid 是 8-4-4-4-12 的 UUID
   if (/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(urlOrId)) {
     return urlOrId;
   }
@@ -100,18 +97,14 @@ function apiHeaders(cookie: string): Record<string, string> {
   };
 }
 
-// 按目标 URL 决定是否携带登录 Cookie：仅 lanhuapp.com（官方 API）发 Cookie，
-// CDN/OSS（json_url 标注数据、封面图、切图）一律不发——凭据不外泄到第三方主机，且 CDN 无需凭据
+// 仅 lanhuapp.com 带 Cookie；CDN/OSS（标注数据、封面、切图）一律不带，免凭据外泄到第三方主机
 function headersFor(url: string, cookie: string): Record<string, string> {
   const host = new URL(url).hostname;
   const isLanhu = host === 'lanhuapp.com' || host.endsWith('.lanhuapp.com');
   return isLanhu ? apiHeaders(cookie) : { Referer: 'https://lanhuapp.com/' };
 }
 
-// 统一 HTTP 错误处理：401 分场景提示，避免一刀切「cookie 过期」误导
-// - scope='auth'（探活/全局接口）401 → cookie 确实过期/缺字段 → 重新登录有效
-// - scope='resource'（单个稿/项目）401 → 多半是无权访问该资源 → 重新登录无效，要找设计者开权限
-// - 非 401 错误 → 原样报 HTTP 状态
+// 401 分场景：auth=cookie 过期（重新登录有效）；resource=无该资源权限（重新登录无效）
 class LanhuHttpError extends Error {
   constructor(public status: number, public scope: 'auth' | 'resource', public hint: string) {
     super(hint);
@@ -137,13 +130,12 @@ function assertOk(res: Response, scope: 'auth' | 'resource', what: string): void
   assertStatusOk(res.status, scope, what);
 }
 
-// cookie 探活：复用 fetchUserTeams（同一接口），不抛错，返回结构化 { ok, reason, hint }
-// 供 lanhu_check_auth 工具与 401 二次确认用——不抛错是因为 AI 需要拿到结构化结果而非捕获异常
+// 探活不抛错：AI 需要结构化结果而非捕获异常
 export async function checkAuth(opts: Credentials): Promise<
   | { ok: true; teamCount: number; teams: Array<{ teamId: string; name: string }> }
   | { ok: false; status: number; reason: string; hint: string }
 > {
-  // 未配置 cookie 时也返回结构化结果（不抛错），与工具描述的首次使用分支一致
+  // 无 cookie 时也返回结构化结果，与工具描述的首次使用分支一致
   if (!opts.cookie) {
     return { ok: false, status: 0, reason: 'no_cookie', hint: `未配置蓝湖 cookie。${RELOGIN_HINT}` };
   }
@@ -188,22 +180,22 @@ async function fetchDesignByImageId(
   let slices: SliceInfo[] = [];
   if (jsonUrl) {
     const jsonRes = await fetch(jsonUrl, { headers: headersFor(jsonUrl, cookie) });
+    // CDN 403/404 常见于标注数据过期，需明确报状态码，别让 SyntaxError 刷屏
+    if (!jsonRes.ok) throw new Error(`下载设计稿标注数据失败：HTTP ${jsonRes.status}（${jsonUrl}）`);
     const json = await jsonRes.json();
     const norm = normalizeSketch(json);
     layers = norm.layers;
     meta = norm.meta;
-    // 画布尺寸取 artboard.frame（图层坐标基准）；detail.width 是蓝湖缩放后的显示尺寸
+    // 画布尺寸取 artboard.frame（图层坐标基准）；detail.width 是缩放后的显示尺寸
     const ab = json?.artboard;
     if (ab?.frame) {
       canvasWidth = Math.round(Number(ab.frame.width || 0)) || canvasWidth;
       canvasHeight = Math.round(Number(ab.frame.height || 0)) || canvasHeight;
     }
-    // 收集切图：遍历图层树，所有 hasExportImage 且带 image.imageUrl 的图层
     slices = collectSlices(ab);
   }
 
-  // 3) 拿封面图（完整设计截图，仅 needCover 时下载；headersFor 保证 CDN 不带 Cookie）
-  // 4x 封面单张可达 1.6MB：压到 viewport 1x JPEG 再返回，喂视觉模型不再二次处理
+  // 3) 拿封面图（仅 needCover 时下载）；4x 单张可达 1.6MB，压到 1x JPEG 再返回
   let coverImageBase64: string | undefined;
   if (opts.needCover) {
     const coverUrl = detail.url || versions[0]?.url;
@@ -268,7 +260,18 @@ export async function fetchDesignViaApi(
   return { ...r, url };
 }
 
-// 一次拉全团队目录（项目→分组，不展开设计稿名）：workbench parentId=0 列根，folder id 下钻项目，再并列项目分组
+// 读单个设计稿（imageId+projectId 直达，免拼 URL——read_sector 拿到的就是 image_id）
+export async function fetchDesignByIds(
+  imageId: string,
+  projectId: string,
+  opts: Credentials & { needCover?: boolean }
+): Promise<DesignResult> {
+  const cookie = resolveCookie(opts);
+  const r = await fetchDesignByImageId(imageId, projectId, cookie, opts);
+  return { ...r, name: r.name || imageId };
+}
+
+// parentId=0 列根 → folder 下钻项目 → 并列各项目分组；不展开设计稿名
 export async function listDirectory(
   opts: Credentials & { teamId?: string; url?: string }
 ): Promise<{
@@ -292,7 +295,7 @@ export async function listDirectory(
   // 2) 并行下钻所有 folder，根目录的 project 直接收
   const folders = rootItems.filter((p) => p.sourceType === 'folder');
   const rootProjects = rootItems.filter((p) => p.sourceType !== 'folder');
-  // 尽力而为：单个 folder 下钻失败（401/500/非JSON）只收集进 folderErrors，不整体抛错
+  // 单个 folder 下钻失败只记进 folderErrors，不整体抛错
   const folderErrors: string[] = [];
   const underFolders = await Promise.all(
     folders.map(async (f) => {
@@ -314,8 +317,7 @@ export async function listDirectory(
   );
   const allProjects = [...rootProjects, ...underFolders.flat()];
 
-  // 3) 并行列每个项目的分组（复用 listSectorsByProject，只取 name + designCount）
-  // 尽力而为：单个项目无权限/失败只记录，不影响其余项目——目录列举的意义就是「能看到什么列什么」
+  // 3) 并行列各项目分组；单个项目无权限只记录，不影响其余——目录列举就是「能看到什么列什么」
   const failedProjects: Array<{ project: string; projectId: string; error: string }> = [];
   const perProject = (
     await Promise.all(
@@ -355,7 +357,7 @@ export async function listSectorsByProject(
 ): Promise<{ projectId: string; sectorCount: number; sectors: SectorInfo[] }> {
   const cookie = resolveCookie(opts);
   const headers = apiHeaders(cookie);
-  // team_id 用于 /api/project/images，从 URL 取或默认 0；按 project 查时用 0 兜底
+  // 按 project 查时 team_id 用 0 兜底
   const teamId = '0';
 
   const sRes = await fetch(`${LANHU_API_BASE}/api/project/project_sectors?project_id=${projectId}`, { headers });
@@ -385,9 +387,7 @@ export async function listSectorsByProject(
   };
 }
 
-// 按分组名列出该分组下所有设计稿的目录（不含图层树——26 稿全量 layers 实测 395KB 会撑爆
-// Agent 上下文；改为目录定位，AI 按稿名挑中目标后用 fetch_design 逐张读）
-// url 参数接受蓝湖 URL 或项目 UUID
+// 只给目录不给图层树：26 稿全量 layers 实测 395KB 会撑爆 Agent 上下文
 export async function readSector(
   url: string,
   sectorName: string,
@@ -405,7 +405,7 @@ export async function readSector(
   }
   const cookie = resolveCookie(opts);
 
-  // 并行抓取该分组所有稿拿 viewport + 层数（独立 API 并行，禁止串行 await）；单稿失败不整体挂，记入 failed
+  // 并行抓各稿拿 viewport + 层数；单稿失败记入 failed，不整体挂
   const failed: Array<{ image_id: string; name: string; error: string }> = [];
   const okDesigns = (
     await Promise.all(
@@ -431,8 +431,7 @@ export async function readSector(
   };
 }
 
-// 下载切图到本地目录。范围：单稿传 urlOrImageId；分组传 sector + urlOrImageId（项目UUID或该分组任一稿链接）
-// 三层去重：URL 去重（同图只下一次）/ skipExisting（本地已存在跳过）/ sliceNames（只下指定名）。失败入 failed 列表
+// 单稿传 urlOrImageId；分组传 sector + urlOrImageId。三层去重：URL / skipExisting / sliceNames
 export async function downloadSlices(
   urlOrImageId: string,
   outputPath: string,
@@ -459,7 +458,7 @@ export async function downloadSlices(
   let designErrors: string[] | undefined;
 
   if (opts.sector) {
-    // 分组模式：拉该分组所有稿的切图，合并
+    // 分组模式
     const projectId = resolveProjectId(urlOrImageId);
     const cookie = resolveCookie(opts);
     const secList = await listSectorsByProject(projectId, opts);
@@ -469,8 +468,7 @@ export async function downloadSlices(
     }
     rawSlices = [];
     const secErrors: string[] = [];
-    // 并行抓取该分组所有稿的切图清单（独立 API 并行，禁止串行 await）；
-    // 尽力而为：单稿失败只记录进 designErrors，已抓到的切图照常下载
+    // 并行抓各稿切图清单；单稿失败只记 designErrors，已抓到的照常下载
     await Promise.all(
       sector.designs.map((d) =>
         fetchDesignByImageId(d.image_id, projectId, cookie, {})
@@ -513,7 +511,7 @@ export async function downloadSlices(
     const src = s.imageUrl;
     if (!src) continue;
     if (nameFilter && !nameFilter.has(s.name)) continue;   // sliceNames 过滤
-    if (seenUrl.has(src)) { dupCount++; continue; }        // URL 去重
+    if (seenUrl.has(src)) { dupCount++; continue; }
     seenUrl.add(src);
     pending.push(s);
   }
@@ -522,46 +520,58 @@ export async function downloadSlices(
   const failed: Array<{ name: string; url: string; status: number }> = [];
   let existCount = 0;
 
-  for (const s of pending) {
-    const src = s.imageUrl;
-    const cleanName = String(s.name).replace(/[/\\:*?"<>|]/g, '_').replace(/\s+/g, '_');
-    const hash = shortHash(src);
-    const fileName = `${cleanName}_${hash}.png`;
-    const filePath = path.join(dir, fileName);
+  // 并发池（默认 6）：串行每张图 RTT 叠加太严重，分组内切图多时会慢到不可用
+  const concurrency = Number(process.env.LANHU_SLICE_CONCURRENCY) || 6;
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < pending.length) {
+      const idx = cursor++;
+      const s = pending[idx];
+      const src = s.imageUrl;
+      const cleanName = String(s.name).replace(/[/\\:*?"<>|]/g, '_').replace(/\s+/g, '_');
+      const hash = shortHash(src);
+      const fileName = `${cleanName}_${hash}.png`;
+      const filePath = path.join(dir, fileName);
 
-    // skipExisting：本地已存在就跳过（不重复下载）
-    if (skipExist && existsSync(filePath)) {
-      existCount++;
-      out.push({ name: s.name, file: filePath, bytes: 0, w: s.w, h: s.h });
-      continue;
-    }
+      // skipExisting：本地已存在就跳过
+      if (skipExist && existsSync(filePath)) {
+        existCount++;
+        out[idx] = { name: s.name, file: filePath, bytes: 0, w: s.w, h: s.h };
+        continue;
+      }
 
-    let res: Response;
-    try {
-      res = await fetch(src, { headers: { Referer: 'https://lanhuapp.com/' } });
-    } catch {
-      failed.push({ name: s.name, url: src, status: 0 });
-      continue;
+      let res: Response;
+      try {
+        res = await fetch(src, { headers: { Referer: 'https://lanhuapp.com/' } });
+      } catch {
+        failed.push({ name: s.name, url: src, status: 0 });
+        continue;
+      }
+      if (!res.ok) {
+        failed.push({ name: s.name, url: src, status: res.status });
+        continue;
+      }
+      const buf = Buffer.from(await res.arrayBuffer());
+      // CDN 切图固定 4x（实测 pixel = design frame × 4）：压到设计尺寸的 2x 落盘
+      let final: Buffer = buf;
+      try { final = await compressSlicePng(buf, s.w, s.h); } catch { final = buf; }
+      writeFileSync(filePath, final);
+      out[idx] = { name: s.name, file: filePath, bytes: final.length, w: s.w, h: s.h };
     }
-    if (!res.ok) {
-      failed.push({ name: s.name, url: src, status: res.status });
-      continue;
-    }
-    const buf = Buffer.from(await res.arrayBuffer());
-    // CDN 切图固定 4x（实测 pixel = design frame × 4）：压到设计尺寸的 2x 落盘
-    let final: Buffer = buf;
-    try { final = await compressSlicePng(buf, s.w, s.h); } catch { final = buf; }
-    writeFileSync(filePath, final);
-    out.push({ name: s.name, file: filePath, bytes: final.length, w: s.w, h: s.h });
-  }
+  };
+  const workers = Array.from(
+    { length: Math.min(concurrency, pending.length || 1) },
+    () => worker()
+  );
+  await Promise.all(workers);
 
   return {
     scope,
     outputDir: dir,
-    downloaded: out.filter((s) => s.bytes > 0).length,
+    downloaded: out.filter((s) => s && s.bytes > 0).length,
     skipped: { dup: dupCount, exist: existCount },
     failed,
-    slices: out,
+    slices: out.filter(Boolean),
     ...(designErrors ? { designErrors } : {}),
   };
 }

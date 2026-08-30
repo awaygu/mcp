@@ -2,8 +2,9 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { readFileSync } from 'node:fs';
-import { fetchDesignViaApi, readSector, listDirectory, listUserTeams, downloadSlices, checkAuth } from './lanhu-client.js';
-import { callVision, DESIGN_ANALYZE_PROMPT } from './vision.js';
+import { fetchDesignViaApi, fetchDesignByIds, readSector, listDirectory, listUserTeams, downloadSlices, checkAuth } from './lanhu-client.js';
+import { verifyDesignSpec } from './verify-spec.js';
+import { callVision, DESIGN_ANALYZE_PROMPT, isAutoAnalyzeEnabled, isVisionConfigured } from './vision.js';
 import { shrinkForVision } from './image.js';
 import type { Credentials, DesignResult } from './types.js';
 
@@ -23,8 +24,7 @@ function jsonContent(obj: unknown) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(obj, null, 2) }] };
 }
 
-// 从 LANHU_COOKIE_FILE 指定文件读 cookie（文件内容就是完整 cookie 串，可含换行/空白，会自动 trim）
-// 文件不存在或未设置时返回 undefined，交由 resolveCookie 给出明确报错
+// LANHU_COOKIE_FILE 文件内容即完整 cookie 串；读不到返回 undefined，由 resolveCookie 报错
 function readCookieFile(filePath?: string): string | undefined {
   if (!filePath) return undefined;
   try {
@@ -38,13 +38,12 @@ function readCookieFile(filePath?: string): string | undefined {
 
 function credentials(args: { cookie?: string }): Credentials {
   return {
-    // cookie 优先级：显式入参 > 环境变量直填 LANHU_COOKIE > 从 LANHU_COOKIE_FILE 指定文件读
+    // cookie 优先级：入参 > LANHU_COOKIE > LANHU_COOKIE_FILE 文件
     cookie: args.cookie || process.env.LANHU_COOKIE || readCookieFile(process.env.LANHU_COOKIE_FILE),
   };
 }
 
-// 视觉工具入参图统一 shrink 到最长边 1568 + JPEG：截图/设计稿 base64 常是 2-4x 大图，
-// 先压小再发模型省请求体积与 token；非图片 base64 原样透传（模型自己报错）
+// 入参图先压小再发模型省体积；压不动就原样透传，让模型自己报错
 async function shrinkB64(b64: string): Promise<string> {
   try {
     const small = await shrinkForVision(Buffer.from(b64, 'base64'));
@@ -55,73 +54,108 @@ async function shrinkB64(b64: string): Promise<string> {
 }
 
 export function registerTools(server: McpServer): void {
-  // 1. 读设计稿
   server.registerTool(
     'lanhu_fetch_design',
     {
       description:
         '读取蓝湖设计稿的结构化图层树（精确 x/y/宽高/色值/字号/圆角/文本）。mode：api=官方Cookie接口(默认,无需浏览器) / mock=内置示例。analyze=true 时用配置的视觉模型理解设计稿封面图。' +
+        'analyze 默认值：已配置视觉模型（LANHU_VISION_MODEL + LLM_API_KEY/MT_API_KEY）时默认 true，未配置则默认 false；显式传 true/false 始终优先。' +
         '使用纪律：一次只读当前要实现的那 1 张稿；不要为「了解全貌」批量读稿——分组稿目录用 lanhu_read_sector，它足够定位；返回的 layers 含精确数值，色值/字号从数据取，禁止靠视觉模型 OCR 小字。',
       inputSchema: {
         mode: z.enum(['api', 'mock']).default('api').describe('抽取后端'),
         url: z.string().optional().describe('蓝湖设计稿链接，如 https://lanhuapp.com/web/#/item/project/detailDetach?pid=xxx&image_id=yyy'),
+        imageId: z.string().optional().describe('设计稿 id（来自 lanhu_read_sector），与 projectId 搭配；url 与 imageId 二选一，免拼 URL'),
+        projectId: z.string().optional().describe('项目 UUID（imageId 模式必填；url 模式不需要）'),
         cookie: z.string().optional().describe('登录 cookie 串（也可用 LANHU_COOKIE / LANHU_COOKIE_FILE）'),
-        analyze: z.boolean().optional().describe('true 时用视觉模型理解封面图，返回 visionAnalysis'),
-        mock: z.boolean().optional().describe('true 时返回内置示例'),
+        analyze: z.boolean().optional().describe('用视觉模型理解封面图，返回 visionAnalysis；不传时按是否配置了视觉模型自动决定（配了就 true）'),
       },
     },
     async (args) => {
-      if (process.env.LANHU_MOCK === '1' || args.mock || args.mode === 'mock') {
+      if (process.env.LANHU_MOCK === '1' || args.mode === 'mock') {
         return jsonContent(MOCK_DESIGN);
       }
 
-      // mode === 'api'（默认）
-      if (!args.url) throw new Error('api 模式需要 url');
-      const r = await fetchDesignViaApi(args.url, {
-        ...credentials(args),
-        needCover: !!args.analyze,
-      });
-      if (args.analyze && r.coverImageBase64) {
-        // 封面在 client 里已压到 viewport 1x JPEG，这里带 mime 前缀喂模型
-        const analysis = await callVision({ images: [`data:image/jpeg;base64,${r.coverImageBase64}`], text: DESIGN_ANALYZE_PROMPT, detail: 'high' });
-        const { coverImageBase64, ...rest } = r;
-        return jsonContent({ ...rest, visionAnalysis: analysis });
+      // mode === 'api'（默认）：url 与 imageId+projectId 二选一
+      if (!args.url && !args.imageId) throw new Error('api 模式需要 url 或 imageId+projectId');
+      if (args.imageId && !args.projectId && !args.url) throw new Error('imageId 模式需要同时传 projectId');
+      // 未传 analyze 时，配了视觉模型就默认开
+      const analyze = args.analyze ?? isAutoAnalyzeEnabled();
+      if (args.analyze === undefined && analyze) {
+        console.error(`[fetch_design] analyze 未指定且视觉模型已配置 → 自动开启（${process.env.LANHU_VISION_MODEL || '默认模型'}）`);
       }
-      return jsonContent(r);
+
+      const fetchOpts = { ...credentials(args), needCover: analyze };
+      const r = args.url
+        ? await fetchDesignViaApi(args.url, fetchOpts)
+        : await fetchDesignByIds(args.imageId!, args.projectId!, fetchOpts);
+      if (!analyze) return jsonContent(r);
+
+      const { coverImageBase64, ...rest } = r;
+      // 视觉分析失败降级为 visionError，不该带走图层树
+      if (!coverImageBase64) {
+        return jsonContent({ ...rest, visionError: '设计稿无封面图（coverImageBase64 为空），已跳过视觉分析' });
+      }
+      try {
+        // 封面已在 client 压成 1x JPEG，补 mime 前缀喂模型
+        const analysis = await callVision({ images: [`data:image/jpeg;base64,${coverImageBase64}`], text: DESIGN_ANALYZE_PROMPT, detail: 'high' });
+        return jsonContent({ ...rest, visionAnalysis: analysis });
+      } catch (e) {
+        console.error(`[fetch_design] 视觉分析失败，降级返回图层树：${(e as Error)?.message}`);
+        // 未配置视觉模型时补一句可操作提示
+        const hint = isVisionConfigured() ? '' : '未检测到视觉模型配置：需同时设置 LANHU_VISION_MODEL 与 LLM_API_KEY。';
+        return jsonContent({ ...rest, visionError: `${(e as Error)?.message || String(e)}${hint}` });
+      }
     }
   );
 
-  // 2. 渲染对比
   server.registerTool(
     'lanhu_verify_render',
     {
-      description: '把渲染页截图与设计稿截图调视觉模型做语义对比，返回 matchScore / verdict / diffs。',
+      description: '把渲染页截图（可选：设计稿截图）调视觉模型做语义对比，返回 matchScore / verdict / diffs。传 context 可声明已知刻意差异，模型将跳过这些区域。结论仅是视觉线索，与 lanhu_verify_spec 数据比对冲突时以数据比对为准。',
       inputSchema: {
         actualImageBase64: z.string().describe('你渲染的页面截图 base64'),
-        designImageBase64: z.string().optional().describe('设计稿截图 base64'),
+        designImageBase64: z.string().optional().describe('设计稿截图 base64；不传则只做单图内部一致性检查'),
+        context: z.string().optional().describe('已知刻意差异说明，模型将跳过这些区域的报错。如「顶部44px是系统状态栏，页面由原生渲染」「底部按钮刻意加高到56px」'),
         detail: z.enum(['auto', 'low', 'high']).optional(),
       },
     },
     async (args) => {
-      const text =
-        'You are a senior frontend reviewer. Compare the RENDERED screenshot (first image) ' +
-        'against the DESIGN reference (second image). Output a JSON: ' +
-        '{"matchScore":<0-100>,"verdict":"pass|need_fix|fail",' +
-        '"diffs":[{"location":"","issue":"","severity":"minor|major|critical"}],' +
-        '"suggestions":["..."]}. Only output JSON.';
+      // 单图/双图 prompt 分支：单图时模型没有对比对象，硬按双图 prompt 会胡编
+      const text = args.designImageBase64
+        ? 'You are a senior frontend reviewer. Compare the RENDERED screenshot (first image) ' +
+          'against the DESIGN reference (second image). Output a JSON: ' +
+          '{"matchScore":<0-100>,"verdict":"pass|need_fix|fail",' +
+          '"diffs":[{"location":"","issue":"","severity":"minor|major|critical"}],' +
+          '"suggestions":["..."]}. ' +
+          'Ignore: JPEG compression noise, font anti-aliasing differences, resolution differences ' +
+          'between the two images (compare by relative proportions, do not misreport size due to pixel density). ' +
+          'Counter-rule: structural problems (misalignment/truncation/color deviation/missing elements) ' +
+          'MUST be reported even if the image looks blurry. ' +
+          `Known intentional differences (do NOT report these): ${args.context || 'none'}. ` +
+          'Arbitration: your verdict is a visual hint only; if it conflicts with the lanhu_verify_spec ' +
+          'data comparison, the data comparison wins. ' +
+          'Output discipline: at most 15 diffs, most important first. Only output JSON.'
+        : 'You are a senior frontend reviewer. No design reference provided — inspect this ' +
+          'rendered screenshot for internal consistency only: layout sanity, alignment, ' +
+          'contrast, truncation, overlap. Output JSON: ' +
+          '{"matchScore":<0-100>,"verdict":"pass|need_fix|fail",' +
+          '"diffs":[{"location":"","issue":"","severity":"minor|major|critical"}],' +
+          '"suggestions":["..."]}. ' +
+          `Known intentional differences (do NOT report these): ${args.context || 'none'}. ` +
+          'Output discipline: at most 15 diffs, most important first. Only output JSON.';
       const images = [await shrinkB64(args.actualImageBase64)];
       if (args.designImageBase64) images.push(await shrinkB64(args.designImageBase64));
       return jsonContent(await callVision({ images, text, detail: args.detail || 'high' }));
     }
   );
 
-  // 3. UI 缺陷检测
   server.registerTool(
     'vision_defect_check',
     {
-      description: '整页/局部 UI 缺陷检测：重叠、溢出、缺图、对比度、错位等。返回 defects 数组与 pass。',
+      description: '整页/局部 UI 缺陷检测：重叠、溢出、缺图、对比度、错位、截断、破图、占位残留等 12 类。返回 defects 数组与 pass。传 context 可声明已知刻意差异，模型将跳过这些区域。',
       inputSchema: {
         imageBase64: z.string().describe('截屏 base64'),
+        context: z.string().optional().describe('已知刻意差异说明，模型将跳过这些区域的报错。如「顶部44px是系统状态栏，页面由原生渲染」'),
         language: z.string().optional().describe('语言，默认 zh-CN'),
         detail: z.enum(['auto', 'low', 'high']).optional(),
       },
@@ -129,39 +163,63 @@ export function registerTools(server: McpServer): void {
     async (args) => {
       const lang = args.language || 'zh-CN';
       const text =
-        `Inspect this UI screenshot (${lang}) for visual defects. Output JSON: ` +
-        '{"defects":[{"type":"overlap|overflow|missing_asset|contrast|misalign|other",' +
-        '"severity":"minor|major|critical","location":"","description":""}],' +
-        '"summary":"","pass":<true|false>}. Only output JSON.';
+        `Inspect this UI screenshot for visual defects; write all descriptions in ${lang}. Output JSON: ` +
+        '{"defects":[{"type":"overlap|overflow|missing_asset|contrast|misalign|truncation|broken_image|placeholder|stale_state|typo|alignment|other",' +
+        '"severity":"minor|major|critical","location":"","description":""}' +
+        '],"summary":"","pass":<true|false>}. ' +
+        'type guide: overlap / overflow / missing_asset / contrast(insufficient) / misalign / truncation / ' +
+        'broken_image / placeholder(unreplaced, e.g. lorem or test images) / stale_state(e.g. loading never dismissed) / ' +
+        'typo / alignment / other. ' +
+        // severity 定性标准，不写死数字，模型硬套数字公式反而降信息量
+        'severity (qualitative): critical = unreadable content / non-clickable element / blocked interaction; ' +
+        'major = clearly visible, hurts consistency; minor = nitpick level. ' +
+        'For contrast defects, always include the estimated ratio in description as "ratio:x.x". ' +
+        `Known intentional differences (do NOT report these): ${args.context || 'none'}. ` +
+        'Output discipline: at most 15 defects, most severe first. Only output JSON.';
       return jsonContent(await callVision({ images: [await shrinkB64(args.imageBase64)], text, detail: args.detail || 'auto' }));
     }
   );
 
-  // 4. E2E 归因
   server.registerTool(
     'vision_e2e_triage',
     {
-      description: 'E2E 测试失败时，分析截图+DOM 快照+错误文本，给出根因、类别、修复建议。',
+      description: 'E2E 测试失败时，分析截图+DOM 快照+错误文本，给出根因、类别、置信度与下一步动作建议。强烈建议传 expectedBehavior（测试预期行为）——归因质量取决于「预期 vs 实际」的差异分析，只给失败现场模型只能猜。',
       inputSchema: {
+        expectedBehavior: z.string().optional().describe('测试的预期行为，如「点击提交按钮后 2s 内出现支付成功弹窗」——归因的基准线，强烈建议传入'),
+        testSteps: z.string().optional().describe('失败前的操作步骤序列，如「打开页面 → 填写表单 → 点击提交」'),
         screenshotBase64: z.string().optional().describe('失败时的截屏 base64'),
         domSnapshot: z.string().optional().describe('失败时的 DOM 快照文本'),
         errorText: z.string().optional().describe('错误消息/栈'),
       },
     },
     async (args) => {
+      // 期望-实际差异分析：有 expectedBehavior 归因才有基准线，否则退化为现象描述
       const text =
-        'A test failed. Analyze the screenshot and (optional) DOM snapshot + error text. ' +
-        'Output JSON: {"rootCause":"","category":"selector|timing|layout|data|auth|other",' +
-        '"confidence":<0-1>,"fixSuggestion":"","relatedFiles":[""]}. Only output JSON.';
+        'You are an E2E test triage assistant. You are given: the EXPECTED behavior, ' +
+        '(optional) steps taken before failure, and failure artifacts (screenshot/DOM/error). ' +
+        'Judge the root cause by comparing expected vs actual. Output JSON: ' +
+        '{"rootCause":"<=30 words",' +
+        '"evidence":"cite concrete evidence: DOM snippet / error text / screenshot phenomenon, <=60 words",' +
+        '"category":"selector_not_found|selector_changed|timing|layout_css|data|auth|environment|other",' +
+        '"confidence":<0-1>,' +
+        '"next_action":"wait_and_retry|check_selector|refresh|fix_data|report_bug",' +
+        '"fixSuggestion":"<=30 words"}. ' +
+        'category guide: selector_not_found = target element never rendered; selector_changed = DOM structure ' +
+        'changed but function still exists; timing = sequencing / dynamic rendering not finished; layout_css = ' +
+        'style-caused anomaly; data = missing or wrong data; auth = auth/login-state problem; environment = ' +
+        'network/timeout/proxy issues. ' +
+        'confidence must be backed by evidence; confidence without evidence is meaningless. ' +
+        `Expected behavior: ${args.expectedBehavior || '(not provided, base your analysis on the failure artifacts only)'}` +
+        (args.testSteps ? `\nSteps before failure: ${args.testSteps}` : '');
       const images = args.screenshotBase64 ? [await shrinkB64(args.screenshotBase64)] : [];
-      const full = images.length ? text : 'No screenshot provided. ' + text;
+      const full = images.length ? text : 'No screenshot provided. Base your analysis on DOM + error text only.\n' + text;
       const dom = args.domSnapshot ? `\n\nDOM snapshot:\n${args.domSnapshot}` : '';
       const err = args.errorText ? `\n\nError text:\n${args.errorText}` : '';
       return jsonContent(await callVision({ images, text: full + dom + err, detail: 'auto' }));
     }
   );
 
-  // cookie 探活：判断当前 cookie 是否有效。任何蓝湖工具返回 401/空数据/疑似过期时主动调它二次确认。
+  // cookie 探活：区分「cookie 过期」与「无权访问该资源」
   server.registerTool(
     'lanhu_check_auth',
     {
@@ -174,7 +232,6 @@ export function registerTools(server: McpServer): void {
     async (args) => jsonContent(await checkAuth(credentials(args)))
   );
 
-  // 列账号所属团队（多团队发现入口）
   server.registerTool(
     'lanhu_list_teams',
     {
@@ -187,7 +244,6 @@ export function registerTools(server: McpServer): void {
     async (args) => jsonContent(await listUserTeams(credentials(args)))
   );
 
-  // 5. 列团队目录（项目→分组）
   server.registerTool(
     'lanhu_list_directory',
     {
@@ -202,7 +258,6 @@ export function registerTools(server: McpServer): void {
     async (args) => jsonContent(await listDirectory({ ...credentials(args), ...(args.url ? { url: args.url } : {}), ...(args.teamId ? { teamId: args.teamId } : {}) }))
   );
 
-  // 6. 按分组读稿目录
   server.registerTool(
     'lanhu_read_sector',
     {
@@ -218,7 +273,6 @@ export function registerTools(server: McpServer): void {
     async (args) => jsonContent(await readSector(args.url, args.sector, credentials(args)))
   );
 
-  // 7. 下载切图
   server.registerTool(
     'lanhu_download_slices',
     {
@@ -241,6 +295,34 @@ export function registerTools(server: McpServer): void {
         ...(args.sector ? { sector: args.sector } : {}),
         ...(args.sliceNames ? { sliceNames: args.sliceNames } : {}),
         ...(args.skipExisting !== undefined ? { skipExisting: args.skipExisting } : {}),
+      })
+    )
+  );
+
+  server.registerTool(
+    'lanhu_verify_spec',
+    {
+      description:
+        '设计稿验收（L3 数据比对）：取设计稿图层树的精确数值作为期望值，用 Playwright 打开页面采 getComputedStyle 作为实际值，逐字段 diff，输出尺寸/位置/色值/字号四类偏差清单（含 delta 与 minor/major/critical 分级）。' +
+        '不含主观判断，结论可回归、可复现，是替代人工走查的主手段；lanhu_verify_render 的视觉语义比对只能当补充线索。' +
+        '元素匹配：文案精确相等 > 几何 IoU（与语言无关）。' +
+        '「样式清单比对」安全网：只比设计稿与页面的文字样式集合（fontSize/字重/色值），零标注、不比文案，永远在线——跨语言或跨迭代文案差异都不会让它失盲（见返回 inventory 字段）。' +
+        '当前为最小可用版本：只跑默认态、单一视口（按设计稿 viewport 尺寸）、不评分。',
+      inputSchema: {
+        designUrl: z.string().describe('蓝湖设计稿 URL（期望值来源）'),
+        pageUrl: z.string().describe('已实现页面 URL（实际值来源），需可访问'),
+        waitFor: z.string().optional().describe('页面加载后等待出现的选择器（如 .task-list），用于等待接口数据渲染'),
+        maxDiffs: z.number().optional().describe('返回偏差条数上限，默认 200'),
+        cookie: z.string().optional(),
+      },
+    },
+    async (args) => jsonContent(
+      await verifyDesignSpec({
+        designUrl: args.designUrl,
+        pageUrl: args.pageUrl,
+        credentials: credentials(args),
+        ...(args.waitFor ? { waitFor: args.waitFor } : {}),
+        ...(args.maxDiffs !== undefined ? { maxDiffs: args.maxDiffs } : {}),
       })
     )
   );
