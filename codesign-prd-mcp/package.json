@@ -1,0 +1,23 @@
+{
+  "name": "codesign-prd-mcp",
+  "version": "0.1.0",
+  "description": "MCP server: 读取腾讯 CoDesign 产品原型（Axure），提取文字+流程图，生成结构化需求文档，供 AI Coding Agent 使用",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "codesign-prd-mcp": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test:crawl": "node scripts/test-crawl.js",
+    "install:browser": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "playwright": "^1.51.0",
+    "zod": "^3.23.8"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
