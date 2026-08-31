@@ -7,12 +7,13 @@
  *   - table: 表格数据识别（行列数据）
  *   - page: 普通页面结构识别（布局、组件、交互）
  *
- * 支持多段截图并行解析，并发上限 3
+ * 支持多段截图并行解析，默认并发上限 3
  *
  * 环境变量配置：
- *   VLM_API_KEY   - API 密钥（必填）
- *   VLM_BASE_URL  - API 基础 URL，默认 https://api.openai.com/v1
- *   VLM_MODEL     - 模型名称，默认 gpt-4o
+ *   VLM_API_KEY      - API 密钥（必填）
+ *   VLM_BASE_URL     - API 基础 URL，默认 https://api.openai.com/v1
+ *   VLM_MODEL        - 模型名称，默认 gpt-4o
+ *   VLM_MAX_PARALLEL - 最大并发数，默认 3
  */
 import * as fs from 'fs';
 import * as path from 'path';
@@ -22,15 +23,33 @@ const BASE_URL = process.env.VLM_BASE_URL || 'https://api.openai.com/v1';
 const MODEL = process.env.VLM_MODEL || 'gpt-4o';
 
 // 并发限制
-const MAX_PARALLEL = 3;
+const MAX_PARALLEL = Math.max(1, parseInt(process.env.VLM_MAX_PARALLEL || '3', 10) || 3);
 const VLM_TIMEOUT = 30000; // 单段超时 30s
 const MAX_RETRY = 1; // 失败重试次数
+
+// 改动下方任意 Prompt 时必须递增，否则会命中旧 Prompt 产生的缓存
+const PROMPT_VERSION = 'v1';
 
 /**
  * 检查 VLM 是否配置
  */
 export function isVLMConfigured() {
   return !!API_KEY;
+}
+
+/**
+ * 影响解析结果但不体现在入参里的指纹，用于缓存键隔离
+ */
+export function getVlmVersion() {
+  // BASE_URL 参与指纹：换供应商但模型名相同时，避免缓存互相污染
+  return `${PROMPT_VERSION}::${MODEL}::${BASE_URL}`;
+}
+
+/**
+ * 是否存在解析失败的分段（网络错误或返回非法 JSON），用于决定是否写缓存
+ */
+export function hasParseFailure(segments) {
+  return (segments || []).some((s) => !s || s._error || s._parseError);
 }
 
 /**
@@ -290,43 +309,64 @@ export async function analyzeSingleImage(imagePath, type, options = {}) {
 // ─── 多段并行解析 ─────────────────────────────────────────────
 
 /**
- * 并行解析多段截图（并发上限 MAX_PARALLEL）
- * @param {string[]} imagePaths - 图片路径数组
- * @param {'flowchart'|'table'|'page'} type - 页面类型
- * @param {object} options - { pageText }
+ * 跨页面的全局并发解析：把多个页面的分段摊平成一个队列统一消费。
+ * 相比「页内并发、页间串行」，可以避免每页末尾的并发度浪费。
+ * @param {Array<{imagePath: string, type: string, segmentIndex: number, totalSegments: number, pageText?: string}>} tasks
+ * @param {object} options - { concurrency }
  * @returns {Promise<object[]>} 解析结果数组（按输入顺序）
  */
-export async function analyzeSegmentsParallel(imagePaths, type, options = {}) {
-  const results = new Array(imagePaths.length);
+export async function analyzeSegmentsGlobal(tasks, options = {}) {
+  const concurrency = Math.max(1, options.concurrency || MAX_PARALLEL);
+  const results = new Array(tasks.length);
   let currentIndex = 0;
 
   async function worker() {
-    while (currentIndex < imagePaths.length) {
+    while (currentIndex < tasks.length) {
       const idx = currentIndex++;
+      const task = tasks[idx];
       try {
-        results[idx] = await analyzeSingleImage(imagePaths[idx], type, {
-          segmentIndex: idx + 1,
-          totalSegments: imagePaths.length,
-          pageText: options.pageText,
+        results[idx] = await analyzeSingleImage(task.imagePath, task.type, {
+          segmentIndex: task.segmentIndex,
+          totalSegments: task.totalSegments,
+          pageText: task.pageText,
         });
       } catch (err) {
         results[idx] = {
           _error: err.message,
-          _segmentIndex: idx + 1,
-          _imagePath: imagePaths[idx],
-          _type: type,
+          _segmentIndex: task.segmentIndex,
+          _imagePath: task.imagePath,
+          _type: task.type,
         };
       }
     }
   }
 
   const workers = Array.from(
-    { length: Math.min(MAX_PARALLEL, imagePaths.length) },
+    { length: Math.min(concurrency, tasks.length) },
     () => worker()
   );
   await Promise.all(workers);
 
   return results;
+}
+
+/**
+ * 并行解析单个页面的多段截图（并发上限 MAX_PARALLEL）
+ * @param {string[]} imagePaths - 图片路径数组
+ * @param {'flowchart'|'table'|'page'} type - 页面类型
+ * @param {object} options - { pageText }
+ * @returns {Promise<object[]>} 解析结果数组（按输入顺序）
+ */
+export async function analyzeSegmentsParallel(imagePaths, type, options = {}) {
+  return analyzeSegmentsGlobal(
+    imagePaths.map((imagePath, i) => ({
+      imagePath,
+      type,
+      segmentIndex: i + 1,
+      totalSegments: imagePaths.length,
+      pageText: options.pageText,
+    }))
+  );
 }
 
 // ─── 工具函数 ─────────────────────────────────────────────────

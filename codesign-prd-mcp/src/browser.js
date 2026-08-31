@@ -15,7 +15,9 @@ let page = null;
  * @returns {Promise<import('playwright').Page>}
  */
 export async function launchBrowser({ headless = true, timeout = 30000 } = {}) {
-  if (browser && page) return page;
+  // 引用可能已失活（进程崩溃/页面被外部关闭），失活时清理陈旧引用后重新启动
+  if (browser && page && browser.isConnected() && !page.isClosed()) return page;
+  if (browser || page) await closeBrowser();
 
   browser = await chromium.launch({
     headless,
@@ -34,16 +36,6 @@ export async function launchBrowser({ headless = true, timeout = 30000 } = {}) {
 
   context.setDefaultTimeout(timeout);
   page = await context.newPage();
-
-  // 屏蔽不必要的资源，加速加载
-  await page.route('**/*', (route) => {
-    const type = route.request().resourceType();
-    if (['image', 'media', 'font'].includes(type)) {
-      // 图片需要保留用于截图和 VLM 分析，不拦截
-      return route.continue();
-    }
-    return route.continue();
-  });
 
   return page;
 }

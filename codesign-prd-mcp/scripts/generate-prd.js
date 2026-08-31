@@ -1,68 +1,46 @@
 #!/usr/bin/env node
 /**
  * 命令行工具：爬取指定需求分组，生成纯文本结构化需求文档
- * 用法: node scripts/generate-prd.js
+ *
+ * 用法:
+ *   node scripts/generate-prd.js --url=<分享链接> --group=<分组名> [--password=<访问密码>]
+ * 或通过环境变量提供（便于 CI 与本地 .env）:
+ *   CODESIGN_URL / CODESIGN_GROUP / CODESIGN_PASSWORD
  *
  * 流程：打开链接 → 遍历页面 → 分段截图 → VLM解析 → 合并 → 生成文档
  */
-import { openShareLink, getPageOutline, getGroupPages } from '../src/crawler.js';
-import { closeBrowser } from '../src/browser.js';
-import { isVLMConfigured, detectPageType, analyzeSegmentsParallel } from '../src/vlm.js';
-import { mergePageResult } from '../src/merger.js';
-import { generateRequirementDoc } from '../src/doc-generator.js';
-import { getCache, setCache } from '../src/cache.js';
 import * as fs from 'fs';
 import * as path from 'path';
+import { openShareLink, getPageOutline, getGroupPages } from '../src/crawler.js';
+import { closeBrowser } from '../src/browser.js';
+import { isVLMConfigured } from '../src/vlm.js';
+import { processPages } from '../src/pipeline.js';
+import { generateRequirementDoc } from '../src/doc-generator.js';
 
-const URL = 'https://codesign.qq.com/s/704879443912137';
-const PASSWORD = 'XIVO';
-const GROUP_NAME = '赛季通行证S2优化';
 const OUTPUT_DIR = path.join(process.cwd(), 'output');
 
-async function processPage(pageData, url) {
-  if (pageData.error) {
-    return {
-      pageName: pageData.pageName,
-      type: 'page',
-      domText: '',
-      tables: [],
-      vlmResult: {},
-      warnings: [pageData.error],
-      _hasVLM: false,
-    };
+function parseArgs(argv) {
+  const args = {};
+  for (const arg of argv.slice(2)) {
+    const matched = arg.match(/^--(url|group|password)=(.+)$/);
+    if (matched) args[matched[1]] = matched[2];
   }
+  return args;
+}
 
-  const type = detectPageType(pageData.pageName, pageData.text);
-  let vlmSegments = [];
+const args = parseArgs(process.argv);
+const SHARE_URL = args.url || process.env.CODESIGN_URL || '';
+const PASSWORD = args.password || process.env.CODESIGN_PASSWORD || '';
+const GROUP_NAME = args.group || process.env.CODESIGN_GROUP || '';
 
-  if (isVLMConfigured() && pageData.segments?.length > 0) {
-    const cacheKey = {
-      url,
-      pageName: pageData.pageName,
-      imagePaths: pageData.segments,
-      type,
-    };
-    const cached = getCache(cacheKey);
-    if (cached) {
-      vlmSegments = cached;
-      console.log(`      [缓存命中] ${pageData.pageName}`);
-    } else {
-      console.log(`      [VLM解析] ${pageData.pageName} (${pageData.segmentCount}段)`);
-      vlmSegments = await analyzeSegmentsParallel(pageData.segments, type, {
-        pageText: pageData.text,
-      });
-      setCache(cacheKey, vlmSegments);
-    }
-  }
-
-  return mergePageResult({
-    pageName: pageData.pageName,
-    domText: pageData.text,
-    domTables: pageData.tables,
-    vlmSegments,
-    type,
-    screenshotCount: pageData.segmentCount || 0,
-  });
+// 分享链接与访问密码属于凭据，不入库，只从命令行或环境变量读取
+if (!SHARE_URL || !GROUP_NAME) {
+  console.error('缺少必填参数。用法：');
+  console.error(
+    '  node scripts/generate-prd.js --url=<分享链接> --group=<分组名> [--password=<访问密码>]'
+  );
+  console.error('也可通过环境变量提供：CODESIGN_URL / CODESIGN_GROUP / CODESIGN_PASSWORD');
+  process.exit(1);
 }
 
 async function main() {
@@ -73,7 +51,7 @@ async function main() {
 
   // 1. 打开链接
   console.log('[1/5] 打开 CoDesign 链接...');
-  await openShareLink(URL, PASSWORD);
+  await openShareLink(SHARE_URL, PASSWORD);
 
   // 2. 获取大纲
   console.log('[2/5] 获取页面大纲...');
@@ -83,26 +61,26 @@ async function main() {
 
   // 3. 爬取分组页面（含分段截图）
   console.log('[3/5] 爬取分组页面（分段截图）...');
-  const pagesData = await getGroupPages(GROUP_NAME);
+  const pagesData = await getGroupPages(GROUP_NAME, SHARE_URL);
   console.log(`      共 ${pagesData.length} 个页面`);
   pagesData.forEach((p) => {
     const segInfo = p.isSegmented ? `, ${p.segmentCount}段截图` : ', 单张截图';
     console.log(`      - ${p.pageName}: ${(p.text || '').length}字符${segInfo}`);
   });
 
-  // 4. VLM 解析 + 合并
+  // 4. VLM 解析 + 合并（跨页全局并发）
   console.log('[4/5] VLM 解析 + 结果合并...');
-  const mergedPages = [];
-  for (const pageData of pagesData) {
-    const merged = await processPage(pageData, URL);
-    mergedPages.push(merged);
-  }
+  const mergedPages = await processPages(pagesData, SHARE_URL, {
+    onPageDone: (pageName, { cached, segments }) => {
+      console.log(`      ${cached ? '[缓存命中]' : '[VLM解析]'} ${pageName} (${segments}段)`);
+    },
+  });
 
   // 5. 生成文档
   console.log('[5/5] 生成纯文本结构化需求文档...');
   const doc = generateRequirementDoc({
     groupName: GROUP_NAME,
-    sourceUrl: URL,
+    sourceUrl: SHARE_URL,
     pages: mergedPages,
     detailLevel: 'standard',
   });

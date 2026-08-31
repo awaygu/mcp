@@ -448,8 +448,13 @@ export function crossValidate(domText, vlmResult, type) {
  * @param {'flowchart'|'table'|'page'} params.type - 页面类型
  * @returns {object} 合并后的完整页面数据
  */
-export function mergePageResult({ pageName, domText, domTables = [], vlmSegments = [], type, screenshotCount = 0 }) {
+export function mergePageResult({ pageName, domText, domTables = [], images = [], vlmSegments = [], type, screenshotCount = 0 }) {
   const warnings = [];
+
+  // VLM 全段解析失败：显式告警，避免静默降级为纯 DOM/空输出
+  if (vlmSegments.length > 0 && vlmSegments.every((s) => !s || s._error || s._parseError)) {
+    warnings.push('该页面所有分段 VLM 解析失败，已降级为纯 DOM 输出，建议检查 VLM_API_KEY / 网络后重试');
+  }
 
   // 1. 合并 VLM 多段结果
   let vlmMerged;
@@ -496,6 +501,7 @@ export function mergePageResult({ pageName, domText, domTables = [], vlmSegments
     type,
     domText,
     tables: finalTables,
+    images,
     vlmResult: verified,
     warnings,
     _segmentCount: screenshotCount || vlmSegments.length,

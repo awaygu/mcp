@@ -68,6 +68,21 @@ export function generateRequirementDoc({ groupName, sourceUrl = '', pages = [], 
 }
 
 /**
+ * 渲染页面内嵌原型图清单（设计稿/插画类图片，DOM 文字提取不到）
+ */
+function renderImages(page) {
+  const imgs = page.images || [];
+  if (imgs.length === 0) return '';
+  let out = `**页面内嵌原型图**：${imgs.length} 张\n\n`;
+  out += `| 尺寸 | alt 说明 |\n`;
+  out += `|---|---|\n`;
+  imgs.forEach((im) => {
+    out += `| ${im.width}x${im.height} | ${im.alt || '-'} |\n`;
+  });
+  return out + `\n`;
+}
+
+/**
  * 生成流程图章节
  */
 function generateFlowchartSection(page, index, detailLevel, totalFlowcharts) {
@@ -160,6 +175,9 @@ function generatePageSection(page, index, detailLevel) {
     section += `**布局结构**：${ps.layout}\n\n`;
   }
 
+  // 页面内嵌原型图
+  section += renderImages(page);
+
   // 核心组件
   if (ps.components && ps.components.length > 0) {
     section += `**核心组件**：\n\n`;
@@ -239,6 +257,9 @@ function generateTableSection(page, index, detailLevel) {
     const firstLines = page.domText.split('\n').slice(0, 5).join('\n');
     section += `**说明**：\n\n${firstLines}\n\n`;
   }
+
+  // 页面内嵌原型图
+  section += renderImages(page);
 
   // 所有表格
   if (page.tables && page.tables.length > 0) {

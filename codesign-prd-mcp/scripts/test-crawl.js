@@ -1,24 +1,48 @@
 #!/usr/bin/env node
 /**
  * 测试脚本：直接调用 crawler 模块，验证 CoDesign 原型爬取
- * 用法: node scripts/test-crawl.js
+ *
+ * 用法:
+ *   node scripts/test-crawl.js --url=<分享链接> --group=<分组名> [--password=<访问密码>]
+ * 或通过环境变量提供：CODESIGN_URL / CODESIGN_GROUP / CODESIGN_PASSWORD
  */
-import { openShareLink, getPageOutline, getGroupPages, navigateToPage, extractPageText, screenshotPage } from '../src/crawler.js';
+import { openShareLink, getPageOutline, getGroupPages } from '../src/crawler.js';
 import { closeBrowser } from '../src/browser.js';
 import * as fs from 'fs';
 import * as path from 'path';
 
-const URL = 'https://codesign.qq.com/s/704879443912137';
-const PASSWORD = 'XIVO';
-const GROUP_NAME = '赛季通行证S2优化';
 const OUTPUT_DIR = path.join(process.cwd(), 'output');
+
+function parseArgs(argv) {
+  const args = {};
+  for (const arg of argv.slice(2)) {
+    const matched = arg.match(/^--(url|group|password)=(.+)$/);
+    if (matched) args[matched[1]] = matched[2];
+  }
+  return args;
+}
+
+const args = parseArgs(process.argv);
+const SHARE_URL = args.url || process.env.CODESIGN_URL || '';
+const PASSWORD = args.password || process.env.CODESIGN_PASSWORD || '';
+const GROUP_NAME = args.group || process.env.CODESIGN_GROUP || '';
+
+// 分享链接与访问密码属于凭据，不入库，只从命令行或环境变量读取
+if (!SHARE_URL || !GROUP_NAME) {
+  console.error('缺少必填参数。用法：');
+  console.error(
+    '  node scripts/test-crawl.js --url=<分享链接> --group=<分组名> [--password=<访问密码>]'
+  );
+  console.error('也可通过环境变量提供：CODESIGN_URL / CODESIGN_GROUP / CODESIGN_PASSWORD');
+  process.exit(1);
+}
 
 async function main() {
   console.log('=== CoDesign 原型爬取测试 ===\n');
 
   // 1. 打开链接 + 输入密码
   console.log('[1/5] 打开分享链接...');
-  await openShareLink(URL, PASSWORD);
+  await openShareLink(SHARE_URL, PASSWORD);
   console.log('      链接已打开，密码已输入\n');
 
   // 2. 获取页面大纲
@@ -44,7 +68,7 @@ async function main() {
 
   // 4. 获取分组下所有页面
   console.log('[4/5] 爬取分组下所有页面...');
-  const pages = await getGroupPages(GROUP_NAME);
+  const pages = await getGroupPages(GROUP_NAME, SHARE_URL);
   console.log(`      共获取 ${pages.length} 个页面\n`);
 
   // 5. 输出结果
@@ -71,16 +95,20 @@ async function main() {
       JSON.stringify(page.tables || [], null, 2)
     );
 
-    // 复制截图到输出目录
-    if (page.screenshot && fs.existsSync(page.screenshot)) {
-      const screenshotDest = path.join(pageDir, 'screenshot.png');
-      fs.copyFileSync(page.screenshot, screenshotDest);
-    }
+    // 复制分段截图到输出目录（crawler 返回的是 segments 数组，不再有单张 screenshot）
+    const segments = page.segments || [];
+    segments.forEach((src, si) => {
+      if (fs.existsSync(src)) {
+        const dest = path.join(pageDir, `segment_${String(si + 1).padStart(2, '0')}.png`);
+        fs.copyFileSync(src, dest);
+      }
+    });
 
     console.log(`      ✅ 页面 ${i + 1}: ${page.pageName}`);
     console.log(`         文字长度: ${(page.text || '').length} 字符`);
     console.log(`         表格数: ${(page.tables || []).length}`);
-    console.log(`         截图: ${page.screenshot || '无'}`);
+    console.log(`         截图: ${segments.length ? `${segments.length} 段` : '无'}`);
+    if (page.error) console.log(`         错误: ${page.error}`);
   });
 
   // 生成汇总 Markdown
@@ -102,7 +130,8 @@ async function main() {
           summary += `**表${i + 1}**: ${t.headers?.join(' | ') || ''}\n\n`;
         });
       }
-      summary += `截图: \`${page.screenshot}\`\n\n`;
+      const segCount = (page.segments || []).length;
+      summary += segCount ? `截图: ${segCount} 段\n\n` : `截图: 无\n\n`;
     }
     summary += `---\n\n`;
   });

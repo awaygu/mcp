@@ -12,6 +12,7 @@
  *   - 分组图标: .t-folder-icon
  * - 右侧内容: .axure-container (Axure 原型渲染区)
  */
+import { createHash } from 'crypto';
 import { launchBrowser, getPage, waitForNetworkIdle } from './browser.js';
 import { capturePageSegments } from './screenshot.js';
 
@@ -152,61 +153,79 @@ export async function getAxureFrame() {
 /**
  * 导航到指定页面（通过目录树点击）
  * @param {string} pageName - 页面名称
- * @returns {Promise<boolean>} 是否成功
+ * @returns {Promise<{ok: true} | {ok: false, reason: 'not_found'|'ambiguous', count?: number}>}
  */
 export async function navigateToPage(pageName) {
   const page = getPage();
   if (!page) throw new Error('浏览器未启动');
 
-  const clicked = await page.evaluate((name) => {
+  const outcome = await page.evaluate((name) => {
     const tree = document.querySelector('.t-tree');
-    if (!tree) return false;
-    const labels = tree.querySelectorAll('.t-tree__label');
-    for (const label of labels) {
-      const labelText = label.querySelector('.label-text');
-      if (labelText?.textContent?.trim() === name) {
-        label.click();
-        return true;
-      }
-    }
-    return false;
+    if (!tree) return { ok: false, reason: 'not_found' };
+
+    const labels = Array.from(tree.querySelectorAll('.t-tree__label'));
+    const matched = labels.filter(
+      (label) => label.querySelector('.label-text')?.textContent?.trim() === name
+    );
+
+    // 同名节点点第一个会静默跳错页面，这里上报歧义交给调用方决定
+    if (matched.length === 0) return { ok: false, reason: 'not_found' };
+    if (matched.length > 1) return { ok: false, reason: 'ambiguous', count: matched.length };
+
+    matched[0].click();
+    return { ok: true };
   }, pageName);
 
-  if (clicked) {
-    await page.waitForTimeout(2000);
-    await waitForNetworkIdle(5000);
+  if (!outcome.ok) return outcome;
 
-    // 等待 iframe 中有内容
-    for (let i = 0; i < 10; i++) {
-      await page.waitForTimeout(500);
-      try {
-        const frame = await getAxureFrame();
-        if (frame) {
-          const text = await frame.evaluate(() => document.body?.innerText?.trim() || '');
-          if (text.length > 5) break;
-        }
-      } catch {
-        // frame 可能还在加载
+  // 等待 iframe 切换到新页面（URL 变化或元素被替换），替代固定 2s 睡眠
+  const oldFrame = await getAxureFrame();
+  const oldFrameUrl = oldFrame?.url() || '';
+  for (let i = 0; i < 24; i++) {
+    await page.waitForTimeout(250);
+    const frame = await getAxureFrame();
+    if (!frame) continue;
+    if (frame !== oldFrame || frame.url() !== oldFrameUrl) break;
+  }
+  await waitForNetworkIdle(5000);
+
+  // 等待 iframe 中有内容
+  for (let i = 0; i < 20; i++) {
+    await page.waitForTimeout(250);
+    try {
+      const frame = await getAxureFrame();
+      if (frame) {
+        const text = await frame.evaluate(() => document.body?.innerText?.trim() || '');
+        if (text.length > 5) break;
       }
+    } catch {
+      // frame 可能还在加载
     }
   }
 
-  return clicked;
+  return { ok: true };
+}
+
+function describeNavigationFailure(pageName, nav) {
+  if (nav.reason === 'ambiguous') {
+    return `页面名「${pageName}」在目录中出现 ${nav.count} 次，无法确定唯一目标，请改用更完整的名称`;
+  }
+  return `目录中未找到页面「${pageName}」，请对照大纲使用完全一致的页面名称`;
 }
 
 /**
- * 提取当前页面的纯文本内容（从 Axure iframe 中提取，含表格）
- * @returns {Promise<{text: string, tables: Array<{headers: string[], rows: string[][]}>}>}
+ * 提取当前页面的纯文本内容（从 Axure iframe 中提取，含表格与内嵌图片）
+ * @returns {Promise<{text: string, tables: Array<{headers: string[], rows: string[][]}>, images: Array<{src: string, alt: string, width: number, height: number}>}>}
  */
 export async function extractPageText() {
   const frame = await getAxureFrame();
   if (!frame) {
-    return { text: '', tables: [] };
+    return { text: '', tables: [], images: [] };
   }
 
   const result = await frame.evaluate(() => {
     const container = document.body;
-    if (!container) return { text: '', tables: [] };
+    if (!container) return { text: '', tables: [], images: [] };
 
     // 提取表格
     const tables = [];
@@ -228,6 +247,21 @@ export async function extractPageText() {
       }
     });
 
+    // 提取内嵌原型图（设计稿/插画类大图，DOM 文字提取不到，过滤图标小图）
+    const images = [];
+    container.querySelectorAll('img').forEach((img) => {
+      const rect = img.getBoundingClientRect();
+      const width = Math.round(rect.width);
+      const height = Math.round(rect.height);
+      if (width < 40 || height < 40) return;
+      images.push({
+        src: (img.currentSrc || img.src || '').slice(0, 200),
+        alt: img.alt?.trim() || '',
+        width,
+        height,
+      });
+    });
+
     // 提取纯文本
     const rawText = container.innerText || container.textContent || '';
     const textLines = rawText
@@ -238,6 +272,7 @@ export async function extractPageText() {
     return {
       text: textLines.join('\n'),
       tables,
+      images,
     };
   });
 
@@ -247,67 +282,116 @@ export async function extractPageText() {
 /**
  * 截取当前页面（分段截图，超长页面自动分段）
  * @param {string} filename - 文件名（不含扩展名）
+ * @param {string} [pageCacheKey] - 页面级缓存键（url+页面名+文字哈希），命中时跳过截图
  * @returns {Promise<{segments: string[], totalHeight: number, segmentCount: number, isSegmented: boolean}>}
  */
-export async function screenshotPage(filename) {
+export async function screenshotPage(filename, pageCacheKey) {
   const page = getPage();
   if (!page) throw new Error('浏览器未启动');
 
   const frame = await getAxureFrame();
-  return await capturePageSegments(filename, frame);
+  return await capturePageSegments(filename, frame, pageCacheKey);
+}
+
+/**
+ * 页面级缓存键：分享链接 + 页面名 + DOM 文字哈希。
+ * Axure 为静态导出，文字不变即可认为页面未变，可复用已有截图。
+ */
+function pageCacheKeyOf(url, pageName, text) {
+  if (!url) return null;
+  return createHash('md5').update(`${url}::${pageName}::${text}`).digest('hex');
+}
+
+/**
+ * 在目录树中定位分组或页面：精确匹配优先，其次模糊匹配，多种可能时抛出候选清单。
+ * 原实现取首个模糊匹配，遇到同名分组会静默解析错目标。
+ * @returns {{kind: 'group', index: number} | {kind: 'page', name: string}}
+ */
+function resolveTarget(outline, name) {
+  const groups = outline.filter((i) => i.isGroup);
+  const pages = outline.filter((i) => !i.isGroup);
+
+  const exactGroups = groups.filter((i) => i.name === name);
+  if (exactGroups.length === 1) return { kind: 'group', index: outline.indexOf(exactGroups[0]) };
+  if (exactGroups.length > 1) {
+    throw new Error(`分组名「${name}」在目录中出现 ${exactGroups.length} 次，请改用更完整的名称`);
+  }
+
+  const fuzzyGroups = groups.filter((i) => i.name.includes(name));
+  if (fuzzyGroups.length === 1) return { kind: 'group', index: outline.indexOf(fuzzyGroups[0]) };
+  if (fuzzyGroups.length > 1) {
+    throw new Error(
+      `分组名「${name}」模糊匹配到 ${fuzzyGroups.length} 个分组：${fuzzyGroups
+        .map((i) => i.name)
+        .join(' / ')}。请细化名称后重试`
+    );
+  }
+
+  // 退化：传入的其实是页面名，按单页处理
+  const exactPages = pages.filter((i) => i.name === name);
+  if (exactPages.length === 1) return { kind: 'page', name };
+  if (exactPages.length > 1) {
+    throw new Error(`页面名「${name}」在目录中出现 ${exactPages.length} 次，请改用更完整的名称`);
+  }
+
+  throw new Error(
+    `未找到分组或页面「${name}」。可用分组：${groups.map((i) => i.name).join(' / ') || '（无）'}`
+  );
 }
 
 /**
  * 获取指定分组下所有页面的完整内容
  * @param {string} groupName - 分组名称（如"赛季通行证S2优化"）
- * @returns {Promise<Array<{pageName: string, text: string, tables: any[], segments: string[], segmentCount: number, isSegmented: boolean, error?: string}>>}
+ * @param {string} [url] - 分享链接，用于页面级缓存键
+ * @returns {Promise<Array<{pageName: string, text: string, tables: any[], images: any[], segments: string[], segmentCount: number, isSegmented: boolean, error?: string}>>}
  */
-export async function getGroupPages(groupName) {
+export async function getGroupPages(groupName, url) {
   const outline = await getPageOutline();
+  const target = resolveTarget(outline, groupName);
 
-  const groupIndex = outline.findIndex((item) => item.name.includes(groupName));
-  if (groupIndex === -1) {
-    throw new Error(`未找到分组: ${groupName}`);
-  }
-
-  const groupLevel = outline[groupIndex].level;
-  const pages = [];
-
-  for (let i = groupIndex + 1; i < outline.length; i++) {
-    const item = outline[i];
-    if (item.level <= groupLevel) break;
-    if (!item.isGroup && item.level > groupLevel) {
-      pages.push(item.name);
+  let pages;
+  if (target.kind === 'page') {
+    pages = [target.name];
+  } else {
+    const groupLevel = outline[target.index].level;
+    pages = [];
+    for (let i = target.index + 1; i < outline.length; i++) {
+      const item = outline[i];
+      if (item.level <= groupLevel) break;
+      if (!item.isGroup) pages.push(item.name);
     }
-  }
-
-  if (pages.length === 0) {
-    pages.push(groupName);
+    // 空分组：退化为解析分组节点自身
+    if (pages.length === 0) pages.push(outline[target.index].name);
   }
 
   const results = [];
   for (const pageName of pages) {
-    const success = await navigateToPage(pageName);
-    if (!success) {
+    const nav = await navigateToPage(pageName);
+    if (!nav.ok) {
       results.push({
         pageName,
         text: '',
         tables: [],
+        images: [],
         segments: [],
         segmentCount: 0,
         isSegmented: false,
-        error: '页面导航失败',
+        error: describeNavigationFailure(pageName, nav),
       });
       continue;
     }
 
-    const { text, tables } = await extractPageText();
-    const screenshotResult = await screenshotPage(`${groupName}_${pageName}`);
+    const { text, tables, images } = await extractPageText();
+    const screenshotResult = await screenshotPage(
+      `${groupName}_${pageName}`,
+      pageCacheKeyOf(url, pageName, text)
+    );
 
     results.push({
       pageName,
       text,
       tables,
+      images,
       segments: screenshotResult.segments,
       segmentCount: screenshotResult.segmentCount,
       isSegmented: screenshotResult.isSegmented,
@@ -321,19 +405,24 @@ export async function getGroupPages(groupName) {
 /**
  * 获取单个页面的完整内容
  * @param {string} pageName
- * @returns {Promise<{pageName: string, text: string, tables: any[], segments: string[], segmentCount: number, isSegmented: boolean}>}
+ * @param {string} [url] - 分享链接，用于页面级缓存键
+ * @returns {Promise<{pageName: string, text: string, tables: any[], images: any[], segments: string[], segmentCount: number, isSegmented: boolean}>}
  */
-export async function getSinglePage(pageName) {
-  const success = await navigateToPage(pageName);
-  if (!success) throw new Error(`无法导航到页面: ${pageName}`);
+export async function getSinglePage(pageName, url) {
+  const nav = await navigateToPage(pageName);
+  if (!nav.ok) throw new Error(describeNavigationFailure(pageName, nav));
 
-  const { text, tables } = await extractPageText();
-  const screenshotResult = await screenshotPage(pageName);
+  const { text, tables, images } = await extractPageText();
+  const screenshotResult = await screenshotPage(
+    pageName,
+    pageCacheKeyOf(url, pageName, text)
+  );
 
   return {
     pageName,
     text,
     tables,
+    images,
     segments: screenshotResult.segments,
     segmentCount: screenshotResult.segmentCount,
     isSegmented: screenshotResult.isSegmented,

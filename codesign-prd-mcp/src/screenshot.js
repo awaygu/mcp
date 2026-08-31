@@ -9,9 +9,11 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
+import { createHash } from 'crypto';
 import { getPage } from './browser.js';
 
 const SCREENSHOT_DIR = path.join(process.cwd(), '.codesign-mcp', 'screenshots');
+const PAGE_CACHE_DIR = path.join(process.cwd(), '.codesign-mcp', 'pagecache');
 
 // 分段截图参数
 const VIEWPORT_HEIGHT = 1080;
@@ -153,14 +155,56 @@ async function captureIframeVisible(filepath) {
 }
 
 /**
+ * 读取页面级缓存（跳过重复截图）
+ * 键 = md5(url + 页面名 + DOM 文字哈希)，值 = 分段截图结果
+ */
+function readPageCache(key) {
+  try {
+    const file = path.join(PAGE_CACHE_DIR, `${key}.json`);
+    if (!fs.existsSync(file)) return null;
+    const data = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    // 截图文件可能被手动清理，缺任何一个都视为失效
+    if (!data.segments?.length || !data.segments.every((p) => fs.existsSync(p))) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+function writePageCache(key, result) {
+  try {
+    if (!fs.existsSync(PAGE_CACHE_DIR)) {
+      fs.mkdirSync(PAGE_CACHE_DIR, { recursive: true });
+    }
+    fs.writeFileSync(path.join(PAGE_CACHE_DIR, `${key}.json`), JSON.stringify(result), 'utf-8');
+  } catch (err) {
+    console.warn('写入页面缓存失败:', err.message);
+  }
+}
+
+/**
  * 分段截取当前页面（Axure iframe 内容）
  * @param {string} filename - 基础文件名（不含扩展名）
  * @param {import('playwright').Frame} frame - Axure iframe
+ * @param {string} [pageCacheKey] - 页面级缓存键，命中且截图文件齐全时直接复用
  * @returns {Promise<{segments: string[], totalHeight: number, segmentCount: number, isSegmented: boolean}>}
  */
-export async function capturePageSegments(filename, frame) {
+export async function capturePageSegments(filename, frame, pageCacheKey) {
+  if (pageCacheKey) {
+    const cached = readPageCache(pageCacheKey);
+    if (cached) return cached;
+  }
+
   ensureScreenshotDir();
-  const baseName = safeName(filename);
+  const finish = (result) => {
+    if (pageCacheKey && result.segments.length) writePageCache(pageCacheKey, result);
+    return result;
+  };
+
+  // 文件名加当前页面 URL 哈希前缀：避免不同分享链接的同名页面覆盖彼此的截图
+  const pageUrl = getPage()?.url() || '';
+  const urlKey = pageUrl ? createHash('md5').update(pageUrl).digest('hex').slice(0, 8) : 'nolink';
+  const baseName = `${urlKey}_${safeName(filename)}`;
 
   if (!frame) {
     // 没有 iframe，降级为单张全页截图
@@ -169,7 +213,7 @@ export async function capturePageSegments(filename, frame) {
     if (page) {
       await page.screenshot({ path: filepath, fullPage: true, animations: 'disabled' });
     }
-    return { segments: [filepath], totalHeight: 0, segmentCount: 1, isSegmented: false };
+    return finish({ segments: [filepath], totalHeight: 0, segmentCount: 1, isSegmented: false });
   }
 
   // 检测滚动容器
@@ -191,12 +235,12 @@ export async function capturePageSegments(filename, frame) {
       const page = getPage();
       if (page) await page.screenshot({ path: filepath, fullPage: true, animations: 'disabled' });
     }
-    return {
+    return finish({
       segments: [filepath],
       totalHeight: scrollHeight,
       segmentCount: 1,
       isSegmented: false,
-    };
+    });
   }
 
   // 长页面：分段截图
@@ -234,12 +278,12 @@ export async function capturePageSegments(filename, frame) {
   // 滚动回顶部
   await scrollTo(frame, containerSelector, 0);
 
-  return {
+  return finish({
     segments,
     totalHeight: scrollHeight,
     segmentCount: segments.length,
     isSegmented: segments.length > 1,
-  };
+  });
 }
 
 /**
