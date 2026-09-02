@@ -52,7 +52,7 @@ function resolveAccess(url, password) {
 async function ensureOpened(url, password) {
   const nextPassword = password ?? null;
   // 浏览器崩溃/被关闭后必须重新导航，否则同 URL 会永久跳过 openShareLink 卡死
-  const browserAlive = !!getPage()?.browser()?.isConnected() && !getPage().isClosed();
+  const browserAlive = !!getPage()?.context()?.browser()?.isConnected() && !getPage()?.isClosed();
   if (currentUrl === url && currentPassword === nextPassword && browserAlive) return;
 
   // 先置空：openShareLink 失败时不会残留错误状态，下次调用必然重新导航
@@ -118,7 +118,8 @@ server.registerTool(
           const indent = '  '.repeat(item.level);
           const icon = item.isGroup ? '📁' : '📄';
           const index = item.pageIndex !== undefined ? ` (第${item.pageIndex + 1}页)` : '';
-          lines.push(`${indent}- ${icon} ${item.name}${index}`);
+          // 展示完整路径：同名页面靠它消歧，调用方按此传 pageName/groupName
+          lines.push(`${indent}- ${icon} ${item.path}${index}`);
         });
         return lines.join('\n');
       });
@@ -137,11 +138,11 @@ server.registerTool(
 server.registerTool(
   'get_page_content',
   {
-    description: '获取 CoDesign 原型中单个页面的结构化内容（VLM 解析后纯文本，含组件/交互/表格）',
+    description: '获取 CoDesign 原型中单个页面的结构化内容（VLM 解析后纯文本，含组件/交互/表格）。页面同名时传完整路径「父分组/页面名」',
     inputSchema: {
       url: z.string().optional().describe('CoDesign 分享链接；不传时使用环境变量 CODESIGN_URL'),
       password: z.string().optional().describe('访问密码；不传时使用环境变量 CODESIGN_PASSWORD'),
-      pageName: z.string().describe('页面名称（与左侧目录一致）'),
+      pageName: z.string().describe('页面名称（叶子名或完整路径「父分组/页面名」，同名页面须用路径区分）'),
       vlmEnabled: z.boolean().optional().describe('是否启用 VLM 解析，默认 true'),
     },
   },
@@ -252,7 +253,7 @@ server.registerTool(
     inputSchema: {
       url: z.string().optional().describe('CoDesign 分享链接；不传时使用环境变量 CODESIGN_URL'),
       password: z.string().optional().describe('访问密码；不传时使用环境变量 CODESIGN_PASSWORD'),
-      groupName: z.string().describe('需求分组名称，如"赛季通行证S2优化"。分组名不确定时可直接调用，失败会返回候选列表'),
+      groupName: z.string().describe('需求分组名称，如"赛季通行证S2优化"；同名歧义时用完整路径。分组名不确定时可直接调用，失败会返回候选列表'),
       vlmEnabled: z.boolean().optional().describe('是否启用 VLM 解析，默认 true'),
       detailLevel: z
         .enum(['summary', 'standard', 'full'])

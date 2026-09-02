@@ -77,9 +77,13 @@ npx playwright install chromium
 | 变量 | 必填 | 说明 | 默认值 |
 |---|---|---|---|
 | `VLM_API_KEY` | 否 | 视觉模型 API Key，配置后启用流程图/表格/页面自动解析 | - |
-| `VLM_BASE_URL` | 否 | API 基础 URL（OpenAI 兼容格式） | `https://api.openai.com/v1` |
+| `VLM_BASE_URL` | 否 | API 基础 URL（带不带 `/v1` 均可，入口自动归一化） | `https://api.openai.com/v1` |
+| `VLM_USE_V1` | 否 | 设 `0` 切到不带 `/v1` 的 `/chat/completions`（少数网关） | `1` |
 | `VLM_MODEL` | 否 | 视觉模型名称 | `gpt-4o` |
 | `VLM_MAX_PARALLEL` | 否 | 视觉模型请求最大并发数 | `3` |
+| `VLM_TIMEOUT_MS` | 否 | 单段请求超时（推理型模型单次可达 100s+，勿设太小） | `180000` |
+| `VLM_MAX_ATTEMPTS` | 否 | 瞬态错误（网络/超时/429/5xx）最大尝试次数 | `3` |
+| `VLM_MAX_TOKENS` | 否 | 单次输出 token 上限（推理模型 reasoning 计入上限） | `8192` |
 
 > 支持任何 OpenAI 兼容的视觉模型接口（豆包、GPT-4o、Claude 等）。
 > 未配置 VLM 时自动降级为仅 DOM 文字提取。
@@ -251,7 +255,7 @@ codesign-prd-mcp/
 | table | 名称含"奖励/配置/规则/参数/列表" | 表格行列数据、字段说明、枚举值 |
 | page | 其他 | 页面布局、组件列表、交互行为、状态 |
 
-**并发控制**：默认同时最多 3 个 VLM 请求（可用 `VLM_MAX_PARALLEL` 调整），单段超时 30s，失败重试 1 次。
+**并发控制**：默认同时最多 3 个 VLM 请求（可用 `VLM_MAX_PARALLEL` 调整），单段超时 180s（`VLM_TIMEOUT_MS`），瞬态错误线性退避重试（1s → 2s，默认最多 3 次）。传输层自带防御：404 自动切换 `/v1` 端点路径、模型拒绝 `response_format` 时降级为提示词约束、网关返回网页（200+HTML）时报清晰错误并换路径重试。
 
 `get_requirement_doc` 会把分组下**所有页面**的分段摊平成一个全局队列统一调度，而不是「页内并发、页间串行」，避免每页末尾的并发度浪费。页面爬取阶段仍必须串行——浏览器 page 是进程内单例，并发导航会互相打断。
 

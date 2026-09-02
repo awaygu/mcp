@@ -89,20 +89,19 @@ async function inputPassword(page, password) {
 }
 
 /**
- * 获取原型页面大纲（左侧目录树）
- * @returns {Promise<Array<{name: string, level: number, isGroup: boolean, pageIndex: number}>>}
+ * 收集目录树扁平节点（含 DOM 索引）。TDesign 树为扁平渲染，DOM 顺序即大纲顺序，
+ * 后续点击按索引定位，天然规避同名节点歧义。
  */
-export async function getPageOutline() {
+async function collectTreeItems() {
   const page = getPage();
   if (!page) throw new Error('浏览器未启动，请先调用 openShareLink');
 
-  const outline = await page.evaluate(() => {
+  return page.evaluate(() => {
     const tree = document.querySelector('.t-tree');
-    if (!tree) return [];
+    if (!tree) return null;
 
     const items = [];
-    const treeItems = tree.querySelectorAll('.t-tree__item');
-    treeItems.forEach((item) => {
+    tree.querySelectorAll('.t-tree__item').forEach((item, domIndex) => {
       const labelText = item.querySelector(':scope > .t-tree__label .label-text');
       const name = labelText?.textContent?.trim();
       if (!name) return;
@@ -116,14 +115,37 @@ export async function getPageOutline() {
       const levelMatch = style.match(/--level:\s*(\d+)/);
       const level = levelMatch ? parseInt(levelMatch[1]) : 0;
 
-      items.push({ name, level, isGroup });
+      items.push({ name, level, isGroup, domIndex });
     });
     return items;
   });
+}
+
+/**
+ * 按层级栈为扁平节点推导完整路径（祖先分组名 + 自身，用 / 连接）。
+ * 同名页面靠路径成为唯一地址，如「赛季通行证S2优化/流程图」。
+ * @param {Array<{name: string, level: number, isGroup: boolean, domIndex: number}>} items
+ */
+export function buildTreePaths(items) {
+  const stack = [];
+  return items.map((item) => {
+    while (stack.length && stack[stack.length - 1].level >= item.level) stack.pop();
+    stack.push({ level: item.level, name: item.name });
+    return { ...item, path: stack.map((s) => s.name).join('/') };
+  });
+}
+
+/**
+ * 获取原型页面大纲（左侧目录树，节点带完整路径）
+ * @returns {Promise<Array<{name: string, level: number, isGroup: boolean, domIndex: number, path: string, pageIndex?: number}>>}
+ */
+export async function getPageOutline() {
+  const items = (await collectTreeItems()) || [];
+  const tree = buildTreePaths(items);
 
   // 给非分组项分配 pageIndex
   let pageIndex = 0;
-  return outline.map((item) => {
+  return tree.map((item) => {
     if (!item.isGroup) {
       return { ...item, pageIndex: pageIndex++ };
     }
@@ -151,30 +173,25 @@ export async function getAxureFrame() {
 }
 
 /**
- * 导航到指定页面（通过目录树点击）
- * @param {string} pageName - 页面名称
- * @returns {Promise<{ok: true} | {ok: false, reason: 'not_found'|'ambiguous', count?: number}>}
+ * 导航到指定页面（按目录树 DOM 索引点击）
+ * @param {number} domIndex - 目标节点在大纲数组中的索引
+ * @returns {Promise<{ok: true} | {ok: false, reason: 'stale_outline'}>}
  */
-export async function navigateToPage(pageName) {
+export async function navigateToPageByIndex(domIndex) {
   const page = getPage();
   if (!page) throw new Error('浏览器未启动');
 
-  const outcome = await page.evaluate((name) => {
+  const outcome = await page.evaluate((index) => {
     const tree = document.querySelector('.t-tree');
-    if (!tree) return { ok: false, reason: 'not_found' };
+    if (!tree) return { ok: false, reason: 'stale_outline' };
 
-    const labels = Array.from(tree.querySelectorAll('.t-tree__label'));
-    const matched = labels.filter(
-      (label) => label.querySelector('.label-text')?.textContent?.trim() === name
-    );
+    const items = Array.from(tree.querySelectorAll('.t-tree__item'));
+    const label = items[index]?.querySelector(':scope > .t-tree__label');
+    if (!label) return { ok: false, reason: 'stale_outline' };
 
-    // 同名节点点第一个会静默跳错页面，这里上报歧义交给调用方决定
-    if (matched.length === 0) return { ok: false, reason: 'not_found' };
-    if (matched.length > 1) return { ok: false, reason: 'ambiguous', count: matched.length };
-
-    matched[0].click();
+    label.click();
     return { ok: true };
-  }, pageName);
+  }, domIndex);
 
   if (!outcome.ok) return outcome;
 
@@ -206,11 +223,57 @@ export async function navigateToPage(pageName) {
   return { ok: true };
 }
 
-function describeNavigationFailure(pageName, nav) {
-  if (nav.reason === 'ambiguous') {
-    return `页面名「${pageName}」在目录中出现 ${nav.count} 次，无法确定唯一目标，请改用更完整的名称`;
+/**
+ * 纯函数：在大纲中匹配目标（分组或页面）。
+ * 支持：叶子名（唯一时）、完整路径、路径尾部（最后 N 段）。
+ * 多种命中时返回候选路径清单，让调用方拿到可行动的提示。
+ * @param {Array<{name: string, path: string, isGroup: boolean, domIndex: number}>} outline
+ * @param {string} name - 叶子名或路径
+ * @param {'any'|'group'} kind - 只匹配分组，或分组与页面都匹配
+ * @returns {{ok: true, target: object} | {ok: false, reason: string}}
+ */
+export function matchTreeTarget(outline, name, kind = 'any') {
+  const pool = kind === 'group' ? outline.filter((i) => i.isGroup) : outline;
+  if (!pool.length) return { ok: false, reason: `目录中没有任何${kind === 'group' ? '分组' : '节点'}` };
+
+  // 1) 精确路径匹配（唯一地址，直接命中）
+  const exactPaths = pool.filter((i) => i.path === name);
+  if (exactPaths.length === 1) return { ok: true, target: exactPaths[0] };
+
+  // 2) 精确叶子名匹配（唯一时可用；同名靠路径消歧）
+  const exactNames = pool.filter((i) => i.name === name);
+  if (exactNames.length === 1) return { ok: true, target: exactNames[0] };
+
+  // 3) 路径尾部匹配（含部分段，如「S2优化/流程图」命中「赛季通行证S2优化/流程图」）
+  const pathSuffix = pool.filter((i) => i.path.endsWith(name));
+  if (pathSuffix.length === 1) return { ok: true, target: pathSuffix[0] };
+
+  const candidates = [...new Set([...exactPaths, ...exactNames, ...pathSuffix])];
+  if (candidates.length > 0) {
+    if (candidates.length > 1) {
+      return {
+        ok: false,
+        reason: `「${name}」匹配到 ${candidates.length} 个节点：${candidates
+          .map((i) => i.path)
+          .join('、')}。请使用完整路径（父分组/页面名）区分`,
+      };
+    }
+    return {
+      ok: false,
+      reason: `「${name}」匹配到同名节点（路径：${candidates[0].path}），无法区分`,
+    };
   }
-  return `目录中未找到页面「${pageName}」，请对照大纲使用完全一致的页面名称`;
+  return {
+    ok: false,
+    reason: `目录中未找到「${name}」。可用路径：${pool.map((i) => i.path).join('、')}`,
+  };
+}
+
+function describeNavigationFailure(pageName, nav) {
+  if (nav.reason === 'stale_outline') {
+    return '目录树已刷新导致定位失效，请重新调用获取大纲后再试';
+  }
+  return nav.reason;
 }
 
 /**
@@ -303,92 +366,70 @@ function pageCacheKeyOf(url, pageName, text) {
 }
 
 /**
- * 在目录树中定位分组或页面：精确匹配优先，其次模糊匹配，多种可能时抛出候选清单。
- * 原实现取首个模糊匹配，遇到同名分组会静默解析错目标。
- * @returns {{kind: 'group', index: number} | {kind: 'page', name: string}}
+ * 在目录树中定位分组：叶子名唯一时可用，歧义时返回候选路径清单。
+ * @param {Array<{name: string, path: string, isGroup: boolean}>} outline
+ * @param {string} name
+ * @returns {{ok: true, target: {name: string, path: string, domIndex: number, level: number, isGroup: boolean}} | {ok: false, reason: string}}
  */
-function resolveTarget(outline, name) {
-  const groups = outline.filter((i) => i.isGroup);
-  const pages = outline.filter((i) => !i.isGroup);
-
-  const exactGroups = groups.filter((i) => i.name === name);
-  if (exactGroups.length === 1) return { kind: 'group', index: outline.indexOf(exactGroups[0]) };
-  if (exactGroups.length > 1) {
-    throw new Error(`分组名「${name}」在目录中出现 ${exactGroups.length} 次，请改用更完整的名称`);
-  }
-
-  const fuzzyGroups = groups.filter((i) => i.name.includes(name));
-  if (fuzzyGroups.length === 1) return { kind: 'group', index: outline.indexOf(fuzzyGroups[0]) };
-  if (fuzzyGroups.length > 1) {
-    throw new Error(
-      `分组名「${name}」模糊匹配到 ${fuzzyGroups.length} 个分组：${fuzzyGroups
-        .map((i) => i.name)
-        .join(' / ')}。请细化名称后重试`
-    );
-  }
-
-  // 退化：传入的其实是页面名，按单页处理
-  const exactPages = pages.filter((i) => i.name === name);
-  if (exactPages.length === 1) return { kind: 'page', name };
-  if (exactPages.length > 1) {
-    throw new Error(`页面名「${name}」在目录中出现 ${exactPages.length} 次，请改用更完整的名称`);
-  }
-
-  throw new Error(
-    `未找到分组或页面「${name}」。可用分组：${groups.map((i) => i.name).join(' / ') || '（无）'}`
-  );
+function resolveGroup(outline, name) {
+  return matchTreeTarget(outline, name, 'group');
 }
 
 /**
  * 获取指定分组下所有页面的完整内容
- * @param {string} groupName - 分组名称（如"赛季通行证S2优化"）
+ * @param {string} groupName - 分组名称（如"赛季通行证S2优化/流程图"或叶子名）
  * @param {string} [url] - 分享链接，用于页面级缓存键
  * @returns {Promise<Array<{pageName: string, text: string, tables: any[], images: any[], segments: string[], segmentCount: number, isSegmented: boolean, error?: string}>>}
  */
 export async function getGroupPages(groupName, url) {
   const outline = await getPageOutline();
-  const target = resolveTarget(outline, groupName);
+  const located = resolveGroup(outline, groupName);
+  if (!located.ok) throw new Error(located.reason);
+  const { target } = located;
 
   let pages;
-  if (target.kind === 'page') {
-    pages = [target.name];
+  if (!target.isGroup) {
+    // 传入的其实是页面名，按单页处理
+    pages = [{ name: target.name, domIndex: target.domIndex }];
   } else {
-    const groupLevel = outline[target.index].level;
+    // domIndex 是原始 DOM 序号（可能含无文字节点），遍历须用大纲数组下标，两者不可混用
+    const targetIndex = outline.indexOf(target);
+    const groupLevel = target.level;
     pages = [];
-    for (let i = target.index + 1; i < outline.length; i++) {
+    for (let i = targetIndex + 1; i < outline.length; i++) {
       const item = outline[i];
       if (item.level <= groupLevel) break;
-      if (!item.isGroup) pages.push(item.name);
+      if (!item.isGroup) pages.push({ name: item.name, domIndex: item.domIndex });
     }
     // 空分组：退化为解析分组节点自身
-    if (pages.length === 0) pages.push(outline[target.index].name);
+    if (pages.length === 0) pages.push({ name: target.name, domIndex: target.domIndex });
   }
 
   const results = [];
-  for (const pageName of pages) {
-    const nav = await navigateToPage(pageName);
+  for (const pageInfo of pages) {
+    const nav = await navigateToPageByIndex(pageInfo.domIndex);
     if (!nav.ok) {
       results.push({
-        pageName,
+        pageName: pageInfo.name,
         text: '',
         tables: [],
         images: [],
         segments: [],
         segmentCount: 0,
         isSegmented: false,
-        error: describeNavigationFailure(pageName, nav),
+        error: describeNavigationFailure(pageInfo.name, nav),
       });
       continue;
     }
 
     const { text, tables, images } = await extractPageText();
     const screenshotResult = await screenshotPage(
-      `${groupName}_${pageName}`,
-      pageCacheKeyOf(url, pageName, text)
+      `${groupName}_${pageInfo.name}`,
+      pageCacheKeyOf(url, pageInfo.name, text)
     );
 
     results.push({
-      pageName,
+      pageName: pageInfo.name,
       text,
       tables,
       images,
@@ -404,18 +445,22 @@ export async function getGroupPages(groupName, url) {
 
 /**
  * 获取单个页面的完整内容
- * @param {string} pageName
+ * @param {string} pageName - 页面叶子名或完整路径（父分组/页面名，用于同名页面消歧）
  * @param {string} [url] - 分享链接，用于页面级缓存键
  * @returns {Promise<{pageName: string, text: string, tables: any[], images: any[], segments: string[], segmentCount: number, isSegmented: boolean}>}
  */
 export async function getSinglePage(pageName, url) {
-  const nav = await navigateToPage(pageName);
+  const outline = await getPageOutline();
+  const located = matchTreeTarget(outline, pageName, 'any');
+  if (!located.ok) throw new Error(located.reason);
+
+  const nav = await navigateToPageByIndex(located.target.domIndex);
   if (!nav.ok) throw new Error(describeNavigationFailure(pageName, nav));
 
   const { text, tables, images } = await extractPageText();
   const screenshotResult = await screenshotPage(
     pageName,
-    pageCacheKeyOf(url, pageName, text)
+    pageCacheKeyOf(url, located.target.path, text)
   );
 
   return {

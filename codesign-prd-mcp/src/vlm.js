@@ -11,21 +11,34 @@
  *
  * 环境变量配置：
  *   VLM_API_KEY      - API 密钥（必填）
- *   VLM_BASE_URL     - API 基础 URL，默认 https://api.openai.com/v1
+ *   VLM_BASE_URL     - API 基础 URL（带不带 /v1 均可，入口自动归一化），默认 https://api.openai.com/v1
+ *   VLM_USE_V1       - 设 0 切到不带 /v1 的 /chat/completions（少数网关）
  *   VLM_MODEL        - 模型名称，默认 gpt-4o
  *   VLM_MAX_PARALLEL - 最大并发数，默认 3
+ *   VLM_TIMEOUT_MS   - 单段请求超时，默认 180000（推理型模型单次可达 100s+）
+ *   VLM_MAX_ATTEMPTS - 瞬态错误最大尝试次数，默认 3
+ *   VLM_MAX_TOKENS   - 单次输出 token 上限，默认 8192
  */
 import * as fs from 'fs';
 import * as path from 'path';
 
-const API_KEY = process.env.VLM_API_KEY || '';
-const BASE_URL = process.env.VLM_BASE_URL || 'https://api.openai.com/v1';
-const MODEL = process.env.VLM_MODEL || 'gpt-4o';
-
+const API_KEY = process.env.VLM_API_KEY || process.env.MT_API_KEY || '';
+// 入口归一化：剥掉尾部斜杠与已有的 /v1，端点路径统一由 chatEndpoint() 拼——配置带不带 /v1 都能正确工作
+// （曾因配置少 /v1，且网关对未知路径返回 200+HTML，导致所有分段解析失败）
+const BASE_URL = (process.env.VLM_BASE_URL || 'https://api.openai.com/v1')
+  .replace(/\/+$/, '')
+  .replace(/\/v1$/, '');
+// VLM_USE_V1=0 切到不带 /v1 的原生 /chat/completions（少数网关）
+const USE_V1 = process.env.VLM_USE_V1 !== '0';
+const MODEL = process.env.VLM_MODEL;
 // 并发限制
 const MAX_PARALLEL = Math.max(1, parseInt(process.env.VLM_MAX_PARALLEL || '3', 10) || 3);
-const VLM_TIMEOUT = 30000; // 单段超时 30s
-const MAX_RETRY = 1; // 失败重试次数
+// 推理型视觉模型单次可达 100s+（实测 GLM-5.3-Flash 103s），原 30s 会掐死正常请求
+const VLM_TIMEOUT = Math.max(1, parseInt(process.env.VLM_TIMEOUT_MS || '180000', 10) || 180000);
+// 瞬态错误（网络/超时/429/5xx）最大尝试次数（含首次）
+const MAX_ATTEMPTS = Math.max(1, parseInt(process.env.VLM_MAX_ATTEMPTS || '3', 10) || 3);
+// 输出上限：部分模型 reasoning token 计入 max_tokens，原 4000 会截断长 JSON
+const MAX_TOKENS = Math.max(1000, parseInt(process.env.VLM_MAX_TOKENS || '8192', 10) || 8192);
 
 // 改动下方任意 Prompt 时必须递增，否则会命中旧 Prompt 产生的缓存
 const PROMPT_VERSION = 'v1';
@@ -62,11 +75,15 @@ function imageToBase64(imagePath) {
   return `data:${mime};base64,${data.toString('base64')}`;
 }
 
+function chatEndpoint(useV1) {
+  return `${BASE_URL}${useV1 ? '/v1' : ''}/chat/completions`;
+}
+
 /**
  * 调用视觉模型（OpenAI 兼容接口）
  * @param {Array} content - 消息内容（text + image_url）
  * @param {object} options
- * @returns {Promise<string>}
+ * @returns {Promise<{content: string, finishReason: string, status: number}>}
  */
 async function callVLM(content, options = {}) {
   if (!API_KEY) {
@@ -75,9 +92,9 @@ async function callVLM(content, options = {}) {
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), options.timeout || VLM_TIMEOUT);
-
+  let response;
   try {
-    const response = await fetch(`${BASE_URL}/chat/completions`, {
+    response = await fetch(chatEndpoint(options.useV1 ?? USE_V1), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -87,39 +104,125 @@ async function callVLM(content, options = {}) {
         model: MODEL,
         messages: [{ role: 'user', content }],
         temperature: options.temperature ?? 0.1,
-        max_tokens: options.maxTokens ?? 4000,
+        max_tokens: options.maxTokens ?? MAX_TOKENS,
         response_format: options.responseFormat,
       }),
       signal: controller.signal,
     });
-    clearTimeout(timer);
-
-    if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`VLM 调用失败 (${response.status}): ${errText}`);
-    }
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content || '';
   } catch (err) {
+    // AbortError 报清晰信息，方便定位是超时而非网络故障
+    if (err?.name === 'AbortError') {
+      throw new Error(`VLM 请求超时（${options.timeout || VLM_TIMEOUT}ms），可设 VLM_TIMEOUT_MS 调整`);
+    }
+    throw err;
+  } finally {
     clearTimeout(timer);
+  }
+
+  const errText = await response.text();
+  // 非 2xx 且错误体是 JSON 才解析；其他网关 401 返回纯文本，直接拼原文
+  let errJson = null;
+  if (!response.ok) {
+    try {
+      errJson = JSON.parse(errText);
+    } catch {
+      errJson = null;
+    }
+  }
+  if (!response.ok) {
+    const msg = errJson?.error?.message || errJson?.message || errText.slice(0, 150);
+    const err = new Error(`VLM 调用失败 (HTTP ${response.status}): ${msg}`);
+    err.status = response.status;
     throw err;
   }
+  // 网关对未知路径可能返回 200 + SPA 首页 HTML（已实际踩坑），校验 content-type 防止隐晦的 SyntaxError
+  if (!/application\/json/i.test(response.headers.get('content-type') || '')) {
+    const err = new Error(
+      `VLM 端点返回非 JSON（content-type=${response.headers.get('content-type')}），多为 BASE_URL 路径错误（网关返回了网页）：${errText.slice(0, 120)}`
+    );
+    err.status = response.status;
+    err.nonJson = true;
+    throw err;
+  }
+
+  const data = JSON.parse(errText);
+  const choice = data.choices?.[0];
+  return {
+    content: choice?.message?.content || '',
+    finishReason: choice?.finish_reason || '',
+    status: response.status,
+  };
 }
 
 /**
- * 带重试的 VLM 调用
+ * 带分类重试的 VLM 调用：
+ * - 404：切换 /v1 路径重试一次（不占重试次数）
+ * - 模型拒绝 response_format：去掉该参数重试一次（不占重试次数）
+ * - 瞬态错误（网络/超时/429/5xx）：线性退避重试
+ * - 4xx 鉴权/参数错误：不重试直接抛
  */
 async function callVLMWithRetry(content, options = {}) {
   let lastErr;
-  for (let attempt = 0; attempt <= MAX_RETRY; attempt++) {
+  let useV1 = options.useV1 ?? USE_V1;
+  let triedAltPath = false;
+  let triedNoResponseFormat = false;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    let status = 0;
+    let result = null;
     try {
-      return await callVLM(content, options);
+      result = await callVLM(content, { ...options, useV1 });
+      status = result.status;
     } catch (err) {
+      status = err.status || 0;
       lastErr = err;
-      if (attempt < MAX_RETRY) {
-        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+
+      // 404 → 网关可能只认另一条路径，切换后重试（一次性，不占重试次数）
+      if (status === 404 && !triedAltPath) {
+        triedAltPath = true;
+        useV1 = !useV1;
+        console.error(`[vlm] HTTP 404 → 切换端点为 ${chatEndpoint(useV1)}`);
+        attempt--;
+        continue;
       }
+      // 400 且疑似 response_format 被拒 → 降级为提示词约束重试（一次性，不占重试次数）
+      if (status === 400 && options.responseFormat && !triedNoResponseFormat) {
+        triedNoResponseFormat = true;
+        delete options.responseFormat;
+        console.error('[vlm] 模型拒绝 response_format → 降级为提示词约束重试');
+        attempt--;
+        continue;
+      }
+      // 非 JSON 响应（网关返回网页）：换路径重试一次，否则直接抛——重试同路径没有意义
+      if (err.nonJson && !triedAltPath) {
+        triedAltPath = true;
+        useV1 = !useV1;
+        console.error(`[vlm] 端点返回非 JSON → 切换端点为 ${chatEndpoint(useV1)}`);
+        attempt--;
+        continue;
+      }
+      // 瞬态错误（网络 0/超时 abort/429/5xx）→ 退避重试；其他 4xx 是配置错误，重试无意义
+      const isTransient = status === 0 || status === 429 || status >= 500;
+      if (!isTransient) throw err;
+      if (attempt >= MAX_ATTEMPTS) throw err;
     }
+
+    if (result) {
+      // 请求成功但返回空 content（部分模型 json_object 模式偶发空响应）→ 计入重试
+      if (result.content.trim()) {
+        // 部分模型不守 json_object 约定，仍套 markdown 围栏
+        return result.content.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+      }
+      lastErr = new Error(
+        `VLM 返回空 content（finish_reason=${result.finishReason || '无choices字段'}），多为模型端/代理异常`
+      );
+      status = 0; // 空响应按瞬态处理
+      if (attempt >= MAX_ATTEMPTS) throw lastErr;
+    }
+
+    const delay = 1000 * attempt; // 1s → 2s 线性退避
+    console.error(`[vlm] ${lastErr.message}，${delay}ms 后重试（attempt=${attempt}/${MAX_ATTEMPTS}）`);
+    await new Promise((r) => setTimeout(r, delay));
   }
   throw lastErr;
 }
@@ -283,7 +386,7 @@ export async function analyzeSingleImage(imagePath, type, options = {}) {
 
   const result = await callVLMWithRetry(content, {
     temperature: type === 'page' ? 0.2 : 0.1,
-    maxTokens: 4000,
+    maxTokens: MAX_TOKENS,
     responseFormat: { type: 'json_object' },
   });
 
