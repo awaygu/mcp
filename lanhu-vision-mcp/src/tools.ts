@@ -59,7 +59,7 @@ export function registerTools(server: McpServer): void {
     {
       description:
         '读取蓝湖设计稿的结构化图层树（精确 x/y/宽高/色值/字号/圆角/文本）。mode：api=官方Cookie接口(默认,无需浏览器) / mock=内置示例。analyze=true 时用配置的视觉模型理解设计稿封面图。' +
-        'analyze 默认值：已配置视觉模型（LANHU_VISION_MODEL + LLM_API_KEY/MT_API_KEY）时默认 true，未配置则默认 false；显式传 true/false 始终优先。' +
+        'analyze 默认值：已配置视觉模型（VLM_MODEL + VLM_API_KEY/MT_API_KEY）时默认 true，未配置则默认 false；显式传 true/false 始终优先。' +
         '使用纪律：一次只读当前要实现的那 1 张稿；不要为「了解全貌」批量读稿——分组稿目录用 lanhu_read_sector，它足够定位；返回的 layers 含精确数值，色值/字号从数据取，禁止靠视觉模型 OCR 小字。',
       inputSchema: {
         mode: z.enum(['api', 'mock']).default('api').describe('抽取后端'),
@@ -81,7 +81,7 @@ export function registerTools(server: McpServer): void {
       // 未传 analyze 时，配了视觉模型就默认开
       const analyze = args.analyze ?? isAutoAnalyzeEnabled();
       if (args.analyze === undefined && analyze) {
-        console.error(`[fetch_design] analyze 未指定且视觉模型已配置 → 自动开启（${process.env.LANHU_VISION_MODEL || '默认模型'}）`);
+        console.error(`[fetch_design] analyze 未指定且视觉模型已配置 → 自动开启（${process.env.VLM_MODEL || '默认模型'}）`);
       }
 
       const fetchOpts = { ...credentials(args), needCover: analyze };
@@ -102,7 +102,7 @@ export function registerTools(server: McpServer): void {
       } catch (e) {
         console.error(`[fetch_design] 视觉分析失败，降级返回图层树：${(e as Error)?.message}`);
         // 未配置视觉模型时补一句可操作提示
-        const hint = isVisionConfigured() ? '' : '未检测到视觉模型配置：需同时设置 LANHU_VISION_MODEL 与 LLM_API_KEY。';
+        const hint = isVisionConfigured() ? '' : '未检测到视觉模型配置：需同时设置 VLM_MODEL 与 VLM_API_KEY。';
         return jsonContent({ ...rest, visionError: `${(e as Error)?.message || String(e)}${hint}` });
       }
     }

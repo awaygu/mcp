@@ -175,9 +175,12 @@ export async function getAxureFrame() {
 /**
  * 导航到指定页面（按目录树 DOM 索引点击）
  * @param {number} domIndex - 目标节点在大纲数组中的索引
- * @returns {Promise<{ok: true} | {ok: false, reason: 'stale_outline'}>}
+ * @param {object} [opts]
+ * @param {boolean} [opts.quick=false] - 快速模式：仅探测 iframe 是否切换（1.5s），用于判断分组节点是否有自身页面
+ * @returns {Promise<{ok: true, frameChanged: boolean} | {ok: false, reason: 'stale_outline'}>}
+ *   frameChanged=false 表示点击后 iframe 未切换（纯展开类分组节点，无自身内容）
  */
-export async function navigateToPageByIndex(domIndex) {
+export async function navigateToPageByIndex(domIndex, { quick = false } = {}) {
   const page = getPage();
   if (!page) throw new Error('浏览器未启动');
 
@@ -198,12 +201,21 @@ export async function navigateToPageByIndex(domIndex) {
   // 等待 iframe 切换到新页面（URL 变化或元素被替换），替代固定 2s 睡眠
   const oldFrame = await getAxureFrame();
   const oldFrameUrl = oldFrame?.url() || '';
-  for (let i = 0; i < 24; i++) {
+  let frameChanged = false;
+  const probes = quick ? 6 : 24;
+  for (let i = 0; i < probes; i++) {
     await page.waitForTimeout(250);
     const frame = await getAxureFrame();
     if (!frame) continue;
-    if (frame !== oldFrame || frame.url() !== oldFrameUrl) break;
+    if (frame !== oldFrame || frame.url() !== oldFrameUrl) {
+      frameChanged = true;
+      break;
+    }
   }
+
+  // 快速模式且未切换：纯展开类分组，跳过完整等待（否则每组白等 10s+）
+  if (quick && !frameChanged) return { ok: true, frameChanged: false };
+
   await waitForNetworkIdle(5000);
 
   // 等待 iframe 中有内容
@@ -220,7 +232,7 @@ export async function navigateToPageByIndex(domIndex) {
     }
   }
 
-  return { ok: true };
+  return { ok: true, frameChanged };
 }
 
 /**
@@ -357,12 +369,15 @@ export async function screenshotPage(filename, pageCacheKey) {
 }
 
 /**
- * 页面级缓存键：分享链接 + 页面名 + DOM 文字哈希。
- * Axure 为静态导出，文字不变即可认为页面未变，可复用已有截图。
+ * 页面级缓存键：分享链接 + 页面名 + DOM 文字哈希 + 截图方案版本。
+ * Axure 为静态导出，文字不变即可认为页面未变，可复用已有截图；
+ * 截图分段逻辑变化时递增 CAPTURE_SCHEME_VERSION，旧缓存（旧分段清单）自动失效。
  */
+const CAPTURE_SCHEME_VERSION = 'v2';
+
 function pageCacheKeyOf(url, pageName, text) {
   if (!url) return null;
-  return createHash('md5').update(`${url}::${pageName}::${text}`).digest('hex');
+  return createHash('md5').update(`${url}::${pageName}::${text}::${CAPTURE_SCHEME_VERSION}`).digest('hex');
 }
 
 /**
@@ -376,7 +391,12 @@ function resolveGroup(outline, name) {
 }
 
 /**
- * 获取指定分组下所有页面的完整内容
+ * 获取指定分组下所有页面的完整内容（含分组节点自身的内容页）
+ *
+ * CoDesign 分组节点点击后右侧可能显示自身页面（如挂在分组上的说明页），
+ * 也可能只是展开/收起目录。策略：先快速点击分组节点探测 iframe 是否切换，
+ * 切换且非空白才把分组自身页计入结果，再遍历子页面。
+ *
  * @param {string} groupName - 分组名称（如"赛季通行证S2优化/流程图"或叶子名）
  * @param {string} [url] - 分享链接，用于页面级缓存键
  * @returns {Promise<Array<{pageName: string, text: string, tables: any[], images: any[], segments: string[], segmentCount: number, isSegmented: boolean, error?: string}>>}
@@ -387,6 +407,36 @@ export async function getGroupPages(groupName, url) {
   if (!located.ok) throw new Error(located.reason);
   const { target } = located;
 
+  const results = [];
+
+  // 1) 分组节点自身内容探测
+  if (target.isGroup) {
+    const before = await extractPageText();
+    const selfNav = await navigateToPageByIndex(target.domIndex, { quick: true });
+    if (selfNav.ok) {
+      const { text, tables, images } = await extractPageText();
+      // URL 未切换但文字变化也算切换（防同 URL 重渲染），空白页（无文字无图）不计入
+      const switched = selfNav.frameChanged || text !== before.text;
+      if (switched && (text.trim() || images.length > 0)) {
+        const screenshotResult = await screenshotPage(
+          `${groupName}_分组页`,
+          pageCacheKeyOf(url, target.path, text)
+        );
+        results.push({
+          pageName: target.name,
+          text,
+          tables,
+          images,
+          segments: screenshotResult.segments,
+          segmentCount: screenshotResult.segmentCount,
+          isSegmented: screenshotResult.isSegmented,
+          totalHeight: screenshotResult.totalHeight,
+        });
+      }
+    }
+  }
+
+  // 2) 遍历分组下的子页面
   let pages;
   if (!target.isGroup) {
     // 传入的其实是页面名，按单页处理
@@ -401,11 +451,8 @@ export async function getGroupPages(groupName, url) {
       if (item.level <= groupLevel) break;
       if (!item.isGroup) pages.push({ name: item.name, domIndex: item.domIndex });
     }
-    // 空分组：退化为解析分组节点自身
-    if (pages.length === 0) pages.push({ name: target.name, domIndex: target.domIndex });
   }
 
-  const results = [];
   for (const pageInfo of pages) {
     const nav = await navigateToPageByIndex(pageInfo.domIndex);
     if (!nav.ok) {

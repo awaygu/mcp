@@ -1,11 +1,12 @@
 /**
  * 分段截图模块
- * 负责对超长页面进行分段滚动截图，避免单张截图截不全
+ * 负责对超大页面进行网格分段滚动截图（垂直 × 水平），避免单张截图截不全
  *
  * 策略：
- * - 页面高度 <= 视口 * 1.5：单张截图
- * - 页面高度 > 视口 * 1.5：分段滚动截图，段间重叠 100px
- * - 每段截图后等待渲染稳定
+ * - 页面完全在视口内（高宽均不超出）：单张截图
+ * - 否则按轴拆分滚动位置序列，网格组合逐段截图，段间重叠 100px
+ * - 每轴最后一个位置强制贴边，避免最后一段被 clamp 与前段重复
+ * - 截图前收集叶子元素矩形，空白网格直接跳过（省段数，也消除空白画面重复）
  */
 import * as fs from 'fs';
 import * as path from 'path';
@@ -19,7 +20,7 @@ const PAGE_CACHE_DIR = path.join(process.cwd(), '.codesign-mcp', 'pagecache');
 const VIEWPORT_HEIGHT = 1080;
 const OVERLAP = 100; // 段间重叠像素
 const RENDER_WAIT = 500; // 滚动后等待渲染时间 ms
-const LONG_PAGE_THRESHOLD = 1.5; // 超过视口 1.5 倍才分段
+const MAX_SEGMENTS = 60; // 网格分段总数上限（宽流程图可达 7行×4列=28 段）
 
 /**
  * 确保截图目录存在
@@ -72,10 +73,10 @@ async function detectScrollContainer(frame) {
 }
 
 /**
- * 获取滚动容器的总高度和当前滚动位置
+ * 获取滚动容器的总尺寸和当前滚动位置
  * @param {import('playwright').Frame} frame
  * @param {string} containerSelector
- * @returns {Promise<{scrollHeight: number, scrollTop: number, clientHeight: number}>}
+ * @returns {Promise<{scrollHeight: number, scrollTop: number, clientHeight: number, scrollWidth: number, scrollLeft: number, clientWidth: number}>}
  */
 async function getScrollInfo(frame, containerSelector) {
   return await frame.evaluate((selector) => {
@@ -87,16 +88,28 @@ async function getScrollInfo(frame, containerSelector) {
         ),
         scrollTop: window.scrollY || window.pageYOffset || 0,
         clientHeight: window.innerHeight,
+        scrollWidth: Math.max(
+          document.body.scrollWidth,
+          document.documentElement.scrollWidth
+        ),
+        scrollLeft: window.scrollX || window.pageXOffset || 0,
+        clientWidth: window.innerWidth,
       };
     }
     const el = document.querySelector(selector);
     if (!el) {
-      return { scrollHeight: 0, scrollTop: 0, clientHeight: 0 };
+      return {
+        scrollHeight: 0, scrollTop: 0, clientHeight: 0,
+        scrollWidth: 0, scrollLeft: 0, clientWidth: 0,
+      };
     }
     return {
       scrollHeight: el.scrollHeight,
       scrollTop: el.scrollTop,
       clientHeight: el.clientHeight,
+      scrollWidth: el.scrollWidth,
+      scrollLeft: el.scrollLeft,
+      clientWidth: el.clientWidth,
     };
   }, containerSelector);
 }
@@ -105,19 +118,22 @@ async function getScrollInfo(frame, containerSelector) {
  * 滚动到指定位置
  * @param {import('playwright').Frame} frame
  * @param {string} containerSelector
- * @param {number} scrollTop
+ * @param {{x: number, y: number}} pos
  */
-async function scrollTo(frame, containerSelector, scrollTop) {
+async function scrollTo(frame, containerSelector, pos) {
   await frame.evaluate(
-    ({ selector, top }) => {
+    ({ selector, x, y }) => {
       if (selector === 'window') {
-        window.scrollTo(0, top);
+        window.scrollTo(x, y);
       } else {
         const el = document.querySelector(selector);
-        if (el) el.scrollTop = top;
+        if (el) {
+          el.scrollTop = y;
+          el.scrollLeft = x;
+        }
       }
     },
-    { selector: containerSelector, top: scrollTop }
+    { selector: containerSelector, x: pos.x, y: pos.y }
   );
 }
 
@@ -221,13 +237,13 @@ export async function capturePageSegments(filename, frame, pageCacheKey) {
 
   // 获取滚动信息
   const scrollInfo = await getScrollInfo(frame, containerSelector);
-  const { scrollHeight, clientHeight } = scrollInfo;
+  const { scrollHeight, clientHeight, scrollWidth, clientWidth } = scrollInfo;
 
-  // 短页面：单张截图
-  if (scrollHeight <= clientHeight * LONG_PAGE_THRESHOLD || scrollHeight <= VIEWPORT_HEIGHT) {
+  // 内容完全在视口内才单张截图；否则任何一轴超出都会截不全
+  if (scrollHeight <= clientHeight && scrollWidth <= clientWidth) {
     const filepath = path.join(SCREENSHOT_DIR, `${baseName}.png`);
     // 滚动到顶部
-    await scrollTo(frame, containerSelector, 0);
+    await scrollTo(frame, containerSelector, { x: 0, y: 0 });
     await new Promise((r) => setTimeout(r, RENDER_WAIT));
     const ok = await captureIframeVisible(filepath);
     if (!ok) {
@@ -243,40 +259,63 @@ export async function capturePageSegments(filename, frame, pageCacheKey) {
     });
   }
 
-  // 长页面：分段截图
-  const segments = [];
+  // 网格分段：每轴生成滚动位置序列（步进+末点贴边），双轴组合逐段截图
   const segmentHeight = clientHeight > 0 ? clientHeight : VIEWPORT_HEIGHT;
-  const step = Math.max(segmentHeight - OVERLAP, 100);
+  const segmentWidth = clientWidth > 0 ? clientWidth : VIEWPORT_HEIGHT;
+  const yPoints = scrollPoints(scrollHeight, segmentHeight);
+  const xPoints = scrollPoints(scrollWidth, segmentWidth);
 
-  let currentScroll = 0;
+  // 回到原点后收集叶子元素矩形（视口坐标即内容坐标），用于跳过空白网格
+  await scrollTo(frame, containerSelector, { x: 0, y: 0 });
+  await new Promise((r) => setTimeout(r, RENDER_WAIT));
+  const contentRects = await collectContentRects(frame);
+  const neededCells = planNeededCells(contentRects, {
+    yPoints,
+    xPoints,
+    viewW: segmentWidth,
+    viewH: segmentHeight,
+    contentW: scrollWidth,
+    contentH: scrollHeight,
+  });
+
+  const segments = [];
   let segmentIndex = 0;
+  let truncated = false;
 
-  while (currentScroll < scrollHeight) {
-    // 滚动到当前位置
-    await scrollTo(frame, containerSelector, currentScroll);
-    await new Promise((r) => setTimeout(r, RENDER_WAIT));
+  for (let yi = 0; yi < yPoints.length; yi++) {
+    for (let xi = 0; xi < xPoints.length; xi++) {
+      if (segmentIndex >= MAX_SEGMENTS) {
+        truncated = true;
+        break;
+      }
+      // 空白格跳过：既减少段数，也消除「空白画面重复」的段
+      if (neededCells && !neededCells.has(yi * xPoints.length + xi)) continue;
+      await scrollTo(frame, containerSelector, { x: xPoints[xi], y: yPoints[yi] });
+      await new Promise((r) => setTimeout(r, RENDER_WAIT));
 
-    // 截图
-    const segFilepath = path.join(
-      SCREENSHOT_DIR,
-      `${baseName}_part${String(segmentIndex + 1).padStart(2, '0')}.png`
-    );
-    const ok = await captureIframeVisible(segFilepath);
-    if (ok) {
-      segments.push(segFilepath);
-    } else {
-      console.warn(`分段 ${segmentIndex + 1} 截图失败，跳过`);
+      const segFilepath = path.join(
+        SCREENSHOT_DIR,
+        `${baseName}_part${String(segmentIndex + 1).padStart(2, '0')}.png`
+      );
+      const ok = await captureIframeVisible(segFilepath);
+      if (ok) {
+        segments.push(segFilepath);
+      } else {
+        console.warn(`分段 ${segmentIndex + 1} 截图失败，跳过`);
+      }
+      segmentIndex++;
     }
+    if (truncated) break;
+  }
 
-    segmentIndex++;
-    currentScroll += step;
-
-    // 安全限制：最多 20 段
-    if (segmentIndex >= 20) break;
+  if (truncated) {
+    console.warn(
+      `页面 ${baseName} 过大（${scrollWidth}x${scrollHeight}），达到 ${MAX_SEGMENTS} 段上限，仅截取部分区域`
+    );
   }
 
   // 滚动回顶部
-  await scrollTo(frame, containerSelector, 0);
+  await scrollTo(frame, containerSelector, { x: 0, y: 0 });
 
   return finish({
     segments,
@@ -284,6 +323,72 @@ export async function capturePageSegments(filename, frame, pageCacheKey) {
     segmentCount: segments.length,
     isSegmented: segments.length > 1,
   });
+}
+
+/**
+ * 单轴滚动位置序列：0 开始按步长推进，末点强制贴边。
+ * 末点贴边可避免最后一段被浏览器 clamp 到同一位置、截出重复画面。
+ * @param {number} contentSize - 内容总尺寸（scrollHeight/scrollWidth）
+ * @param {number} viewSize - 视口尺寸（clientHeight/clientWidth）
+ */
+function scrollPoints(contentSize, viewSize) {
+  const maxScroll = Math.max(contentSize - viewSize, 0);
+  const step = Math.max(viewSize - OVERLAP, 100);
+  const points = [];
+  for (let p = 0; p < maxScroll; p += step) points.push(p);
+  points.push(maxScroll);
+  return points;
+}
+
+/**
+ * 收集 iframe 内叶子元素的矩形（需先滚动到原点，视口坐标即内容坐标）。
+ * 只统计叶子节点：容器盒子（如 #base）会铺满整页，会把所有格子判成非空。
+ */
+async function collectContentRects(frame) {
+  try {
+    return await frame.evaluate(() => {
+      const rects = [];
+      for (const el of document.querySelectorAll('*')) {
+        if (el.children.length > 0) continue;
+        const cs = getComputedStyle(el);
+        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+        const r = el.getBoundingClientRect();
+        if (r.width < 2 || r.height < 2) continue;
+        rects.push({ x: r.left, y: r.top, w: r.width, h: r.height });
+        if (rects.length >= 5000) break;
+      }
+      return rects;
+    });
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 计算需要截取的网格单元集合（key = 行下标*列数+列下标）。
+ * 叶子矩形与格子相交即保留；无矩形信息时返回 null（全量截取，宁多勿缺）。
+ */
+function planNeededCells(rects, { yPoints, xPoints, viewW, viewH, contentW, contentH }) {
+  if (!rects.length) return null;
+  const needed = new Set();
+  for (const r of rects) {
+    const rx0 = r.x;
+    const ry0 = r.y;
+    const rx1 = r.x + r.w;
+    const ry1 = r.y + r.h;
+    for (let yi = 0; yi < yPoints.length; yi++) {
+      const cy0 = yPoints[yi];
+      const cy1 = Math.min(cy0 + viewH, contentH);
+      if (ry1 <= cy0 || ry0 >= cy1) continue;
+      for (let xi = 0; xi < xPoints.length; xi++) {
+        const cx0 = xPoints[xi];
+        const cx1 = Math.min(cx0 + viewW, contentW);
+        if (rx1 <= cx0 || rx0 >= cx1) continue;
+        needed.add(yi * xPoints.length + xi);
+      }
+    }
+  }
+  return needed;
 }
 
 /**

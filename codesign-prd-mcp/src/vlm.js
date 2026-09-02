@@ -22,7 +22,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
-const API_KEY = process.env.VLM_API_KEY || process.env.MT_API_KEY || '';
+const API_KEY = process.env.VLM_API_KEY ||  '';
 // 入口归一化：剥掉尾部斜杠与已有的 /v1，端点路径统一由 chatEndpoint() 拼——配置带不带 /v1 都能正确工作
 // （曾因配置少 /v1，且网关对未知路径返回 200+HTML，导致所有分段解析失败）
 const BASE_URL = (process.env.VLM_BASE_URL || 'https://api.openai.com/v1')

@@ -49,7 +49,7 @@ node lanhu-login.mjs
 
 ### 2. 配置视觉模型（analyze / 验收需要）
 
-配置 `LLM_API_KEY`（视觉模型 Key），可选 `LANHU_VISION_MODEL`。
+配置 `VLM_API_KEY`（视觉模型 Key），可选 `VLM_MODEL`。
 
 配好后 `lanhu_fetch_design` 会**默认带上视觉理解**（`analyze` 自动为 `true`）；想省掉这次视觉调用传 `analyze:false`，或设 `LANHU_AUTO_ANALYZE=0` 全局关闭。
 
@@ -349,9 +349,9 @@ vision_e2e_triage({ screenshotBase64: "<失败截图>", domSnapshot: "<DOM>", er
 
 | 变量 | 必填 | 默认 | 说明 |
 |---|---|---|---|
-| `LLM_API_KEY` | analyze/验收时必填 | — | 视觉模型 Key |
-| `VISION_BASE_URL` | 否 | `https://api.deepseek.com` | 视觉模型端点（验证时可指向 mock） |
-| `LANHU_VISION_MODEL` | 否 | `deepseek-v4-flash-vision-exp` | 视觉模型名 |
+| `VLM_API_KEY` | analyze/验收时必填 | — | 视觉模型 Key |
+| `VLM_BASE_URL` | 否 | `https://api.deepseek.com` | 视觉模型端点（验证时可指向 mock） |
+| `VLM_MODEL` | 否 | `deepseek-v4-flash-vision-exp` | 视觉模型名 |
 | `LANHU_AUTO_ANALYZE` | 否 | — | 设为 `0` 关闭 `lanhu_fetch_design` 的自动视觉分析（配置齐全时也默认不开） |
 | `LANHU_VISION_MAX_TOKENS` | 否 | `4096` | 输出上限。JSON Output 模式下不设会被截断 |
 | `LANHU_VISION_MAX_EDGE` | 否 | `1568` | 入参图压缩的最长边。DeepSeek 进模型前统一缩到约 800×800 等效像素、每张封顶 384 token，设 `1024` 可省流量 |
@@ -384,7 +384,7 @@ vision_e2e_triage({ screenshotBase64: "<失败截图>", domSnapshot: "<DOM>", er
 - HTTP 404 → 自动在 `/v1/chat/completions` 与 `/chat/completions` 之间切换一次；
 - HTTP 400 且错误指向 `response_format` → 剥掉 JSON Output，退回纯提示词约束再解析。
 
-> ⚠️ 401 `Authentication Fails`：说明 `LLM_API_KEY` / `MT_API_KEY` 不是 **DeepSeek 平台**的 key（其它厂商的 `sk-` key 打不通 api.deepseek.com）。去 <https://platform.deepseek.com/api_keys> 申请后替换。
+> ⚠️ 401 `Authentication Fails`：说明 `VLM_API_KEY` / `MT_API_KEY` 不是 **DeepSeek 平台**的 key（其它厂商的 `sk-` key 打不通 api.deepseek.com）。去 <https://platform.deepseek.com/api_keys> 申请后替换。
 
 ## 开发 / 类型检查
 

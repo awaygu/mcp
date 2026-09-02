@@ -2,11 +2,11 @@
 import { request as httpsRequest } from 'node:https';
 import { request as httpRequest } from 'node:http';
 
-const MODEL = process.env.LANHU_VISION_MODEL || 'deepseek-v4-flash-vision-exp';
+const MODEL = process.env.VLM_MODEL || 'deepseek-v4-flash-vision-exp';
 // MT_API_KEY 兜底：部分 MCP 客户端不展开 .mcp.json 里的 env，系统变量更可靠
-const API_KEY = process.env.LLM_API_KEY || process.env.MT_API_KEY || '';
+const API_KEY = process.env.VLM_API_KEY || '';
 // 剥掉尾部 /v1，加不加由 chatEndpoint 统一决定
-const BASE_URL = (process.env.VISION_BASE_URL || 'https://api.deepseek.com').replace(/\/+$/, '').replace(/\/v1$/, '');
+const BASE_URL = (process.env.VLM_BASE_URL || 'https://api.deepseek.com').replace(/\/+$/, '').replace(/\/v1$/, '');
 // VISION_USE_V1=0 切到文档原生的 /chat/completions
 const USE_V1 = process.env.VISION_USE_V1 !== '0';
 // 不设 max_tokens，长 JSON 会被中途截断
