@@ -37,7 +37,7 @@ export interface DesignLayer {
 }
 
 export interface DesignMeta {
-  rawLayerCount: number;
+  rawLayerCount: number;          // 全树遍历的图层数（含被清洗的容器层）
   totalLayerCount: number;
   droppedLayerCount?: number;     // 清洗过滤掉的无样式容器层数
   payloadBytes?: number;          // 清洗后 layers JSON 字节数（Agent 感知数据大小）

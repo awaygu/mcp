@@ -127,6 +127,7 @@ export function normalizeSketch(json: Record<string, any>): { layers: DesignLaye
   const arr = findLayerArray(json) || [];
   const layers: DesignLayer[] = [];
   let droppedCount = 0;
+  let walkedCount = 0; // 全树实际遍历的图层数（含被丢弃的容器）
   // 有视觉信息才输出；容器名不丢，进子层 parentPath
   const isContentful = (l: DesignLayer): boolean =>
     !!(l.fill || l.gradient || l.color || l.text || l.imageUrl || l.hasExportImage || l.radius || l.opacity != null);
@@ -135,6 +136,7 @@ export function normalizeSketch(json: Record<string, any>): { layers: DesignLaye
   const walk = (items: unknown[], path: string[]) => {
     for (const s of items) {
       if (!s || typeof s !== 'object') continue;
+      walkedCount++;
       const shape = s as Record<string, any>;
       const shapeName = String(shape.name || '');
       const childPath = shapeName && meaningfulName(shapeName) ? [...path, shapeName] : path;
@@ -153,7 +155,7 @@ export function normalizeSketch(json: Record<string, any>): { layers: DesignLaye
   };
   walk(arr, []);
   const meta: DesignMeta = {
-    rawLayerCount: arr.length,
+    rawLayerCount: walkedCount,
     totalLayerCount: layers.length,
     droppedLayerCount: droppedCount,
     payloadBytes: Buffer.byteLength(JSON.stringify(layers)),

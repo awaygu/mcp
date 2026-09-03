@@ -155,6 +155,36 @@ export async function checkAuth(opts: Credentials): Promise<
   }
 }
 
+// 蓝湖标注 JSON 实测有 GBK 编码响应（响应头缺 charset 或声明不实），res.json() 会按 latin1 解出乱码。
+// 策略：按响应头 charset 解码；无声明时先试 utf-8，解析出 latin1 高区特征字符（ç/å/é 或 Í¨ÐÐÖ¤ 形态）
+// 则回退 gbk 重解码。utf-8 严格校验（fatal）失败也回退 gbk。
+function decodeJsonBody(buf: ArrayBuffer, contentType: string): any {
+  const m = /charset=([\w-]+)/i.exec(contentType || '');
+  const declared = m?.[1]?.toLowerCase();
+  const tryParse = (label: string): any | null => {
+    try {
+      const text = new TextDecoder(label, { fatal: true }).decode(buf);
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  };
+  if (declared && declared !== 'iso-8859-1') {
+    const json = tryParse(declared);
+    if (json != null) return json;
+  }
+  const utf8 = tryParse('utf-8');
+  if (utf8 != null) return utf8;
+  // latin1 无 fatal 错误（任何字节都合法），只能靠乱码特征识别：非 ASCII 字符落在 latin1 高区且无 CJK
+  const text = new TextDecoder('iso-8859-1').decode(buf);
+  if (/[-ÿ]/.test(text) && !/[一-鿿]/.test(text)) {
+    const gbk = tryParse('gbk');
+    if (gbk != null) return gbk;
+  }
+  // 都失败：容忍非严格 utf-8（含个别坏字节），至少拿到可用的 JSON
+  return JSON.parse(text);
+}
+
 // 读单个设计稿（按 imageId）
 async function fetchDesignByImageId(
   imageId: string,
@@ -182,7 +212,7 @@ async function fetchDesignByImageId(
     const jsonRes = await fetch(jsonUrl, { headers: headersFor(jsonUrl, cookie) });
     // CDN 403/404 常见于标注数据过期，需明确报状态码，别让 SyntaxError 刷屏
     if (!jsonRes.ok) throw new Error(`下载设计稿标注数据失败：HTTP ${jsonRes.status}（${jsonUrl}）`);
-    const json = await jsonRes.json();
+    const json = decodeJsonBody(await jsonRes.arrayBuffer(), jsonRes.headers.get('content-type') || '');
     const norm = normalizeSketch(json);
     layers = norm.layers;
     meta = norm.meta;
