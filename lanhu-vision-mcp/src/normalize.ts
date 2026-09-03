@@ -114,7 +114,42 @@ export function normalizeShape(shape: Record<string, any>): DesignLayer {
       const c = applyAlpha(fill0?.color?.value, fill0);
       if (c) layer.fill = c;
     }
-    layer.radius = Number(style.borderRadius ?? style.cornerRadius ?? 0) || undefined;
+    // 圆角：蓝湖 Figma JSON 真值在 paths[].radius（逐角）；顶层 shape.radius 实测恒为全 0 不可信，
+    // style.borderRadius/cornerRadius 在该格式中不存在。paths 为空时才回落顶层 radius
+    const radiusOf = (r: any): { tl: number; tr: number; bl: number; br: number } | null => {
+      if (r == null) return null;
+      const tl = Number(r.topLeft ?? 0) || 0;
+      const tr = Number(r.topRight ?? 0) || 0;
+      const bl = Number(r.bottomLeft ?? 0) || 0;
+      const br = Number(r.bottomRight ?? 0) || 0;
+      return tl || tr || bl || br ? { tl, tr, bl, br } : null;
+    };
+    let radii = (shape.paths || []).map((p: any) => radiusOf(p?.radius)).filter(Boolean) as Array<{ tl: number; tr: number; bl: number; br: number }>;
+    if (!radii.length) radii = [radiusOf(shape.radius)].filter(Boolean) as Array<{ tl: number; tr: number; bl: number; br: number }>;
+    if (radii.length) {
+      const allSame = radii.every((r) => r.tl === radii[0].tl && r.tr === radii[0].tr && r.bl === radii[0].bl && r.br === radii[0].br);
+      const first = radii[0];
+      const corners = { topLeft: first.tl, topRight: first.tr, bottomLeft: first.bl, bottomRight: first.br };
+      if (allSame && first.tl === first.tr && first.tr === first.bl && first.bl === first.br) {
+        // 四角一致：只出 radius 单值，省字节
+        layer.radius = first.tl;
+      } else {
+        layer.borderRadius = corners;
+        if (!allSame) layer.radius = Math.max(first.tl, first.tr, first.bl, first.br); // 多 path 不一致时给最大角参考值
+      }
+    }
+    // 描边：取第一条启用中的边框（设计稿极少同一图层多描边）
+    const border0 = (style.borders || []).find((b: any) => b.isEnabled !== false);
+    if (border0) {
+      const bc = applyAlpha(border0.color?.value, { ...border0.color, opacity: border0.opacity });
+      if (bc) {
+        layer.border = {
+          color: bc,
+          width: Number(border0.width ?? 0) || 0,
+          alignment: border0.lineAlignment === 'outside' ? 'outside' : border0.lineAlignment === 'center' ? 'center' : 'inside',
+        };
+      }
+    }
   }
   // 只在透明度无处可烘时导出（无 fill/gradient/color，典型是 image 切图）；已烘进 rgba 的再导出会 eff² 双重叠加
   const hasBakedColor = !!(layer.fill || layer.gradient || layer.color);
@@ -130,7 +165,7 @@ export function normalizeSketch(json: Record<string, any>): { layers: DesignLaye
   let walkedCount = 0; // 全树实际遍历的图层数（含被丢弃的容器）
   // 有视觉信息才输出；容器名不丢，进子层 parentPath
   const isContentful = (l: DesignLayer): boolean =>
-    !!(l.fill || l.gradient || l.color || l.text || l.imageUrl || l.hasExportImage || l.radius || l.opacity != null);
+    !!(l.fill || l.gradient || l.color || l.text || l.imageUrl || l.hasExportImage || l.radius || l.borderRadius || l.border || l.opacity != null);
   // 自动生成名（Frame_xxx/编组N…）对 AI 无信息量，且会吃掉过滤省下的字节
   const meaningfulName = (name: string): boolean => !/^(frame|group|编组|矩形|椭圆|形状|切片|蒙版|layer|rect|image|vector|line)[\s_-]?\d*$/i.test(name.trim());
   const walk = (items: unknown[], path: string[]) => {

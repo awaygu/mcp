@@ -16,6 +16,7 @@ const MOCK_DESIGN: DesignResult = {
     { id: 'title', type: 'text', x: 24, y: 64, w: 342, h: 32, text: 'Masked Ball', fontSize: 24, fontWeight: 700, color: '#F5F1FF', fontFamily: 'Inter' },
     { id: 'cta', type: 'rect', x: 24, y: 720, w: 342, h: 48, fill: '#7C5CFF', radius: 12 },
     { id: 'card', type: 'rect', x: 24, y: 120, w: 342, h: 200, fill: '#1A1530', radius: 16 },
+    { id: 'badge', type: 'rect', x: 24, y: 340, w: 61, h: 16, fill: '#771E00', borderRadius: { topLeft: 8, topRight: 12, bottomLeft: 0, bottomRight: 12 }, border: { color: 'rgba(239,216,185,1)', width: 1, alignment: 'inside' } },
   ],
   meta: { rawLayerCount: 4, totalLayerCount: 4 },
 };
@@ -58,7 +59,7 @@ export function registerTools(server: McpServer): void {
     'lanhu_fetch_design',
     {
       description:
-        '读取蓝湖设计稿的结构化图层树（精确 x/y/宽高/色值/字号/圆角/文本）。mode：api=官方Cookie接口(默认,无需浏览器) / mock=内置示例。analyze=true 时用配置的视觉模型理解设计稿封面图。' +
+        '读取蓝湖设计稿的结构化图层树（精确 x/y/宽高/色值/字号/圆角/描边/文本）。mode：api=官方Cookie接口(默认,无需浏览器) / mock=内置示例。analyze=true 时用配置的视觉模型理解设计稿封面图。' +
         'analyze 默认值：已配置视觉模型（VLM_MODEL + VLM_API_KEY/MT_API_KEY）时默认 true，未配置则默认 false；显式传 true/false 始终优先。' +
         '使用纪律：一次只读当前要实现的那 1 张稿；不要为「了解全貌」批量读稿——分组稿目录用 lanhu_read_sector，它足够定位；返回的 layers 含精确数值，色值/字号从数据取，禁止靠视觉模型 OCR 小字。',
       inputSchema: {

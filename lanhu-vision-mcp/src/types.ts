@@ -27,7 +27,18 @@ export interface DesignLayer {
   // 非 text 图层
   fill?: string;
   gradient?: { stops: Array<{ color: string; position: number }> };
-  radius?: number;
+  radius?: number;                // 四角统一圆角（逐角不一致时取最大角并标 borderRadius）
+  borderRadius?: {                // 逐角圆角（蓝湖按角定义，还原设计必须用逐角值）
+    topLeft: number;
+    topRight: number;
+    bottomLeft: number;
+    bottomRight: number;
+  };
+  border?: {                      // 描边
+    color: string;                // rgba
+    width: number;                // px
+    alignment: 'inside' | 'outside' | 'center';  // 描边位置，CSS 需换算（inside 无需，outside 视觉上比 CSS border 宽 2×width）
+  };
   // 图层透明度（仅无 fill/gradient/color 的图层导出，如 image 切图——有颜色的图层透明度已烘进 rgba
   // alpha，再叠此字段会双重叠加；image 图层 Agent 需自行写 CSS opacity）
   opacity?: number;
