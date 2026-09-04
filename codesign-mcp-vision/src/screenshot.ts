@@ -11,7 +11,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { createHash } from 'crypto';
+import type { Frame } from 'playwright';
 import { getPage } from './browser.js';
+import { safeName, sleep } from './utils.js';
+import type { ScreenshotResult } from './types.js';
 
 const SCREENSHOT_DIR = path.join(process.cwd(), '.codesign-mcp', 'screenshots');
 const PAGE_CACHE_DIR = path.join(process.cwd(), '.codesign-mcp', 'pagecache');
@@ -22,32 +25,51 @@ const OVERLAP = 100; // 段间重叠像素
 const RENDER_WAIT = 500; // 滚动后等待渲染时间 ms
 const MAX_SEGMENTS = 60; // 网格分段总数上限（宽流程图可达 7行×4列=28 段）
 
+/** 滚动容器的元信息 */
+interface ScrollInfo {
+  scrollHeight: number;
+  scrollTop: number;
+  clientHeight: number;
+  scrollWidth: number;
+  scrollLeft: number;
+  clientWidth: number;
+}
+
+/** iframe 内叶子元素的矩形（视口坐标） */
+interface ContentRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/** 网格规划入参 */
+interface GridPlan {
+  yPoints: number[];
+  xPoints: number[];
+  viewW: number;
+  viewH: number;
+  contentW: number;
+  contentH: number;
+}
+
 /**
  * 确保截图目录存在
  */
-function ensureScreenshotDir() {
+function ensureScreenshotDir(): void {
   if (!fs.existsSync(SCREENSHOT_DIR)) {
     fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
   }
 }
 
 /**
- * 获取安全的文件名
- */
-function safeName(name) {
-  return name.replace(/[^\w\u4e00-\u9fa5-]/g, '_');
-}
-
-/**
  * 检测 iframe 内的滚动容器
- * @param {import('playwright').Frame} frame
- * @returns {Promise<string>} 滚动容器的 selector（用于 evaluate）
+ * @returns 滚动容器的 selector（用于 evaluate），'window' 表示整页滚动
  */
-async function detectScrollContainer(frame) {
+async function detectScrollContainer(frame: Frame): Promise<string> {
   return await frame.evaluate(() => {
     // 优先检测 body 是否可滚动
-    const bodyScrollable =
-      document.body.scrollHeight > window.innerHeight + 50;
+    const bodyScrollable = document.body.scrollHeight > window.innerHeight + 50;
     if (bodyScrollable) {
       return 'window';
     }
@@ -63,8 +85,8 @@ async function detectScrollContainer(frame) {
         const identifier = div.id
           ? `#${div.id}`
           : div.className
-          ? `.${div.className.split(' ')[0]}`
-          : null;
+            ? `.${div.className.split(' ')[0]}`
+            : null;
         if (identifier) return identifier;
       }
     }
@@ -74,11 +96,11 @@ async function detectScrollContainer(frame) {
 
 /**
  * 获取滚动容器的总尺寸和当前滚动位置
- * @param {import('playwright').Frame} frame
- * @param {string} containerSelector
- * @returns {Promise<{scrollHeight: number, scrollTop: number, clientHeight: number, scrollWidth: number, scrollLeft: number, clientWidth: number}>}
  */
-async function getScrollInfo(frame, containerSelector) {
+async function getScrollInfo(
+  frame: Frame,
+  containerSelector: string
+): Promise<ScrollInfo> {
   return await frame.evaluate((selector) => {
     if (selector === 'window') {
       return {
@@ -99,8 +121,12 @@ async function getScrollInfo(frame, containerSelector) {
     const el = document.querySelector(selector);
     if (!el) {
       return {
-        scrollHeight: 0, scrollTop: 0, clientHeight: 0,
-        scrollWidth: 0, scrollLeft: 0, clientWidth: 0,
+        scrollHeight: 0,
+        scrollTop: 0,
+        clientHeight: 0,
+        scrollWidth: 0,
+        scrollLeft: 0,
+        clientWidth: 0,
       };
     }
     return {
@@ -116,11 +142,12 @@ async function getScrollInfo(frame, containerSelector) {
 
 /**
  * 滚动到指定位置
- * @param {import('playwright').Frame} frame
- * @param {string} containerSelector
- * @param {{x: number, y: number}} pos
  */
-async function scrollTo(frame, containerSelector, pos) {
+async function scrollTo(
+  frame: Frame,
+  containerSelector: string,
+  pos: { x: number; y: number }
+): Promise<void> {
   await frame.evaluate(
     ({ selector, x, y }) => {
       if (selector === 'window') {
@@ -139,10 +166,9 @@ async function scrollTo(frame, containerSelector, pos) {
 
 /**
  * 截取 iframe 当前可见区域
- * @param {string} filepath - 输出文件路径
- * @returns {Promise<boolean>} 是否成功
+ * @returns 是否成功
  */
-async function captureIframeVisible(filepath) {
+async function captureIframeVisible(filepath: string): Promise<boolean> {
   const page = getPage();
   if (!page) return false;
 
@@ -165,7 +191,7 @@ async function captureIframeVisible(filepath) {
     });
     return true;
   } catch (err) {
-    console.error('分段截图失败:', err.message);
+    console.error('分段截图失败:', (err as Error).message);
     return false;
   }
 }
@@ -174,52 +200,63 @@ async function captureIframeVisible(filepath) {
  * 读取页面级缓存（跳过重复截图）
  * 键 = md5(url + 页面名 + DOM 文字哈希)，值 = 分段截图结果
  */
-function readPageCache(key) {
+function readPageCache(key: string): ScreenshotResult | null {
   try {
     const file = path.join(PAGE_CACHE_DIR, `${key}.json`);
     if (!fs.existsSync(file)) return null;
-    const data = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    const data = JSON.parse(fs.readFileSync(file, 'utf-8')) as ScreenshotResult;
     // 截图文件可能被手动清理，缺任何一个都视为失效
-    if (!data.segments?.length || !data.segments.every((p) => fs.existsSync(p))) return null;
+    if (!data.segments?.length || !data.segments.every((p) => fs.existsSync(p))) {
+      return null;
+    }
     return data;
   } catch {
     return null;
   }
 }
 
-function writePageCache(key, result) {
+function writePageCache(key: string, result: ScreenshotResult): void {
   try {
     if (!fs.existsSync(PAGE_CACHE_DIR)) {
       fs.mkdirSync(PAGE_CACHE_DIR, { recursive: true });
     }
-    fs.writeFileSync(path.join(PAGE_CACHE_DIR, `${key}.json`), JSON.stringify(result), 'utf-8');
+    fs.writeFileSync(
+      path.join(PAGE_CACHE_DIR, `${key}.json`),
+      JSON.stringify(result),
+      'utf-8'
+    );
   } catch (err) {
-    console.warn('写入页面缓存失败:', err.message);
+    console.warn('写入页面缓存失败:', (err as Error).message);
   }
 }
 
 /**
  * 分段截取当前页面（Axure iframe 内容）
- * @param {string} filename - 基础文件名（不含扩展名）
- * @param {import('playwright').Frame} frame - Axure iframe
- * @param {string} [pageCacheKey] - 页面级缓存键，命中且截图文件齐全时直接复用
- * @returns {Promise<{segments: string[], totalHeight: number, segmentCount: number, isSegmented: boolean}>}
+ * @param filename - 基础文件名（不含扩展名）
+ * @param frame - Axure iframe
+ * @param pageCacheKey - 页面级缓存键，命中且截图文件齐全时直接复用
  */
-export async function capturePageSegments(filename, frame, pageCacheKey) {
+export async function capturePageSegments(
+  filename: string,
+  frame: Frame | null,
+  pageCacheKey?: string
+): Promise<ScreenshotResult> {
   if (pageCacheKey) {
     const cached = readPageCache(pageCacheKey);
     if (cached) return cached;
   }
 
   ensureScreenshotDir();
-  const finish = (result) => {
+  const finish = (result: ScreenshotResult): ScreenshotResult => {
     if (pageCacheKey && result.segments.length) writePageCache(pageCacheKey, result);
     return result;
   };
 
   // 文件名加当前页面 URL 哈希前缀：避免不同分享链接的同名页面覆盖彼此的截图
   const pageUrl = getPage()?.url() || '';
-  const urlKey = pageUrl ? createHash('md5').update(pageUrl).digest('hex').slice(0, 8) : 'nolink';
+  const urlKey = pageUrl
+    ? createHash('md5').update(pageUrl).digest('hex').slice(0, 8)
+    : 'nolink';
   const baseName = `${urlKey}_${safeName(filename)}`;
 
   if (!frame) {
@@ -244,12 +281,14 @@ export async function capturePageSegments(filename, frame, pageCacheKey) {
     const filepath = path.join(SCREENSHOT_DIR, `${baseName}.png`);
     // 滚动到顶部
     await scrollTo(frame, containerSelector, { x: 0, y: 0 });
-    await new Promise((r) => setTimeout(r, RENDER_WAIT));
+    await sleep(RENDER_WAIT);
     const ok = await captureIframeVisible(filepath);
     if (!ok) {
       // 降级：全页截图
       const page = getPage();
-      if (page) await page.screenshot({ path: filepath, fullPage: true, animations: 'disabled' });
+      if (page) {
+        await page.screenshot({ path: filepath, fullPage: true, animations: 'disabled' });
+      }
     }
     return finish({
       segments: [filepath],
@@ -267,7 +306,7 @@ export async function capturePageSegments(filename, frame, pageCacheKey) {
 
   // 回到原点后收集叶子元素矩形（视口坐标即内容坐标），用于跳过空白网格
   await scrollTo(frame, containerSelector, { x: 0, y: 0 });
-  await new Promise((r) => setTimeout(r, RENDER_WAIT));
+  await sleep(RENDER_WAIT);
   const contentRects = await collectContentRects(frame);
   const neededCells = planNeededCells(contentRects, {
     yPoints,
@@ -278,7 +317,7 @@ export async function capturePageSegments(filename, frame, pageCacheKey) {
     contentH: scrollHeight,
   });
 
-  const segments = [];
+  const segments: string[] = [];
   let segmentIndex = 0;
   let truncated = false;
 
@@ -291,7 +330,7 @@ export async function capturePageSegments(filename, frame, pageCacheKey) {
       // 空白格跳过：既减少段数，也消除「空白画面重复」的段
       if (neededCells && !neededCells.has(yi * xPoints.length + xi)) continue;
       await scrollTo(frame, containerSelector, { x: xPoints[xi], y: yPoints[yi] });
-      await new Promise((r) => setTimeout(r, RENDER_WAIT));
+      await sleep(RENDER_WAIT);
 
       const segFilepath = path.join(
         SCREENSHOT_DIR,
@@ -328,13 +367,13 @@ export async function capturePageSegments(filename, frame, pageCacheKey) {
 /**
  * 单轴滚动位置序列：0 开始按步长推进，末点强制贴边。
  * 末点贴边可避免最后一段被浏览器 clamp 到同一位置、截出重复画面。
- * @param {number} contentSize - 内容总尺寸（scrollHeight/scrollWidth）
- * @param {number} viewSize - 视口尺寸（clientHeight/clientWidth）
+ * @param contentSize - 内容总尺寸（scrollHeight/scrollWidth）
+ * @param viewSize - 视口尺寸（clientHeight/clientWidth）
  */
-function scrollPoints(contentSize, viewSize) {
+function scrollPoints(contentSize: number, viewSize: number): number[] {
   const maxScroll = Math.max(contentSize - viewSize, 0);
   const step = Math.max(viewSize - OVERLAP, 100);
-  const points = [];
+  const points: number[] = [];
   for (let p = 0; p < maxScroll; p += step) points.push(p);
   points.push(maxScroll);
   return points;
@@ -344,10 +383,10 @@ function scrollPoints(contentSize, viewSize) {
  * 收集 iframe 内叶子元素的矩形（需先滚动到原点，视口坐标即内容坐标）。
  * 只统计叶子节点：容器盒子（如 #base）会铺满整页，会把所有格子判成非空。
  */
-async function collectContentRects(frame) {
+async function collectContentRects(frame: Frame): Promise<ContentRect[]> {
   try {
     return await frame.evaluate(() => {
-      const rects = [];
+      const rects: { x: number; y: number; w: number; h: number }[] = [];
       for (const el of document.querySelectorAll('*')) {
         if (el.children.length > 0) continue;
         const cs = getComputedStyle(el);
@@ -368,9 +407,10 @@ async function collectContentRects(frame) {
  * 计算需要截取的网格单元集合（key = 行下标*列数+列下标）。
  * 叶子矩形与格子相交即保留；无矩形信息时返回 null（全量截取，宁多勿缺）。
  */
-function planNeededCells(rects, { yPoints, xPoints, viewW, viewH, contentW, contentH }) {
+function planNeededCells(rects: ContentRect[], plan: GridPlan): Set<number> | null {
+  const { yPoints, xPoints, viewW, viewH, contentW, contentH } = plan;
   if (!rects.length) return null;
-  const needed = new Set();
+  const needed = new Set<number>();
   for (const r of rects) {
     const rx0 = r.x;
     const ry0 = r.y;
@@ -393,11 +433,9 @@ function planNeededCells(rects, { yPoints, xPoints, viewW, viewH, contentW, cont
 
 /**
  * 单张截图（兼容旧接口，内部调用分段截图）
- * @param {string} filename
- * @param {import('playwright').Frame} [frame]
- * @returns {Promise<string>} 第一张截图的路径
+ * @returns 第一张截图的路径
  */
-export async function captureSinglePage(filename, frame) {
-  const result = await capturePageSegments(filename, frame);
+export async function captureSinglePage(filename: string, frame?: Frame): Promise<string> {
+  const result = await capturePageSegments(filename, frame ?? null);
   return result.segments[0] || '';
 }

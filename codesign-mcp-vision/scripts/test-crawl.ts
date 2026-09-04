@@ -3,18 +3,21 @@
  * 测试脚本：直接调用 crawler 模块，验证 CoDesign 原型爬取
  *
  * 用法:
- *   node scripts/test-crawl.js --url=<分享链接> --group=<分组名> [--password=<访问密码>]
+ *   npm run test:crawl -- --url=<分享链接> --group=<分组名> [--password=<访问密码>]
  * 或通过环境变量提供：CODESIGN_URL / CODESIGN_GROUP / CODESIGN_PASSWORD
  */
 import { openShareLink, getPageOutline, getGroupPages } from '../src/crawler.js';
 import { closeBrowser } from '../src/browser.js';
+import { errorMessage, safeName } from '../src/utils.js';
+import type { CrawledPage, OutlineNode } from '../src/types.js';
 import * as fs from 'fs';
 import * as path from 'path';
 
 const OUTPUT_DIR = path.join(process.cwd(), 'output');
 
-function parseArgs(argv) {
-  const args = {};
+/** 解析 --key=value 形式的命令行参数 */
+function parseArgs(argv: string[]): Record<string, string> {
+  const args: Record<string, string> = {};
   for (const arg of argv.slice(2)) {
     const matched = arg.match(/^--(url|group|password)=(.+)$/);
     if (matched) args[matched[1]] = matched[2];
@@ -31,13 +34,51 @@ const GROUP_NAME = args.group || process.env.CODESIGN_GROUP || '';
 if (!SHARE_URL || !GROUP_NAME) {
   console.error('缺少必填参数。用法：');
   console.error(
-    '  node scripts/test-crawl.js --url=<分享链接> --group=<分组名> [--password=<访问密码>]'
+    '  npm run test:crawl -- --url=<分享链接> --group=<分组名> [--password=<访问密码>]'
   );
   console.error('也可通过环境变量提供：CODESIGN_URL / CODESIGN_GROUP / CODESIGN_PASSWORD');
   process.exit(1);
 }
 
-async function main() {
+/** 把爬取结果写成 Markdown 汇总 */
+function buildSummary(groupName: string, pages: CrawledPage[]): string {
+  let summary = `# ${groupName} - 爬取结果汇总\n\n`;
+  summary += `页面数: ${pages.length}\n\n`;
+  summary += `---\n\n`;
+
+  pages.forEach((page) => {
+    summary += `## ${page.pageName}\n\n`;
+    if (page.error) {
+      summary += `**错误**: ${page.error}\n\n`;
+    } else {
+      if (page.text) {
+        summary += `### 文字内容\n\n\`\`\`\n${page.text}\n\`\`\`\n\n`;
+      }
+      if (page.tables?.length) {
+        summary += `### 表格 (${page.tables.length}个)\n\n`;
+        page.tables.forEach((t, i) => {
+          summary += `**表${i + 1}**: ${t.headers?.join(' | ') || ''}\n\n`;
+        });
+      }
+      const segCount = (page.segments || []).length;
+      summary += segCount ? `截图: ${segCount} 段\n\n` : `截图: 无\n\n`;
+    }
+    summary += `---\n\n`;
+  });
+
+  return summary;
+}
+
+/** 打印目录树 */
+function printOutline(outline: OutlineNode[]): void {
+  outline.forEach((item) => {
+    const indent = '  '.repeat(item.level);
+    const icon = item.isGroup ? '📁' : '📄';
+    console.log(`      ${indent}${icon} ${item.name}`);
+  });
+}
+
+async function main(): Promise<void> {
   console.log('=== CoDesign 原型爬取测试 ===\n');
 
   // 1. 打开链接 + 输入密码
@@ -49,11 +90,7 @@ async function main() {
   console.log('[2/5] 获取页面大纲...');
   const outline = await getPageOutline();
   console.log(`      共 ${outline.length} 个目录项`);
-  outline.forEach((item) => {
-    const indent = '  '.repeat(item.level);
-    const icon = item.isGroup ? '📁' : '📄';
-    console.log(`      ${indent}${icon} ${item.name}`);
-  });
+  printOutline(outline);
   console.log('');
 
   // 3. 找到目标分组
@@ -78,22 +115,15 @@ async function main() {
   }
 
   // 保存大纲
-  fs.writeFileSync(
-    path.join(OUTPUT_DIR, 'outline.json'),
-    JSON.stringify(outline, null, 2)
-  );
+  fs.writeFileSync(path.join(OUTPUT_DIR, 'outline.json'), JSON.stringify(outline, null, 2));
 
   // 保存每个页面的内容
   pages.forEach((page, i) => {
-    const safeName = page.pageName.replace(/[^\w\u4e00-\u9fa5]/g, '_');
-    const pageDir = path.join(OUTPUT_DIR, `page_${i + 1}_${safeName}`);
+    const pageDir = path.join(OUTPUT_DIR, `page_${i + 1}_${safeName(page.pageName)}`);
     fs.mkdirSync(pageDir, { recursive: true });
 
     fs.writeFileSync(path.join(pageDir, 'text.txt'), page.text || '');
-    fs.writeFileSync(
-      path.join(pageDir, 'tables.json'),
-      JSON.stringify(page.tables || [], null, 2)
-    );
+    fs.writeFileSync(path.join(pageDir, 'tables.json'), JSON.stringify(page.tables || [], null, 2));
 
     // 复制分段截图到输出目录（crawler 返回的是 segments 数组，不再有单张 screenshot）
     const segments = page.segments || [];
@@ -112,38 +142,17 @@ async function main() {
   });
 
   // 生成汇总 Markdown
-  let summary = `# ${GROUP_NAME} - 爬取结果汇总\n\n`;
-  summary += `页面数: ${pages.length}\n\n`;
-  summary += `---\n\n`;
-
-  pages.forEach((page) => {
-    summary += `## ${page.pageName}\n\n`;
-    if (page.error) {
-      summary += `**错误**: ${page.error}\n\n`;
-    } else {
-      if (page.text) {
-        summary += `### 文字内容\n\n\`\`\`\n${page.text}\n\`\`\`\n\n`;
-      }
-      if (page.tables?.length) {
-        summary += `### 表格 (${page.tables.length}个)\n\n`;
-        page.tables.forEach((t, i) => {
-          summary += `**表${i + 1}**: ${t.headers?.join(' | ') || ''}\n\n`;
-        });
-      }
-      const segCount = (page.segments || []).length;
-      summary += segCount ? `截图: ${segCount} 段\n\n` : `截图: 无\n\n`;
-    }
-    summary += `---\n\n`;
-  });
-
-  fs.writeFileSync(path.join(OUTPUT_DIR, 'summary.md'), summary);
+  fs.writeFileSync(
+    path.join(OUTPUT_DIR, 'summary.md'),
+    buildSummary(GROUP_NAME, pages)
+  );
   console.log(`\n✅ 全部完成！结果保存在: ${OUTPUT_DIR}`);
 
   await closeBrowser();
 }
 
-main().catch(async (err) => {
-  console.error('❌ 测试失败:', err);
+main().catch(async (err: unknown) => {
+  console.error('❌ 测试失败:', errorMessage(err));
   await closeBrowser();
   process.exit(1);
 });

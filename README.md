@@ -6,7 +6,8 @@
 
 | 目录 | 说明 | 接入方式 |
 | --- | --- | --- |
-| `lanhu-vision-mcp/` | 蓝湖设计稿读取（官方 API + 分组枚举）+ 视觉理解/验收（UI 缺陷检测 / E2E 归因）的零依赖 stdio MCP server | 见其内 `README.md` 与 `.mcp.json` |
+| `lanhu-mcp-vision/` | 蓝湖设计稿读取（官方 API + 分组枚举）+ 视觉理解/验收（UI 缺陷检测 / E2E 归因）的零依赖 stdio MCP server | 见其内 `README.md` 与 `.mcp.json` |
+| `codesign-mcp-vision/` | 腾讯 CoDesign 原型（Axure）读取：分段截图 + VLM 视觉解析，生成纯文本结构化需求文档（PRD）的 stdio MCP server | 见其内 `README.md` |
 
 ## 约定
 

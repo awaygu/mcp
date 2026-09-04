@@ -13,16 +13,26 @@
  * - 右侧内容: .axure-container (Axure 原型渲染区)
  */
 import { createHash } from 'crypto';
+import type { Frame, Page } from 'playwright';
 import { launchBrowser, getPage, waitForNetworkIdle } from './browser.js';
 import { capturePageSegments } from './screenshot.js';
+import type {
+  CrawledPage,
+  ExtractedContent,
+  NavigationResult,
+  OutlineNode,
+  ScreenshotResult,
+  TreeMatchResult,
+  TreeNode,
+} from './types.js';
+
+/** 目录节点点击结果：ok=false 表示目录树已刷新，索引失效 */
+type ClickOutcome = { ok: true } | { ok: false; reason: 'stale_outline' };
 
 /**
  * 打开 CoDesign 分享链接并输入密码
- * @param {string} url - 分享链接
- * @param {string} [password] - 访问密码（4位）
- * @returns {Promise<void>}
  */
-export async function openShareLink(url, password) {
+export async function openShareLink(url: string, password?: string): Promise<void> {
   const page = await launchBrowser({ headless: true });
 
   await page.goto(url, { waitUntil: 'domcontentloaded' });
@@ -76,7 +86,7 @@ export async function openShareLink(url, password) {
 /**
  * 输入密码（CoDesign 密码页：一个隐藏 input + 4个视觉方块）
  */
-async function inputPassword(page, password) {
+async function inputPassword(page: Page, password: string): Promise<void> {
   const input = await page.$('.prototype-password__input input, input.t-input__inner');
   if (input) {
     await input.click();
@@ -92,7 +102,7 @@ async function inputPassword(page, password) {
  * 收集目录树扁平节点（含 DOM 索引）。TDesign 树为扁平渲染，DOM 顺序即大纲顺序，
  * 后续点击按索引定位，天然规避同名节点歧义。
  */
-async function collectTreeItems() {
+async function collectTreeItems(): Promise<TreeNode[] | null> {
   const page = getPage();
   if (!page) throw new Error('浏览器未启动，请先调用 openShareLink');
 
@@ -100,7 +110,7 @@ async function collectTreeItems() {
     const tree = document.querySelector('.t-tree');
     if (!tree) return null;
 
-    const items = [];
+    const items: { name: string; level: number; isGroup: boolean; domIndex: number }[] = [];
     tree.querySelectorAll('.t-tree__item').forEach((item, domIndex) => {
       const labelText = item.querySelector(':scope > .t-tree__label .label-text');
       const name = labelText?.textContent?.trim();
@@ -113,7 +123,7 @@ async function collectTreeItems() {
       // 读取 level（从 style 的 --level 变量）
       const style = item.getAttribute('style') || '';
       const levelMatch = style.match(/--level:\s*(\d+)/);
-      const level = levelMatch ? parseInt(levelMatch[1]) : 0;
+      const level = levelMatch ? parseInt(levelMatch[1], 10) : 0;
 
       items.push({ name, level, isGroup, domIndex });
     });
@@ -124,10 +134,9 @@ async function collectTreeItems() {
 /**
  * 按层级栈为扁平节点推导完整路径（祖先分组名 + 自身，用 / 连接）。
  * 同名页面靠路径成为唯一地址，如「赛季通行证S2优化/流程图」。
- * @param {Array<{name: string, level: number, isGroup: boolean, domIndex: number}>} items
  */
-export function buildTreePaths(items) {
-  const stack = [];
+export function buildTreePaths<T extends TreeNode>(items: T[]): (T & { path: string })[] {
+  const stack: { level: number; name: string }[] = [];
   return items.map((item) => {
     while (stack.length && stack[stack.length - 1].level >= item.level) stack.pop();
     stack.push({ level: item.level, name: item.name });
@@ -137,9 +146,8 @@ export function buildTreePaths(items) {
 
 /**
  * 获取原型页面大纲（左侧目录树，节点带完整路径）
- * @returns {Promise<Array<{name: string, level: number, isGroup: boolean, domIndex: number, path: string, pageIndex?: number}>>}
  */
-export async function getPageOutline() {
+export async function getPageOutline(): Promise<OutlineNode[]> {
   const items = (await collectTreeItems()) || [];
   const tree = buildTreePaths(items);
 
@@ -155,9 +163,8 @@ export async function getPageOutline() {
 
 /**
  * 获取 Axure 原型的 iframe（内容实际在 blob URL 的 iframe 中）
- * @returns {Promise<import('playwright').Frame | null>}
  */
-export async function getAxureFrame() {
+export async function getAxureFrame(): Promise<Frame | null> {
   const page = getPage();
   if (!page) return null;
 
@@ -174,22 +181,23 @@ export async function getAxureFrame() {
 
 /**
  * 导航到指定页面（按目录树 DOM 索引点击）
- * @param {number} domIndex - 目标节点在大纲数组中的索引
- * @param {object} [opts]
- * @param {boolean} [opts.quick=false] - 快速模式：仅探测 iframe 是否切换（1.5s），用于判断分组节点是否有自身页面
- * @returns {Promise<{ok: true, frameChanged: boolean} | {ok: false, reason: 'stale_outline'}>}
- *   frameChanged=false 表示点击后 iframe 未切换（纯展开类分组节点，无自身内容）
+ * @param domIndex - 目标节点在大纲数组中的索引
+ * @param opts.quick - 快速模式：仅探测 iframe 是否切换（1.5s），用于判断分组节点是否有自身页面
+ * @returns frameChanged=false 表示点击后 iframe 未切换（纯展开类分组节点，无自身内容）
  */
-export async function navigateToPageByIndex(domIndex, { quick = false } = {}) {
+export async function navigateToPageByIndex(
+  domIndex: number,
+  { quick = false }: { quick?: boolean } = {}
+): Promise<NavigationResult> {
   const page = getPage();
   if (!page) throw new Error('浏览器未启动');
 
-  const outcome = await page.evaluate((index) => {
+  const outcome = await page.evaluate((index): ClickOutcome => {
     const tree = document.querySelector('.t-tree');
     if (!tree) return { ok: false, reason: 'stale_outline' };
 
     const items = Array.from(tree.querySelectorAll('.t-tree__item'));
-    const label = items[index]?.querySelector(':scope > .t-tree__label');
+    const label = items[index]?.querySelector<HTMLElement>(':scope > .t-tree__label');
     if (!label) return { ok: false, reason: 'stale_outline' };
 
     label.click();
@@ -239,14 +247,19 @@ export async function navigateToPageByIndex(domIndex, { quick = false } = {}) {
  * 纯函数：在大纲中匹配目标（分组或页面）。
  * 支持：叶子名（唯一时）、完整路径、路径尾部（最后 N 段）。
  * 多种命中时返回候选路径清单，让调用方拿到可行动的提示。
- * @param {Array<{name: string, path: string, isGroup: boolean, domIndex: number}>} outline
- * @param {string} name - 叶子名或路径
- * @param {'any'|'group'} kind - 只匹配分组，或分组与页面都匹配
- * @returns {{ok: true, target: object} | {ok: false, reason: string}}
  */
-export function matchTreeTarget(outline, name, kind = 'any') {
-  const pool = kind === 'group' ? outline.filter((i) => i.isGroup) : outline;
-  if (!pool.length) return { ok: false, reason: `目录中没有任何${kind === 'group' ? '分组' : '节点'}` };
+export function matchTreeTarget<T extends { name: string; path: string }>(
+  outline: T[],
+  name: string,
+  kind: 'any' | 'group' = 'any'
+): TreeMatchResult<T> {
+  const groupsOnly = kind === 'group';
+  const pool = groupsOnly
+    ? outline.filter((i) => (i as unknown as { isGroup?: boolean }).isGroup)
+    : outline;
+  if (!pool.length) {
+    return { ok: false, reason: `目录中没有任何${groupsOnly ? '分组' : '节点'}` };
+  }
 
   // 1) 精确路径匹配（唯一地址，直接命中）
   const exactPaths = pool.filter((i) => i.path === name);
@@ -281,7 +294,7 @@ export function matchTreeTarget(outline, name, kind = 'any') {
   };
 }
 
-function describeNavigationFailure(pageName, nav) {
+function describeNavigationFailure(nav: { ok: false; reason: string }): string {
   if (nav.reason === 'stale_outline') {
     return '目录树已刷新导致定位失效，请重新调用获取大纲后再试';
   }
@@ -290,23 +303,22 @@ function describeNavigationFailure(pageName, nav) {
 
 /**
  * 提取当前页面的纯文本内容（从 Axure iframe 中提取，含表格与内嵌图片）
- * @returns {Promise<{text: string, tables: Array<{headers: string[], rows: string[][]}>, images: Array<{src: string, alt: string, width: number, height: number}>}>}
  */
-export async function extractPageText() {
+export async function extractPageText(): Promise<ExtractedContent> {
   const frame = await getAxureFrame();
   if (!frame) {
     return { text: '', tables: [], images: [] };
   }
 
-  const result = await frame.evaluate(() => {
+  return await frame.evaluate((): ExtractedContent => {
     const container = document.body;
     if (!container) return { text: '', tables: [], images: [] };
 
     // 提取表格
-    const tables = [];
+    const tables: { headers: string[]; rows: string[][] }[] = [];
     container.querySelectorAll('table').forEach((table) => {
-      const headers = [];
-      const rows = [];
+      const headers: string[] = [];
+      const rows: string[][] = [];
       const allRows = table.querySelectorAll('tr');
       allRows.forEach((row, idx) => {
         const cells = row.querySelectorAll('th, td');
@@ -323,7 +335,7 @@ export async function extractPageText() {
     });
 
     // 提取内嵌原型图（设计稿/插画类大图，DOM 文字提取不到，过滤图标小图）
-    const images = [];
+    const images: { src: string; alt: string; width: number; height: number }[] = [];
     container.querySelectorAll('img').forEach((img) => {
       const rect = img.getBoundingClientRect();
       const width = Math.round(rect.width);
@@ -350,22 +362,22 @@ export async function extractPageText() {
       images,
     };
   });
-
-  return result;
 }
 
 /**
  * 截取当前页面（分段截图，超长页面自动分段）
- * @param {string} filename - 文件名（不含扩展名）
- * @param {string} [pageCacheKey] - 页面级缓存键（url+页面名+文字哈希），命中时跳过截图
- * @returns {Promise<{segments: string[], totalHeight: number, segmentCount: number, isSegmented: boolean}>}
+ * @param filename - 文件名（不含扩展名）
+ * @param pageCacheKey - 页面级缓存键（url+页面名+文字哈希），命中时跳过截图
  */
-export async function screenshotPage(filename, pageCacheKey) {
+export async function screenshotPage(
+  filename: string,
+  pageCacheKey?: string | null
+): Promise<ScreenshotResult> {
   const page = getPage();
   if (!page) throw new Error('浏览器未启动');
 
   const frame = await getAxureFrame();
-  return await capturePageSegments(filename, frame, pageCacheKey);
+  return await capturePageSegments(filename, frame, pageCacheKey ?? undefined);
 }
 
 /**
@@ -375,18 +387,24 @@ export async function screenshotPage(filename, pageCacheKey) {
  */
 const CAPTURE_SCHEME_VERSION = 'v2';
 
-function pageCacheKeyOf(url, pageName, text) {
+function pageCacheKeyOf(
+  url: string | undefined,
+  pageName: string,
+  text: string
+): string | null {
   if (!url) return null;
-  return createHash('md5').update(`${url}::${pageName}::${text}::${CAPTURE_SCHEME_VERSION}`).digest('hex');
+  return createHash('md5')
+    .update(`${url}::${pageName}::${text}::${CAPTURE_SCHEME_VERSION}`)
+    .digest('hex');
 }
 
 /**
  * 在目录树中定位分组：叶子名唯一时可用，歧义时返回候选路径清单。
- * @param {Array<{name: string, path: string, isGroup: boolean}>} outline
- * @param {string} name
- * @returns {{ok: true, target: {name: string, path: string, domIndex: number, level: number, isGroup: boolean}} | {ok: false, reason: string}}
  */
-function resolveGroup(outline, name) {
+function resolveGroup(
+  outline: OutlineNode[],
+  name: string
+): TreeMatchResult<OutlineNode> {
   return matchTreeTarget(outline, name, 'group');
 }
 
@@ -397,17 +415,16 @@ function resolveGroup(outline, name) {
  * 也可能只是展开/收起目录。策略：先快速点击分组节点探测 iframe 是否切换，
  * 切换且非空白才把分组自身页计入结果，再遍历子页面。
  *
- * @param {string} groupName - 分组名称（如"赛季通行证S2优化/流程图"或叶子名）
- * @param {string} [url] - 分享链接，用于页面级缓存键
- * @returns {Promise<Array<{pageName: string, text: string, tables: any[], images: any[], segments: string[], segmentCount: number, isSegmented: boolean, error?: string}>>}
+ * @param groupName - 分组名称（如"赛季通行证S2优化/流程图"或叶子名）
+ * @param url - 分享链接，用于页面级缓存键
  */
-export async function getGroupPages(groupName, url) {
+export async function getGroupPages(groupName: string, url?: string): Promise<CrawledPage[]> {
   const outline = await getPageOutline();
   const located = resolveGroup(outline, groupName);
   if (!located.ok) throw new Error(located.reason);
   const { target } = located;
 
-  const results = [];
+  const results: CrawledPage[] = [];
 
   // 1) 分组节点自身内容探测
   if (target.isGroup) {
@@ -437,7 +454,7 @@ export async function getGroupPages(groupName, url) {
   }
 
   // 2) 遍历分组下的子页面
-  let pages;
+  let pages: { name: string; domIndex: number }[];
   if (!target.isGroup) {
     // 传入的其实是页面名，按单页处理
     pages = [{ name: target.name, domIndex: target.domIndex }];
@@ -464,7 +481,8 @@ export async function getGroupPages(groupName, url) {
         segments: [],
         segmentCount: 0,
         isSegmented: false,
-        error: describeNavigationFailure(pageInfo.name, nav),
+        totalHeight: 0,
+        error: describeNavigationFailure(nav),
       });
       continue;
     }
@@ -492,17 +510,16 @@ export async function getGroupPages(groupName, url) {
 
 /**
  * 获取单个页面的完整内容
- * @param {string} pageName - 页面叶子名或完整路径（父分组/页面名，用于同名页面消歧）
- * @param {string} [url] - 分享链接，用于页面级缓存键
- * @returns {Promise<{pageName: string, text: string, tables: any[], images: any[], segments: string[], segmentCount: number, isSegmented: boolean}>}
+ * @param pageName - 页面叶子名或完整路径（父分组/页面名，用于同名页面消歧）
+ * @param url - 分享链接，用于页面级缓存键
  */
-export async function getSinglePage(pageName, url) {
+export async function getSinglePage(pageName: string, url?: string): Promise<CrawledPage> {
   const outline = await getPageOutline();
   const located = matchTreeTarget(outline, pageName, 'any');
   if (!located.ok) throw new Error(located.reason);
 
   const nav = await navigateToPageByIndex(located.target.domIndex);
-  if (!nav.ok) throw new Error(describeNavigationFailure(pageName, nav));
+  if (!nav.ok) throw new Error(describeNavigationFailure(nav));
 
   const { text, tables, images } = await extractPageText();
   const screenshotResult = await screenshotPage(

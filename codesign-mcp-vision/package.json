@@ -1,0 +1,37 @@
+{
+  "name": "codesign-mcp-vision",
+  "version": "0.2.0",
+  "description": "MCP server: 读取腾讯 CoDesign 产品原型（Axure），提取文字+流程图，生成结构化需求文档，供 AI Coding Agent 使用",
+  "type": "module",
+  "main": "dist/src/index.js",
+  "bin": {
+    "codesign-mcp-vision": "dist/src/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "prepare": "npm run build",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/src/index.js",
+    "dev": "tsx src/index.ts",
+    "generate": "tsx scripts/generate-prd.ts",
+    "test:crawl": "tsx scripts/test-crawl.ts",
+    "install:browser": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "playwright": "^1.51.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -527,7 +527,7 @@ export async function verifyDesignSpec(opts: {
   try {
     pw = await import('playwright');
   } catch {
-    throw new Error('缺少 playwright：请在 mcp/lanhu-vision-mcp 下执行 npm i playwright && npx playwright install chromium');
+    throw new Error('缺少 playwright：请在 mcp/lanhu-mcp-vision 下执行 npm i playwright && npx playwright install chromium');
   }
 
   const browser = await pw.chromium.launch({ headless: true });

@@ -3,7 +3,7 @@
  * 命令行工具：爬取指定需求分组，生成纯文本结构化需求文档
  *
  * 用法:
- *   node scripts/generate-prd.js --url=<分享链接> --group=<分组名> [--password=<访问密码>]
+ *   npm run generate -- --url=<分享链接> --group=<分组名> [--password=<访问密码>]
  * 或通过环境变量提供（便于 CI 与本地 .env）:
  *   CODESIGN_URL / CODESIGN_GROUP / CODESIGN_PASSWORD
  *
@@ -16,11 +16,21 @@ import { closeBrowser } from '../src/browser.js';
 import { isVLMConfigured } from '../src/vlm.js';
 import { processPages } from '../src/pipeline.js';
 import { generateRequirementDoc } from '../src/doc-generator.js';
+import { errorMessage, safeName } from '../src/utils.js';
+import type { PageType } from '../src/types.js';
 
 const OUTPUT_DIR = path.join(process.cwd(), 'output');
 
-function parseArgs(argv) {
-  const args = {};
+/** 页面类型 → 中文名 */
+const TYPE_LABELS: Record<PageType, string> = {
+  flowchart: '流程图',
+  table: '配置表',
+  page: '普通页面',
+};
+
+/** 解析 --key=value 形式的命令行参数 */
+function parseArgs(argv: string[]): Record<string, string> {
+  const args: Record<string, string> = {};
   for (const arg of argv.slice(2)) {
     const matched = arg.match(/^--(url|group|password)=(.+)$/);
     if (matched) args[matched[1]] = matched[2];
@@ -37,13 +47,13 @@ const GROUP_NAME = args.group || process.env.CODESIGN_GROUP || '';
 if (!SHARE_URL || !GROUP_NAME) {
   console.error('缺少必填参数。用法：');
   console.error(
-    '  node scripts/generate-prd.js --url=<分享链接> --group=<分组名> [--password=<访问密码>]'
+    '  npm run generate -- --url=<分享链接> --group=<分组名> [--password=<访问密码>]'
   );
   console.error('也可通过环境变量提供：CODESIGN_URL / CODESIGN_GROUP / CODESIGN_PASSWORD');
   process.exit(1);
 }
 
-async function main() {
+async function main(): Promise<void> {
   console.log('=== 生成需求文档（分段截图 + VLM 解析版）===\n');
 
   const vlmOn = isVLMConfigured();
@@ -87,32 +97,32 @@ async function main() {
 
   // 保存
   if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-  const outputPath = path.join(OUTPUT_DIR, `${GROUP_NAME}_需求文档_v2.md`);
+  const baseName = safeName(GROUP_NAME);
+  const outputPath = path.join(OUTPUT_DIR, `${baseName}_需求文档_v2.md`);
   fs.writeFileSync(outputPath, doc);
 
   // 保存合并后的结构化数据
   fs.writeFileSync(
-    path.join(OUTPUT_DIR, `${GROUP_NAME}_merged_v2.json`),
+    path.join(OUTPUT_DIR, `${baseName}_merged_v2.json`),
     JSON.stringify(mergedPages, null, 2)
   );
 
   console.log(`\n✅ 需求文档已生成: ${outputPath}`);
-  console.log(`✅ 结构化数据: ${path.join(OUTPUT_DIR, `${GROUP_NAME}_merged_v2.json`)}`);
+  console.log(`✅ 结构化数据: ${path.join(OUTPUT_DIR, `${baseName}_merged_v2.json`)}`);
 
   // 打印摘要
   console.log(`\n=== 内容摘要 ===`);
   mergedPages.forEach((p) => {
-    const typeMap = { flowchart: '流程图', table: '配置表', page: '普通页面' };
     const vlmInfo = p._hasVLM ? 'VLM解析' : '仅DOM';
     const warnInfo = p.warnings?.length ? `, ${p.warnings.length}个警告` : '';
-    console.log(`- ${p.pageName} [${typeMap[p.type]}] (${vlmInfo}${warnInfo})`);
+    console.log(`- ${p.pageName} [${TYPE_LABELS[p.type] ?? p.type}] (${vlmInfo}${warnInfo})`);
   });
 
   await closeBrowser();
 }
 
-main().catch(async (err) => {
-  console.error('❌ 生成失败:', err);
+main().catch(async (err: unknown) => {
+  console.error('❌ 生成失败:', errorMessage(err));
   await closeBrowser();
   process.exit(1);
 });

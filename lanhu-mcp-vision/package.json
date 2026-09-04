@@ -1,11 +1,11 @@
 {
-  "name": "lanhu-vision-mcp",
+  "name": "lanhu-mcp-vision",
   "version": "2.0.0",
   "description": "蓝湖设计稿 MCP Server — 官方 API 读稿 + 分组枚举 + 视觉理解/验收",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "lanhu-vision-mcp": "dist/index.js"
+    "lanhu-mcp-vision": "dist/index.js"
   },
   "files": [
     "dist",
@@ -32,7 +32,7 @@
     "zod": "^3.24.4"
   },
   "optionalDependencies": {
-    "playwright": "^1.49.0"
+    "playwright": "^1.62.1"
   },
   "devDependencies": {
     "@types/node": "^22.15.3",

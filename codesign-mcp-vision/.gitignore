@@ -8,3 +8,6 @@
 # 命令行脚本产物
 output
 
+# 编译产物
+dist
+*.tsbuildinfo

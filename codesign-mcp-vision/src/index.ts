@@ -15,8 +15,9 @@
  */
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import { readFileSync, mkdirSync, writeFileSync } from 'fs';
+import { mkdirSync, writeFileSync } from 'fs';
 import * as path from 'path';
 import { openShareLink, getPageOutline, getSinglePage, getGroupPages } from './crawler.js';
 import {
@@ -29,19 +30,27 @@ import { processPage, processPages } from './pipeline.js';
 import { generateRequirementDoc } from './doc-generator.js';
 import { clearCache, cacheStats, cacheDir } from './cache.js';
 import { closeBrowser, getPage } from './browser.js';
+import { errorMessage, formatBytes, packageVersion } from './utils.js';
+import type { PageType } from './types.js';
+
+/** 访问凭据（分享链接 + 访问密码） */
+interface Access {
+  url: string;
+  password?: string;
+}
 
 /**
  * 记录浏览器当前所处的链接。不能用「曾经打开过」的集合，
  * 否则 A→B→A 的调用顺序会错误地跳过第二次 A 的导航，导致在 B 的页面上解析 A 的内容。
  */
-let currentUrl = null;
-let currentPassword = null;
+let currentUrl: string | null = null;
+let currentPassword: string | null = null;
 
 /**
  * url/password 支持环境变量默认值：MCP 配置里设置一次 CODESIGN_URL / CODESIGN_PASSWORD，
  * Agent 后续调用只需传业务参数（如 groupName），不必每次重复带凭据。
  */
-function resolveAccess(url, password) {
+function resolveAccess(url?: string, password?: string): Access {
   const resolvedUrl = url || process.env.CODESIGN_URL || '';
   if (!resolvedUrl) {
     throw new Error('缺少 url 参数，且未设置环境变量 CODESIGN_URL');
@@ -49,10 +58,12 @@ function resolveAccess(url, password) {
   return { url: resolvedUrl, password: password || process.env.CODESIGN_PASSWORD || undefined };
 }
 
-async function ensureOpened(url, password) {
+async function ensureOpened(url: string, password?: string): Promise<void> {
   const nextPassword = password ?? null;
   // 浏览器崩溃/被关闭后必须重新导航，否则同 URL 会永久跳过 openShareLink 卡死
-  const browserAlive = !!getPage()?.context()?.browser()?.isConnected() && !getPage()?.isClosed();
+  const page = getPage();
+  const browserAlive =
+    !!page?.context()?.browser()?.isConnected() && !page?.isClosed();
   if (currentUrl === url && currentPassword === nextPassword && browserAlive) return;
 
   // 先置空：openShareLink 失败时不会残留错误状态，下次调用必然重新导航
@@ -67,8 +78,9 @@ async function ensureOpened(url, password) {
  * 串行化所有浏览器操作。浏览器 page 是进程内单例，
  * 并发调用会让导航互相打断，最终读到别的页面的内容。
  */
-let lockChain = Promise.resolve();
-function withBrowserLock(task) {
+let lockChain: Promise<unknown> = Promise.resolve();
+
+function withBrowserLock<T>(task: () => Promise<T>): Promise<T> {
   const result = lockChain.then(task, task);
   lockChain = result.then(
     () => undefined,
@@ -77,33 +89,32 @@ function withBrowserLock(task) {
   return result;
 }
 
-function formatBytes(size) {
-  if (size < 1024) return `${size} B`;
-  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
-  return `${(size / 1024 / 1024).toFixed(1)} MB`;
+/** 统一的工具返回体构造，避免每处手写 content 数组 */
+function textResult(text: string): CallToolResult {
+  return { content: [{ type: 'text', text }] };
 }
 
-function serverVersion() {
-  try {
-    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8'));
-    if (pkg.version) return pkg.version;
-  } catch {}
-  return '0.1.0';
+function errorResult(text: string): CallToolResult {
+  return { content: [{ type: 'text', text }], isError: true };
 }
 
 const server = new McpServer({
-  name: 'codesign-prd-mcp',
-  version: serverVersion(),
+  name: 'codesign-mcp-vision',
+  version: packageVersion(import.meta.url, '0.2.0'),
 });
 
 // ─── 工具1：获取原型页面大纲 ───────────────────────────────────
 server.registerTool(
   'get_prototype_outline',
   {
-    description: '获取 CoDesign 产品原型的页面目录大纲（左侧导航树），用于了解原型结构和定位需求页面',
+    description:
+      '获取 CoDesign 产品原型的页面目录大纲（左侧导航树），用于了解原型结构和定位需求页面',
     inputSchema: {
       url: z.string().optional().describe('CoDesign 分享链接；不传时使用环境变量 CODESIGN_URL'),
-      password: z.string().optional().describe('访问密码（4位）；不传时使用环境变量 CODESIGN_PASSWORD'),
+      password: z
+        .string()
+        .optional()
+        .describe('访问密码（4位）；不传时使用环境变量 CODESIGN_PASSWORD'),
     },
   },
   async ({ url, password }) => {
@@ -124,12 +135,9 @@ server.registerTool(
         return lines.join('\n');
       });
 
-      return { content: [{ type: 'text', text }] };
+      return textResult(text);
     } catch (err) {
-      return {
-        content: [{ type: 'text', text: `获取大纲失败: ${err.message}` }],
-        isError: true,
-      };
+      return errorResult(`获取大纲失败: ${errorMessage(err)}`);
     }
   }
 );
@@ -138,11 +146,14 @@ server.registerTool(
 server.registerTool(
   'get_page_content',
   {
-    description: '获取 CoDesign 原型中单个页面的结构化内容（VLM 解析后纯文本，含组件/交互/表格）。页面同名时传完整路径「父分组/页面名」',
+    description:
+      '获取 CoDesign 原型中单个页面的结构化内容（VLM 解析后纯文本，含组件/交互/表格）。页面同名时传完整路径「父分组/页面名」',
     inputSchema: {
       url: z.string().optional().describe('CoDesign 分享链接；不传时使用环境变量 CODESIGN_URL'),
       password: z.string().optional().describe('访问密码；不传时使用环境变量 CODESIGN_PASSWORD'),
-      pageName: z.string().describe('页面名称（叶子名或完整路径「父分组/页面名」，同名页面须用路径区分）'),
+      pageName: z
+        .string()
+        .describe('页面名称（叶子名或完整路径「父分组/页面名」，同名页面须用路径区分）'),
       vlmEnabled: z.boolean().optional().describe('是否启用 VLM 解析，默认 true'),
     },
   },
@@ -157,13 +168,13 @@ server.registerTool(
       const merged = await processPage(pageData, access.url, { vlmEnabled });
 
       let result = `# ${merged.pageName}\n\n`;
-      result += `**页面类型**：${merged.type === 'flowchart' ? '流程图' : merged.type === 'table' ? '配置表' : '普通页面'}\n\n`;
+      result += `**页面类型**：${typeLabel(merged.type)}\n\n`;
 
       if (merged.type === 'flowchart' && merged.vlmResult) {
         const fc = merged.vlmResult;
         if (fc.summary) result += `**流程概述**：${fc.summary}\n\n`;
         if (fc.main_flow?.length && fc.nodes) {
-          const nodeMap = {};
+          const nodeMap: Record<string, string> = {};
           fc.nodes.forEach((n) => (nodeMap[n.id] = n.text));
           result += `**主流程**：${fc.main_flow.map((id) => nodeMap[id] || id).join(' → ')}\n\n`;
         }
@@ -234,12 +245,9 @@ server.registerTool(
         merged.warnings.forEach((w) => (result += `- ⚠️ ${w}\n`));
       }
 
-      return { content: [{ type: 'text', text: result }] };
+      return textResult(result);
     } catch (err) {
-      return {
-        content: [{ type: 'text', text: `获取页面内容失败: ${err.message}` }],
-        isError: true,
-      };
+      return errorResult(`获取页面内容失败: ${errorMessage(err)}`);
     }
   }
 );
@@ -253,7 +261,9 @@ server.registerTool(
     inputSchema: {
       url: z.string().optional().describe('CoDesign 分享链接；不传时使用环境变量 CODESIGN_URL'),
       password: z.string().optional().describe('访问密码；不传时使用环境变量 CODESIGN_PASSWORD'),
-      groupName: z.string().describe('需求分组名称，如"赛季通行证S2优化"；同名歧义时用完整路径。分组名不确定时可直接调用，失败会返回候选列表'),
+      groupName: z
+        .string()
+        .describe('需求分组名称，如"赛季通行证S2优化"；同名歧义时用完整路径。分组名不确定时可直接调用，失败会返回候选列表'),
       vlmEnabled: z.boolean().optional().describe('是否启用 VLM 解析，默认 true'),
       detailLevel: z
         .enum(['summary', 'standard', 'full'])
@@ -265,7 +275,14 @@ server.registerTool(
         .describe('true 时文档写入 output/ 目录，返回文件路径+每页摘要而非全文，避免大文档占满上下文；之后按需读取文件'),
     },
   },
-  async ({ url, password, groupName, vlmEnabled = true, detailLevel = 'standard', outputFile }) => {
+  async ({
+    url,
+    password,
+    groupName,
+    vlmEnabled = true,
+    detailLevel = 'standard',
+    outputFile,
+  }) => {
     try {
       const access = resolveAccess(url, password);
       // 爬取阶段独占浏览器（单页顺序导航无法并行）
@@ -285,39 +302,29 @@ server.registerTool(
       });
 
       if (outputFile) {
-        const safeGroupName = groupName.replace(/[^\w\u4e00-\u9fa5-]/g, '_');
         const outDir = path.join(process.cwd(), 'output');
         mkdirSync(outDir, { recursive: true });
-        const filePath = path.join(outDir, `${safeGroupName}_需求文档.md`);
+        const filePath = path.join(outDir, `${safeGroupName(groupName)}_需求文档.md`);
         writeFileSync(filePath, doc, 'utf-8');
 
         // 返回文件路径 + 每页一行的摘要，Agent 按需读取文件内容
-        const typeMap = { flowchart: '流程图', table: '配置表', page: '普通页面' };
         const lines = mergedPages.map((p) => {
           const warn = p.warnings?.length ? ` | ⚠️ ${p.warnings.join(';')}` : '';
-          return `- ${p.pageName}（${typeMap[p.type] || p.type}，${p._segmentCount || 0} 段）${warn}`;
+          return `- ${p.pageName}（${typeLabel(p.type)}，${p._segmentCount || 0} 段）${warn}`;
         });
-        return {
-          content: [
-            {
-              type: 'text',
-              text: [
-                `文档已生成：${filePath}`,
-                `共 ${mergedPages.length} 页，全文请按需读取该文件（可按章节偏移分段读取）。`,
-                '',
-                ...lines,
-              ].join('\n'),
-            },
-          ],
-        };
+        return textResult(
+          [
+            `文档已生成：${filePath}`,
+            `共 ${mergedPages.length} 页，全文请按需读取该文件（可按章节偏移分段读取）。`,
+            '',
+            ...lines,
+          ].join('\n')
+        );
       }
 
-      return { content: [{ type: 'text', text: doc }] };
+      return textResult(doc);
     } catch (err) {
-      return {
-        content: [{ type: 'text', text: `生成需求文档失败: ${err.message}` }],
-        isError: true,
-      };
+      return errorResult(`生成需求文档失败: ${errorMessage(err)}`);
     }
   }
 );
@@ -334,15 +341,9 @@ server.registerTool(
   async ({ imagePath }) => {
     try {
       if (!isVLMConfigured()) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: 'VLM_API_KEY 未配置，无法分析流程图。请设置环境变量后重试。',
-            },
-          ],
-          isError: true,
-        };
+        return errorResult(
+          'VLM_API_KEY 未配置，无法分析流程图。请设置环境变量后重试。'
+        );
       }
 
       const flowchart = await analyzeSingleImage(imagePath, 'flowchart', {
@@ -373,12 +374,9 @@ server.registerTool(
       }
 
       result += `## Mermaid 代码\n\n${mermaid}\n`;
-      return { content: [{ type: 'text', text: result }] };
+      return textResult(result);
     } catch (err) {
-      return {
-        content: [{ type: 'text', text: `流程图分析失败: ${err.message}` }],
-        isError: true,
-      };
+      return errorResult(`流程图分析失败: ${errorMessage(err)}`);
     }
   }
 );
@@ -392,23 +390,18 @@ server.registerTool(
   },
   async () => {
     const stats = cacheStats();
-    return {
-      content: [
-        {
-          type: 'text',
-          text: [
-            `VLM 解析缓存：${stats.total} 条，共 ${formatBytes(stats.size)}`,
-            `缓存目录：${cacheDir()}`,
-            '',
-            '缓存键 = md5(分享链接 + 页面名 + 页面类型 + VLM 版本指纹 + 各截图内容哈希)',
-            '原型内容变动或调整 Prompt / 更换模型后，旧缓存会自动失效。',
-            '注意：解析失败的分段不会被写入缓存，因此失败后可直接重试。',
-            '',
-            '另有一级页面缓存（.codesign-mcp/pagecache）：DOM 文字未变化时直接复用截图，跳过重复截图；clear_cache 不影响它。',
-          ].join('\n'),
-        },
-      ],
-    };
+    return textResult(
+      [
+        `VLM 解析缓存：${stats.total} 条，共 ${formatBytes(stats.size)}`,
+        `缓存目录：${cacheDir()}`,
+        '',
+        '缓存键 = md5(分享链接 + 页面名 + 页面类型 + VLM 版本指纹 + 各截图内容哈希)',
+        '原型内容变动或调整 Prompt / 更换模型后，旧缓存会自动失效。',
+        '注意：解析失败的分段不会被写入缓存，因此失败后可直接重试。',
+        '',
+        '另有一级页面缓存（.codesign-mcp/pagecache）：DOM 文字未变化时直接复用截图，跳过重复截图；clear_cache 不影响它。',
+      ].join('\n')
+    );
   }
 );
 
@@ -424,15 +417,28 @@ server.registerTool(
     const text = removed.failed
       ? `清空缓存失败：缓存目录删除被系统拒绝，请检查是否有进程占用 ${cacheDir()} 后重试。`
       : `已清空 VLM 解析缓存：移除 ${removed.total} 条，释放 ${formatBytes(removed.size)}。\n下次调用将重新请求视觉模型。`;
-    return {
-      content: [{ type: 'text', text }],
-      isError: !!removed.failed,
-    };
+    return { content: [{ type: 'text', text }], isError: !!removed.failed };
   }
 );
 
 // ─── 启动服务器 ────────────────────────────────────────────────
-async function main() {
+
+/** 页面类型中文名，工具输出与文档附录共用 */
+function typeLabel(type: PageType): string {
+  const labels: Record<PageType, string> = {
+    flowchart: '流程图',
+    table: '配置表',
+    page: '普通页面',
+  };
+  return labels[type] || type;
+}
+
+/** 分组名转安全文件名（保留中英文、数字、下划线、短横线） */
+function safeGroupName(name: string): string {
+  return name.replace(/[^\w\u4e00-\u9fa5-]/g, '_');
+}
+
+async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
@@ -446,7 +452,7 @@ async function main() {
   });
 }
 
-main().catch((err) => {
+main().catch((err: unknown) => {
   console.error('MCP Server 启动失败:', err);
   process.exit(1);
 });

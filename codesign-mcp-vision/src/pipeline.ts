@@ -13,8 +13,17 @@ import {
 } from './vlm.js';
 import { mergePageResult } from './merger.js';
 import { getCache, setCache } from './cache.js';
+import type {
+  CacheKeyParams,
+  CrawledPage,
+  MergedPage,
+  PageType,
+  ProcessOptions,
+  SegmentTask,
+  VlmResult,
+} from './types.js';
 
-function pageCacheKey(pageData, url, type) {
+function pageCacheKey(pageData: CrawledPage, url: string, type: PageType): CacheKeyParams {
   return {
     url,
     pageName: pageData.pageName,
@@ -25,7 +34,7 @@ function pageCacheKey(pageData, url, type) {
 }
 
 // 把内嵌原型图元数据拼进 VLM 参考文字，让模型感知页面中的设计图/插画
-function pageTextWithImages(pageData) {
+function pageTextWithImages(pageData: CrawledPage): string {
   const imgs = pageData.images || [];
   if (!imgs.length) return pageData.text;
   const lines = imgs
@@ -34,7 +43,7 @@ function pageTextWithImages(pageData) {
   return `${pageData.text || ''}\n\n[该页面包含 ${imgs.length} 张内嵌原型图]\n${lines}`;
 }
 
-function segmentTasks(pageData, type) {
+function segmentTasks(pageData: CrawledPage, type: PageType): SegmentTask[] {
   const segments = pageData.segments || [];
   return segments.map((imagePath, i) => ({
     imagePath,
@@ -45,7 +54,7 @@ function segmentTasks(pageData, type) {
   }));
 }
 
-function failedResult(pageData, type, reason) {
+function failedResult(pageData: CrawledPage, type: PageType, reason: string): MergedPage {
   return {
     pageName: pageData.pageName,
     type,
@@ -54,11 +63,16 @@ function failedResult(pageData, type, reason) {
     images: pageData.images || [],
     vlmResult: {},
     warnings: [reason],
+    _segmentCount: 0,
     _hasVLM: false,
   };
 }
 
-function finalize(pageData, type, vlmSegments) {
+function finalize(
+  pageData: CrawledPage,
+  type: PageType,
+  vlmSegments: VlmResult[]
+): MergedPage {
   return mergePageResult({
     pageName: pageData.pageName,
     domText: pageData.text || '',
@@ -72,15 +86,19 @@ function finalize(pageData, type, vlmSegments) {
 
 /**
  * 处理单个页面
- * @param {object} pageData - crawler 产出的页面数据
- * @param {string} url - 分享链接
- * @param {object} options - { vlmEnabled }
+ * @param pageData - crawler 产出的页面数据
+ * @param url - 分享链接
+ * @param options - { vlmEnabled }
  */
-export async function processPage(pageData, url, { vlmEnabled = true } = {}) {
+export async function processPage(
+  pageData: CrawledPage,
+  url: string,
+  { vlmEnabled = true }: { vlmEnabled?: boolean } = {}
+): Promise<MergedPage> {
   if (pageData.error) return failedResult(pageData, 'page', pageData.error);
 
   const type = detectPageType(pageData.pageName, pageData.text);
-  let vlmSegments = [];
+  let vlmSegments: VlmResult[] = [];
 
   if (vlmEnabled && isVLMConfigured() && pageData.segments?.length > 0) {
     const key = pageCacheKey(pageData, url, type);
@@ -98,21 +116,33 @@ export async function processPage(pageData, url, { vlmEnabled = true } = {}) {
   return finalize(pageData, type, vlmSegments);
 }
 
+/** 批量处理时的中间态：记录每页的类型、缓存键与分段在全局队列中的区间 */
+interface PreparedPage {
+  pageData: CrawledPage;
+  type: PageType;
+  key?: CacheKeyParams;
+  cached?: VlmResult[] | null;
+  failed?: boolean;
+  vlmSegments: VlmResult[] | null;
+  taskStart?: number;
+  taskEnd?: number;
+}
+
 /**
  * 批量处理分组下的所有页面
  *
  * 先统一查缓存，再把所有未命中的分段摊平成一个全局队列并发提交，
  * 避免「页内并发、页间串行」在每页末尾浪费并发度。
- *
- * @param {object[]} pagesData - crawler 产出的页面数据数组
- * @param {string} url - 分享链接
- * @param {object} options - { vlmEnabled, concurrency, onPageDone(pageName, {cached, result}) }
  */
-export async function processPages(pagesData, url, options = {}) {
+export async function processPages(
+  pagesData: CrawledPage[],
+  url: string,
+  options: ProcessOptions = {}
+): Promise<MergedPage[]> {
   const { vlmEnabled = true, concurrency, onPageDone } = options;
 
-  const prepared = pagesData.map((pageData) => {
-    if (pageData.error) return { pageData, type: 'page', failed: true };
+  const prepared: PreparedPage[] = pagesData.map((pageData) => {
+    if (pageData.error) return { pageData, type: 'page', failed: true, vlmSegments: [] };
 
     const type = detectPageType(pageData.pageName, pageData.text);
     if (!vlmEnabled || !isVLMConfigured() || !pageData.segments?.length) {
@@ -124,7 +154,7 @@ export async function processPages(pagesData, url, options = {}) {
     return { pageData, type, key, cached, vlmSegments: cached || null };
   });
 
-  const tasks = [];
+  const tasks: SegmentTask[] = [];
   prepared.forEach((item) => {
     if (item.failed || item.cached || !item.pageData.segments?.length) return;
     item.taskStart = tasks.length;
@@ -139,13 +169,13 @@ export async function processPages(pagesData, url, options = {}) {
       const segments = results.slice(item.taskStart, item.taskEnd);
       item.vlmSegments = segments;
       // 失败的段落不写缓存，否则一次网络抖动会被固化，后续重试永远拿不到正确结果
-      if (!hasParseFailure(segments)) setCache(item.key, segments);
+      if (!hasParseFailure(segments) && item.key) setCache(item.key, segments);
     });
   }
 
   return prepared.map((item) => {
     const result = item.failed
-      ? failedResult(item.pageData, item.type, item.pageData.error)
+      ? failedResult(item.pageData, item.type, item.pageData.error ?? '页面爬取失败')
       : finalize(item.pageData, item.type, item.vlmSegments || []);
 
     onPageDone?.(item.pageData.pageName, {

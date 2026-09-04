@@ -21,8 +21,16 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
+import { sleep } from './utils.js';
+import type {
+  AnalyzeOptions,
+  PageType,
+  SegmentTask,
+  VlmFlowchart,
+  VlmResult,
+} from './types.js';
 
-const API_KEY = process.env.VLM_API_KEY ||  '';
+const API_KEY = process.env.VLM_API_KEY || '';
 // 入口归一化：剥掉尾部斜杠与已有的 /v1，端点路径统一由 chatEndpoint() 拼——配置带不带 /v1 都能正确工作
 // （曾因配置少 /v1，且网关对未知路径返回 200+HTML，导致所有分段解析失败）
 const BASE_URL = (process.env.VLM_BASE_URL || 'https://api.openai.com/v1')
@@ -43,17 +51,54 @@ const MAX_TOKENS = Math.max(1000, parseInt(process.env.VLM_MAX_TOKENS || '8192',
 // 改动下方任意 Prompt 时必须递增，否则会命中旧 Prompt 产生的缓存
 const PROMPT_VERSION = 'v1';
 
+/** 带 HTTP 状态与响应体分类标记的 VLM 错误，重试逻辑依赖这些字段 */
+interface VlmError extends Error {
+  status?: number;
+  /** 端点返回了非 JSON（多为网关返回网页） */
+  nonJson?: boolean;
+}
+
+/** OpenAI 兼容接口的 message content 片段 */
+type ContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } };
+
+/** 单次 VLM 调用的选项 */
+interface CallOptions {
+  timeout?: number;
+  temperature?: number;
+  maxTokens?: number;
+  responseFormat?: { type: 'json_object' };
+  useV1?: boolean;
+}
+
+/** VLM 成功响应 */
+interface VlmResponse {
+  content: string;
+  finishReason: string;
+  status: number;
+}
+
+/**
+ * 归一化 catch 到的未知异常。
+ * 标注成 VlmError（而非 Error）是因为重试逻辑要读 status / nonJson；
+ * 这两个字段可选，普通 Error 也能安全地当作 VlmError 使用。
+ */
+function toVlmError(err: unknown): VlmError {
+  return err instanceof Error ? err : new Error(String(err));
+}
+
 /**
  * 检查 VLM 是否配置
  */
-export function isVLMConfigured() {
+export function isVLMConfigured(): boolean {
   return !!API_KEY;
 }
 
 /**
  * 影响解析结果但不体现在入参里的指纹，用于缓存键隔离
  */
-export function getVlmVersion() {
+export function getVlmVersion(): string {
   // BASE_URL 参与指纹：换供应商但模型名相同时，避免缓存互相污染
   return `${PROMPT_VERSION}::${MODEL}::${BASE_URL}`;
 }
@@ -61,38 +106,35 @@ export function getVlmVersion() {
 /**
  * 是否存在解析失败的分段（网络错误或返回非法 JSON），用于决定是否写缓存
  */
-export function hasParseFailure(segments) {
+export function hasParseFailure(segments: VlmResult[] | undefined | null): boolean {
   return (segments || []).some((s) => !s || s._error || s._parseError);
 }
 
 /**
  * 将图片文件转为 base64 data URL
  */
-function imageToBase64(imagePath) {
+function imageToBase64(imagePath: string): string {
   const ext = path.extname(imagePath).slice(1);
   const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
   const data = fs.readFileSync(imagePath);
   return `data:${mime};base64,${data.toString('base64')}`;
 }
 
-function chatEndpoint(useV1) {
+function chatEndpoint(useV1: boolean): string {
   return `${BASE_URL}${useV1 ? '/v1' : ''}/chat/completions`;
 }
 
 /**
  * 调用视觉模型（OpenAI 兼容接口）
- * @param {Array} content - 消息内容（text + image_url）
- * @param {object} options
- * @returns {Promise<{content: string, finishReason: string, status: number}>}
  */
-async function callVLM(content, options = {}) {
+async function callVLM(content: ContentPart[], options: CallOptions = {}): Promise<VlmResponse> {
   if (!API_KEY) {
     throw new Error('VLM_API_KEY 未配置，请设置环境变量');
   }
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), options.timeout || VLM_TIMEOUT);
-  let response;
+  let response: Response;
   try {
     response = await fetch(chatEndpoint(options.useV1 ?? USE_V1), {
       method: 'POST',
@@ -111,8 +153,10 @@ async function callVLM(content, options = {}) {
     });
   } catch (err) {
     // AbortError 报清晰信息，方便定位是超时而非网络故障
-    if (err?.name === 'AbortError') {
-      throw new Error(`VLM 请求超时（${options.timeout || VLM_TIMEOUT}ms），可设 VLM_TIMEOUT_MS 调整`);
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error(
+        `VLM 请求超时（${options.timeout || VLM_TIMEOUT}ms），可设 VLM_TIMEOUT_MS 调整`
+      );
     }
     throw err;
   } finally {
@@ -121,31 +165,34 @@ async function callVLM(content, options = {}) {
 
   const errText = await response.text();
   // 非 2xx 且错误体是 JSON 才解析；其他网关 401 返回纯文本，直接拼原文
-  let errJson = null;
+  let errJson: { error?: { message?: string }; message?: string } | null = null;
   if (!response.ok) {
     try {
-      errJson = JSON.parse(errText);
+      errJson = JSON.parse(errText) as { error?: { message?: string }; message?: string };
     } catch {
       errJson = null;
     }
   }
   if (!response.ok) {
     const msg = errJson?.error?.message || errJson?.message || errText.slice(0, 150);
-    const err = new Error(`VLM 调用失败 (HTTP ${response.status}): ${msg}`);
+    const err: VlmError = new Error(`VLM 调用失败 (HTTP ${response.status}): ${msg}`);
     err.status = response.status;
     throw err;
   }
   // 网关对未知路径可能返回 200 + SPA 首页 HTML（已实际踩坑），校验 content-type 防止隐晦的 SyntaxError
-  if (!/application\/json/i.test(response.headers.get('content-type') || '')) {
-    const err = new Error(
-      `VLM 端点返回非 JSON（content-type=${response.headers.get('content-type')}），多为 BASE_URL 路径错误（网关返回了网页）：${errText.slice(0, 120)}`
+  const contentType = response.headers.get('content-type') || '';
+  if (!/application\/json/i.test(contentType)) {
+    const err: VlmError = new Error(
+      `VLM 端点返回非 JSON（content-type=${contentType}），多为 BASE_URL 路径错误（网关返回了网页）：${errText.slice(0, 120)}`
     );
     err.status = response.status;
     err.nonJson = true;
     throw err;
   }
 
-  const data = JSON.parse(errText);
+  const data = JSON.parse(errText) as {
+    choices?: { message?: { content?: string }; finish_reason?: string }[];
+  };
   const choice = data.choices?.[0];
   return {
     content: choice?.message?.content || '',
@@ -161,19 +208,20 @@ async function callVLM(content, options = {}) {
  * - 瞬态错误（网络/超时/429/5xx）：线性退避重试
  * - 4xx 鉴权/参数错误：不重试直接抛
  */
-async function callVLMWithRetry(content, options = {}) {
-  let lastErr;
+async function callVLMWithRetry(content: ContentPart[], options: CallOptions = {}): Promise<string> {
+  let lastErr: Error | undefined;
   let useV1 = options.useV1 ?? USE_V1;
   let triedAltPath = false;
   let triedNoResponseFormat = false;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     let status = 0;
-    let result = null;
+    let result: VlmResponse | null = null;
     try {
       result = await callVLM(content, { ...options, useV1 });
       status = result.status;
-    } catch (err) {
+    } catch (rawErr) {
+      const err = toVlmError(rawErr);
       status = err.status || 0;
       lastErr = err;
 
@@ -221,21 +269,20 @@ async function callVLMWithRetry(content, options = {}) {
     }
 
     const delay = 1000 * attempt; // 1s → 2s 线性退避
-    console.error(`[vlm] ${lastErr.message}，${delay}ms 后重试（attempt=${attempt}/${MAX_ATTEMPTS}）`);
-    await new Promise((r) => setTimeout(r, delay));
+    console.error(
+      `[vlm] ${lastErr?.message ?? '未知错误'}，${delay}ms 后重试（attempt=${attempt}/${MAX_ATTEMPTS}）`
+    );
+    await sleep(delay);
   }
-  throw lastErr;
+  throw lastErr ?? new Error('VLM 调用失败（未知原因）');
 }
 
 // ─── 页面类型判断 ─────────────────────────────────────────────
 
 /**
  * 根据页面名称和 DOM 文字判断页面类型
- * @param {string} pageName
- * @param {string} [domText]
- * @returns {'flowchart'|'table'|'page'}
  */
-export function detectPageType(pageName, domText = '') {
+export function detectPageType(pageName: string, domText = ''): PageType {
   const name = pageName.toLowerCase();
   const text = (domText || '').toLowerCase();
 
@@ -262,10 +309,10 @@ export function detectPageType(pageName, domText = '') {
 
 /**
  * 流程图解析 Prompt
- * @param {number} segmentIndex - 当前段序号（1-based）
- * @param {number} totalSegments - 总段数
+ * @param segmentIndex - 当前段序号（1-based）
+ * @param totalSegments - 总段数
  */
-function flowchartPrompt(segmentIndex, totalSegments) {
+function flowchartPrompt(segmentIndex: number, totalSegments: number): string {
   const segmentHint =
     totalSegments > 1
       ? `\n注意：这是长流程图的第 ${segmentIndex}/${totalSegments} 段，可能包含不完整的节点，只输出你能看清的部分。节点 ID 用 n${segmentIndex}_1, n${segmentIndex}_2... 格式。`
@@ -298,7 +345,7 @@ function flowchartPrompt(segmentIndex, totalSegments) {
 /**
  * 表格解析 Prompt
  */
-function tablePrompt(segmentIndex, totalSegments) {
+function tablePrompt(segmentIndex: number, totalSegments: number): string {
   const segmentHint =
     totalSegments > 1
       ? `\n注意：这是长页面的第 ${segmentIndex}/${totalSegments} 段，表格可能被截断，只输出你能看清的行。`
@@ -326,7 +373,7 @@ function tablePrompt(segmentIndex, totalSegments) {
 /**
  * 普通页面结构解析 Prompt
  */
-function pagePrompt(segmentIndex, totalSegments, pageText = '') {
+function pagePrompt(segmentIndex: number, totalSegments: number, pageText = ''): string {
   const textHint = pageText
     ? `\n\n页面已提取的文字内容（辅助参考）：\n${pageText.slice(0, 2000)}`
     : '';
@@ -355,16 +402,19 @@ function pagePrompt(segmentIndex, totalSegments, pageText = '') {
 
 /**
  * 解析单张截图
- * @param {string} imagePath - 图片路径
- * @param {'flowchart'|'table'|'page'} type - 页面类型
- * @param {object} options - { segmentIndex, totalSegments, pageText }
- * @returns {Promise<object>} 解析结果
+ * @param imagePath - 图片路径
+ * @param type - 页面类型
+ * @param options - { segmentIndex, totalSegments, pageText }
  */
-export async function analyzeSingleImage(imagePath, type, options = {}) {
+export async function analyzeSingleImage(
+  imagePath: string,
+  type: PageType,
+  options: AnalyzeOptions = {}
+): Promise<VlmResult> {
   const { segmentIndex = 1, totalSegments = 1, pageText = '' } = options;
 
   const imageUrl = imageToBase64(imagePath);
-  let prompt;
+  let prompt: string;
 
   switch (type) {
     case 'flowchart':
@@ -379,7 +429,7 @@ export async function analyzeSingleImage(imagePath, type, options = {}) {
       break;
   }
 
-  const content = [
+  const content: ContentPart[] = [
     { type: 'text', text: prompt },
     { type: 'image_url', image_url: { url: imageUrl } },
   ];
@@ -391,7 +441,7 @@ export async function analyzeSingleImage(imagePath, type, options = {}) {
   });
 
   try {
-    const parsed = JSON.parse(result);
+    const parsed = JSON.parse(result) as VlmResult;
     return {
       ...parsed,
       _segmentIndex: segmentIndex,
@@ -414,16 +464,17 @@ export async function analyzeSingleImage(imagePath, type, options = {}) {
 /**
  * 跨页面的全局并发解析：把多个页面的分段摊平成一个队列统一消费。
  * 相比「页内并发、页间串行」，可以避免每页末尾的并发度浪费。
- * @param {Array<{imagePath: string, type: string, segmentIndex: number, totalSegments: number, pageText?: string}>} tasks
- * @param {object} options - { concurrency }
- * @returns {Promise<object[]>} 解析结果数组（按输入顺序）
+ * @returns 解析结果数组（按输入顺序）
  */
-export async function analyzeSegmentsGlobal(tasks, options = {}) {
+export async function analyzeSegmentsGlobal(
+  tasks: SegmentTask[],
+  options: { concurrency?: number } = {}
+): Promise<VlmResult[]> {
   const concurrency = Math.max(1, options.concurrency || MAX_PARALLEL);
-  const results = new Array(tasks.length);
+  const results = new Array<VlmResult>(tasks.length);
   let currentIndex = 0;
 
-  async function worker() {
+  async function worker(): Promise<void> {
     while (currentIndex < tasks.length) {
       const idx = currentIndex++;
       const task = tasks[idx];
@@ -435,7 +486,7 @@ export async function analyzeSegmentsGlobal(tasks, options = {}) {
         });
       } catch (err) {
         results[idx] = {
-          _error: err.message,
+          _error: err instanceof Error ? err.message : String(err),
           _segmentIndex: task.segmentIndex,
           _imagePath: task.imagePath,
           _type: task.type,
@@ -444,10 +495,7 @@ export async function analyzeSegmentsGlobal(tasks, options = {}) {
     }
   }
 
-  const workers = Array.from(
-    { length: Math.min(concurrency, tasks.length) },
-    () => worker()
-  );
+  const workers = Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker());
   await Promise.all(workers);
 
   return results;
@@ -455,12 +503,13 @@ export async function analyzeSegmentsGlobal(tasks, options = {}) {
 
 /**
  * 并行解析单个页面的多段截图（并发上限 MAX_PARALLEL）
- * @param {string[]} imagePaths - 图片路径数组
- * @param {'flowchart'|'table'|'page'} type - 页面类型
- * @param {object} options - { pageText }
- * @returns {Promise<object[]>} 解析结果数组（按输入顺序）
+ * @returns 解析结果数组（按输入顺序）
  */
-export async function analyzeSegmentsParallel(imagePaths, type, options = {}) {
+export async function analyzeSegmentsParallel(
+  imagePaths: string[],
+  type: PageType,
+  options: { pageText?: string } = {}
+): Promise<VlmResult[]> {
   return analyzeSegmentsGlobal(
     imagePaths.map((imagePath, i) => ({
       imagePath,
@@ -474,27 +523,28 @@ export async function analyzeSegmentsParallel(imagePaths, type, options = {}) {
 
 // ─── 工具函数 ─────────────────────────────────────────────────
 
+/** Mermaid 节点形状模板，%text% 占位 */
+const MERMAID_SHAPES: Record<string, string> = {
+  start: '([%text%])',
+  end: '([%text%])',
+  process: '[%text%]',
+  decision: '{%text%}',
+  subflow: '[[%text%]]',
+  io: '[/%text%/]',
+};
+
 /**
  * 将流程图分析结果转为 Mermaid 语法
  */
-export function flowchartToMermaid(flowchart) {
+export function flowchartToMermaid(flowchart: VlmFlowchart): string {
   if (!flowchart.nodes || flowchart.nodes.length === 0) {
     return '```mermaid\nflowchart TD\n    A[无法解析流程图]\n```';
   }
 
-  const shapeMap = {
-    start: '([%text%])',
-    end: '([%text%])',
-    process: '[%text%]',
-    decision: '{%text%}',
-    subflow: '[[%text%]]',
-    io: '[/%text%/]',
-  };
-
   let mermaid = '```mermaid\nflowchart TD\n';
 
   flowchart.nodes.forEach((node) => {
-    const shape = shapeMap[node.type] || '[%text%]';
+    const shape = MERMAID_SHAPES[node.type] || '[%text%]';
     const label = shape.replace('%text%', node.text.replace(/"/g, "'").replace(/\n/g, ' '));
     mermaid += `    ${node.id}${label}\n`;
   });
@@ -511,7 +561,10 @@ export function flowchartToMermaid(flowchart) {
 /**
  * 将表格数据转为 Markdown 表格
  */
-export function tableToMarkdown(table) {
+export function tableToMarkdown(table: {
+  headers?: string[];
+  rows?: string[][];
+}): string {
   if (!table.headers || table.headers.length === 0) return '';
   let md = `| ${table.headers.join(' | ')} |\n`;
   md += `| ${table.headers.map(() => '---').join(' | ')} |\n`;
@@ -524,13 +577,20 @@ export function tableToMarkdown(table) {
 /**
  * 兼容旧接口：分析单张流程图
  */
-export async function analyzeFlowchart(imagePath) {
+export async function analyzeFlowchart(imagePath: string): Promise<VlmResult> {
   return await analyzeSingleImage(imagePath, 'flowchart', { segmentIndex: 1, totalSegments: 1 });
 }
 
 /**
  * 兼容旧接口：分析单张页面结构
  */
-export async function analyzePageStructure(imagePath, pageText = '') {
-  return await analyzeSingleImage(imagePath, 'page', { segmentIndex: 1, totalSegments: 1, pageText });
+export async function analyzePageStructure(
+  imagePath: string,
+  pageText = ''
+): Promise<VlmResult> {
+  return await analyzeSingleImage(imagePath, 'page', {
+    segmentIndex: 1,
+    totalSegments: 1,
+    pageText,
+  });
 }
