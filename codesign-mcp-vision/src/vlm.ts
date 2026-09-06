@@ -43,19 +43,35 @@ const MODEL = process.env.VLM_MODEL;
 const MAX_PARALLEL = Math.max(1, parseInt(process.env.VLM_MAX_PARALLEL || '3', 10) || 3);
 // 推理型视觉模型单次可达 100s+（实测 GLM-5.3-Flash 103s），原 30s 会掐死正常请求
 const VLM_TIMEOUT = Math.max(1, parseInt(process.env.VLM_TIMEOUT_MS || '180000', 10) || 180000);
-// 瞬态错误（网络/超时/429/5xx）最大尝试次数（含首次）
-const MAX_ATTEMPTS = Math.max(1, parseInt(process.env.VLM_MAX_ATTEMPTS || '3', 10) || 3);
+// 瞬态错误（网络/超时/429/5xx）最大尝试次数（含首次）。429 限流依赖退避拉长窗口，默认 5 次
+const MAX_ATTEMPTS = Math.max(1, parseInt(process.env.VLM_MAX_ATTEMPTS || '5', 10) || 5);
+
+// 429 全局限流：所有并发 worker 共享的惩罚期（惩罚期内不发新请求），
+// 每次 429 惩罚翻倍（上限 60s）、调用成功后减半——避免三路并发锁步重试集体撞限
+let rateLimitUntil = 0;
+let rateLimitPenaltyMs = 2000;
 // 输出上限：部分模型 reasoning token 计入 max_tokens，原 4000 会截断长 JSON
 const MAX_TOKENS = Math.max(1000, parseInt(process.env.VLM_MAX_TOKENS || '8192', 10) || 8192);
 
 // 改动下方任意 Prompt 时必须递增，否则会命中旧 Prompt 产生的缓存
 const PROMPT_VERSION = 'v1';
 
+// 网关可能只认 /v1 或非 /v1 其中一条路径；探测成功的路径要记住，否则每次调用白付一次 404 往返
+let preferredUseV1: boolean | null = null;
+
+// 背景上下文提示（需求分组/页面名）：帮助模型理解业务语义；声明仅供参考，防锚定
+function contextHint(context?: string): string {
+  const c = context?.trim();
+  return c ? `\n\n背景信息（仅供参考，以截图可见内容为准）：${c}` : '';
+}
+
 /** 带 HTTP 状态与响应体分类标记的 VLM 错误，重试逻辑依赖这些字段 */
 interface VlmError extends Error {
   status?: number;
   /** 端点返回了非 JSON（多为网关返回网页） */
   nonJson?: boolean;
+  /** 服务端要求的重试等待（Retry-After 头，毫秒） */
+  retryAfterMs?: number;
 }
 
 /** OpenAI 兼容接口的 message content 片段 */
@@ -177,6 +193,12 @@ async function callVLM(content: ContentPart[], options: CallOptions = {}): Promi
     const msg = errJson?.error?.message || errJson?.message || errText.slice(0, 150);
     const err: VlmError = new Error(`VLM 调用失败 (HTTP ${response.status}): ${msg}`);
     err.status = response.status;
+    // Retry-After：429/503 时服务端建议的等待（秒数或 HTTP 日期），重试逻辑优先采用
+    const ra = response.headers.get('retry-after');
+    if (ra) {
+      const sec = Number(ra);
+      err.retryAfterMs = Number.isFinite(sec) && sec > 0 ? sec * 1000 : Math.max(0, Date.parse(ra) - Date.now()) || undefined;
+    }
     throw err;
   }
   // 网关对未知路径可能返回 200 + SPA 首页 HTML（已实际踩坑），校验 content-type 防止隐晦的 SyntaxError
@@ -210,13 +232,17 @@ async function callVLM(content: ContentPart[], options: CallOptions = {}): Promi
  */
 async function callVLMWithRetry(content: ContentPart[], options: CallOptions = {}): Promise<string> {
   let lastErr: Error | undefined;
-  let useV1 = options.useV1 ?? USE_V1;
+  let useV1 = options.useV1 ?? preferredUseV1 ?? USE_V1;
   let triedAltPath = false;
   let triedNoResponseFormat = false;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    // 限流惩罚期全局生效：并发 worker 在此排队（带随机抖动），避免锁步重试集体撞限
+    const throttleWait = rateLimitUntil - Date.now();
+    if (throttleWait > 0) await sleep(throttleWait + Math.random() * 800);
     let status = 0;
     let result: VlmResponse | null = null;
+    let overrideDelay = 0;
     try {
       result = await callVLM(content, { ...options, useV1 });
       status = result.status;
@@ -229,6 +255,7 @@ async function callVLMWithRetry(content: ContentPart[], options: CallOptions = {
       if (status === 404 && !triedAltPath) {
         triedAltPath = true;
         useV1 = !useV1;
+        preferredUseV1 = useV1; // 记住探测成功的路径，后续调用不再白付 404 往返
         console.error(`[vlm] HTTP 404 → 切换端点为 ${chatEndpoint(useV1)}`);
         attempt--;
         continue;
@@ -245,9 +272,20 @@ async function callVLMWithRetry(content: ContentPart[], options: CallOptions = {
       if (err.nonJson && !triedAltPath) {
         triedAltPath = true;
         useV1 = !useV1;
+        preferredUseV1 = useV1;
         console.error(`[vlm] 端点返回非 JSON → 切换端点为 ${chatEndpoint(useV1)}`);
         attempt--;
         continue;
+      }
+      // 429 限流：尊重 Retry-After；全局惩罚翻倍（并发 worker 共享排队），退避量远大于普通瞬态错误
+      if (status === 429) {
+        const retryAfterMs = err.retryAfterMs ?? 0;
+        overrideDelay = Math.max(retryAfterMs, rateLimitPenaltyMs, 2000);
+        rateLimitUntil = Date.now() + overrideDelay;
+        rateLimitPenaltyMs = Math.min(rateLimitPenaltyMs * 2, 60000);
+        console.error(
+          `[vlm] HTTP 429 限流 → 全局暂停 ${Math.round(overrideDelay / 100) / 10}s 后重试（attempt=${attempt}/${MAX_ATTEMPTS}）`
+        );
       }
       // 瞬态错误（网络 0/超时 abort/429/5xx）→ 退避重试；其他 4xx 是配置错误，重试无意义
       const isTransient = status === 0 || status === 429 || status >= 500;
@@ -258,6 +296,8 @@ async function callVLMWithRetry(content: ContentPart[], options: CallOptions = {
     if (result) {
       // 请求成功但返回空 content（部分模型 json_object 模式偶发空响应）→ 计入重试
       if (result.content.trim()) {
+        preferredUseV1 = useV1; // 该路径可用，记住
+        rateLimitPenaltyMs = Math.max(2000, Math.round(rateLimitPenaltyMs / 2)); // 成功后惩罚减半
         // 部分模型不守 json_object 约定，仍套 markdown 围栏
         return result.content.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
       }
@@ -268,7 +308,7 @@ async function callVLMWithRetry(content: ContentPart[], options: CallOptions = {
       if (attempt >= MAX_ATTEMPTS) throw lastErr;
     }
 
-    const delay = 1000 * attempt; // 1s → 2s 线性退避
+    const delay = overrideDelay || 1000 * attempt; // 429 用限流退避；其余线性
     console.error(
       `[vlm] ${lastErr?.message ?? '未知错误'}，${delay}ms 后重试（attempt=${attempt}/${MAX_ATTEMPTS}）`
     );
@@ -286,11 +326,15 @@ export function detectPageType(pageName: string, domText = ''): PageType {
   const name = pageName.toLowerCase();
   const text = (domText || '').toLowerCase();
 
-  // 流程图页面
+  // 流程图页面：页面名命中即判；正文判定收紧——单次偶然命中（如变更记录正文出现"送礼流程"）
+  // 不再误判，需要强信号词（流程图/状态图/…）或 ≥2 个不同流程词
   if (/流程|flow|流转|架构|状态图|时序|泳道/.test(name)) {
     return 'flowchart';
   }
-  if (/流程|flow|流转|状态机/.test(text.slice(0, 500))) {
+  const head = text.slice(0, 300);
+  const strongHits = (head.match(/流程图|状态图|状态机|时序图|泳道/g) || []).length;
+  const weakHits = new Set(head.match(/流程|流转|flow/gi) || []).size;
+  if (strongHits >= 1 || weakHits >= 2) {
     return 'flowchart';
   }
 
@@ -312,7 +356,7 @@ export function detectPageType(pageName: string, domText = ''): PageType {
  * @param segmentIndex - 当前段序号（1-based）
  * @param totalSegments - 总段数
  */
-function flowchartPrompt(segmentIndex: number, totalSegments: number): string {
+function flowchartPrompt(segmentIndex: number, totalSegments: number, context?: string): string {
   const segmentHint =
     totalSegments > 1
       ? `\n注意：这是长流程图的第 ${segmentIndex}/${totalSegments} 段，可能包含不完整的节点，只输出你能看清的部分。节点 ID 用 n${segmentIndex}_1, n${segmentIndex}_2... 格式。`
@@ -339,13 +383,13 @@ function flowchartPrompt(segmentIndex: number, totalSegments: number): string {
 2. 连线方向很重要，注意箭头指向
 3. 判断节点的每个分支条件都要提取
 4. 如果图中有泳道/分区，在 summary 中说明${segmentHint}
-5. 只输出 JSON，不要输出其他文字`;
+5. 只输出 JSON，不要输出其他文字${contextHint(context)}`;
 }
 
 /**
  * 表格解析 Prompt
  */
-function tablePrompt(segmentIndex: number, totalSegments: number): string {
+function tablePrompt(segmentIndex: number, totalSegments: number, context?: string): string {
   const segmentHint =
     totalSegments > 1
       ? `\n注意：这是长页面的第 ${segmentIndex}/${totalSegments} 段，表格可能被截断，只输出你能看清的行。`
@@ -367,13 +411,13 @@ function tablePrompt(segmentIndex: number, totalSegments: number): string {
 1. 仔细识别每个单元格的内容，包括数字、单位、特殊符号
 2. 合并单元格要在对应行中体现
 3. 如果表格有分组/分类，在 title 或 notes 中说明${segmentHint}
-4. 只输出 JSON，不要输出其他文字`;
+4. 只输出 JSON，不要输出其他文字${contextHint(context)}`;
 }
 
 /**
  * 普通页面结构解析 Prompt
  */
-function pagePrompt(segmentIndex: number, totalSegments: number, pageText = ''): string {
+function pagePrompt(segmentIndex: number, totalSegments: number, pageText = '', context?: string): string {
   const textHint = pageText
     ? `\n\n页面已提取的文字内容（辅助参考）：\n${pageText.slice(0, 2000)}`
     : '';
@@ -395,7 +439,7 @@ function pagePrompt(segmentIndex: number, totalSegments: number, pageText = ''):
   "visual_hierarchy": "视觉层级说明（什么是主操作、什么是次要信息、什么是装饰元素）",
   "key_info": ["页面中的关键信息元素，如标题、数据展示、状态标识、金额数字等"]
 }${segmentHint}
-只输出 JSON，不要输出其他文字`;
+只输出 JSON，不要输出其他文字${contextHint(context)}`;
 }
 
 // ─── 单段解析 ─────────────────────────────────────────────────
@@ -411,21 +455,21 @@ export async function analyzeSingleImage(
   type: PageType,
   options: AnalyzeOptions = {}
 ): Promise<VlmResult> {
-  const { segmentIndex = 1, totalSegments = 1, pageText = '' } = options;
+  const { segmentIndex = 1, totalSegments = 1, pageText = '', context } = options;
 
   const imageUrl = imageToBase64(imagePath);
   let prompt: string;
 
   switch (type) {
     case 'flowchart':
-      prompt = flowchartPrompt(segmentIndex, totalSegments);
+      prompt = flowchartPrompt(segmentIndex, totalSegments, context);
       break;
     case 'table':
-      prompt = tablePrompt(segmentIndex, totalSegments);
+      prompt = tablePrompt(segmentIndex, totalSegments, context);
       break;
     case 'page':
     default:
-      prompt = pagePrompt(segmentIndex, totalSegments, pageText);
+      prompt = pagePrompt(segmentIndex, totalSegments, pageText, context);
       break;
   }
 
@@ -468,11 +512,12 @@ export async function analyzeSingleImage(
  */
 export async function analyzeSegmentsGlobal(
   tasks: SegmentTask[],
-  options: { concurrency?: number } = {}
+  options: { concurrency?: number; onProgress?: (done: number, total: number) => void } = {}
 ): Promise<VlmResult[]> {
   const concurrency = Math.max(1, options.concurrency || MAX_PARALLEL);
   const results = new Array<VlmResult>(tasks.length);
   let currentIndex = 0;
+  let completed = 0;
 
   async function worker(): Promise<void> {
     while (currentIndex < tasks.length) {
@@ -483,6 +528,7 @@ export async function analyzeSegmentsGlobal(
           segmentIndex: task.segmentIndex,
           totalSegments: task.totalSegments,
           pageText: task.pageText,
+          context: task.context,
         });
       } catch (err) {
         results[idx] = {
@@ -492,6 +538,8 @@ export async function analyzeSegmentsGlobal(
           _type: task.type,
         };
       }
+      completed++;
+      options.onProgress?.(completed, tasks.length);
     }
   }
 
@@ -508,7 +556,7 @@ export async function analyzeSegmentsGlobal(
 export async function analyzeSegmentsParallel(
   imagePaths: string[],
   type: PageType,
-  options: { pageText?: string } = {}
+  options: { pageText?: string; context?: string } = {}
 ): Promise<VlmResult[]> {
   return analyzeSegmentsGlobal(
     imagePaths.map((imagePath, i) => ({
@@ -517,6 +565,7 @@ export async function analyzeSegmentsParallel(
       segmentIndex: i + 1,
       totalSegments: imagePaths.length,
       pageText: options.pageText,
+      context: options.context,
     }))
   );
 }
@@ -560,16 +609,19 @@ export function flowchartToMermaid(flowchart: VlmFlowchart): string {
 
 /**
  * 将表格数据转为 Markdown 表格
+ * 单元格内换行转 <br>（Markdown 表格内不能有裸换行）、竖线转义防破坏列结构
  */
 export function tableToMarkdown(table: {
   headers?: string[];
   rows?: string[][];
 }): string {
   if (!table.headers || table.headers.length === 0) return '';
-  let md = `| ${table.headers.join(' | ')} |\n`;
+  const esc = (s: unknown): string =>
+    String(s ?? '').replace(/\r?\n/g, '<br>').replace(/\|/g, '\\|').trim();
+  let md = `| ${table.headers.map(esc).join(' | ')} |\n`;
   md += `| ${table.headers.map(() => '---').join(' | ')} |\n`;
   (table.rows || []).forEach((row) => {
-    md += `| ${row.join(' | ')} |\n`;
+    md += `| ${row.map(esc).join(' | ')} |\n`;
   });
   return md;
 }

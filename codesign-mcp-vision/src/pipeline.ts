@@ -43,7 +43,7 @@ function pageTextWithImages(pageData: CrawledPage): string {
   return `${pageData.text || ''}\n\n[该页面包含 ${imgs.length} 张内嵌原型图]\n${lines}`;
 }
 
-function segmentTasks(pageData: CrawledPage, type: PageType): SegmentTask[] {
+function segmentTasks(pageData: CrawledPage, type: PageType, context?: string): SegmentTask[] {
   const segments = pageData.segments || [];
   return segments.map((imagePath, i) => ({
     imagePath,
@@ -51,6 +51,7 @@ function segmentTasks(pageData: CrawledPage, type: PageType): SegmentTask[] {
     segmentIndex: i + 1,
     totalSegments: segments.length,
     pageText: pageTextWithImages(pageData),
+    context,
   }));
 }
 
@@ -78,6 +79,7 @@ function finalize(
     domText: pageData.text || '',
     domTables: pageData.tables || [],
     images: pageData.images || [],
+    sections: pageData.sections,
     vlmSegments,
     type,
     screenshotCount: pageData.segmentCount || 0,
@@ -93,7 +95,7 @@ function finalize(
 export async function processPage(
   pageData: CrawledPage,
   url: string,
-  { vlmEnabled = true }: { vlmEnabled?: boolean } = {}
+  { vlmEnabled = true, context }: { vlmEnabled?: boolean; context?: string } = {}
 ): Promise<MergedPage> {
   if (pageData.error) return failedResult(pageData, 'page', pageData.error);
 
@@ -108,6 +110,7 @@ export async function processPage(
     } else {
       vlmSegments = await analyzeSegmentsParallel(pageData.segments, type, {
         pageText: pageData.text,
+        context,
       });
       if (!hasParseFailure(vlmSegments)) setCache(key, vlmSegments);
     }
@@ -120,6 +123,7 @@ export async function processPage(
 interface PreparedPage {
   pageData: CrawledPage;
   type: PageType;
+  context?: string;
   key?: CacheKeyParams;
   cached?: VlmResult[] | null;
   failed?: boolean;
@@ -139,7 +143,7 @@ export async function processPages(
   url: string,
   options: ProcessOptions = {}
 ): Promise<MergedPage[]> {
-  const { vlmEnabled = true, concurrency, onPageDone } = options;
+  const { vlmEnabled = true, concurrency, onPageDone, onProgress, contextFor } = options;
 
   const prepared: PreparedPage[] = pagesData.map((pageData) => {
     if (pageData.error) return { pageData, type: 'page', failed: true, vlmSegments: [] };
@@ -151,19 +155,22 @@ export async function processPages(
 
     const key = pageCacheKey(pageData, url, type);
     const cached = getCache(key);
-    return { pageData, type, key, cached, vlmSegments: cached || null };
+    return { pageData, type, context: contextFor?.(pageData), key, cached, vlmSegments: cached || null };
   });
 
   const tasks: SegmentTask[] = [];
   prepared.forEach((item) => {
     if (item.failed || item.cached || !item.pageData.segments?.length) return;
     item.taskStart = tasks.length;
-    tasks.push(...segmentTasks(item.pageData, item.type));
+    tasks.push(...segmentTasks(item.pageData, item.type, item.context));
     item.taskEnd = tasks.length;
   });
 
   if (tasks.length > 0) {
-    const results = await analyzeSegmentsGlobal(tasks, { concurrency });
+    const results = await analyzeSegmentsGlobal(tasks, {
+      concurrency,
+      onProgress: (done, total) => onProgress?.(`VLM 解析分段 ${done}/${total}`),
+    });
     prepared.forEach((item) => {
       if (item.taskStart === undefined) return;
       const segments = results.slice(item.taskStart, item.taskEnd);

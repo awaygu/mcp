@@ -98,10 +98,25 @@ function errorResult(text: string): CallToolResult {
   return { content: [{ type: 'text', text }], isError: true };
 }
 
-const server = new McpServer({
-  name: 'codesign-mcp-vision',
-  version: packageVersion(import.meta.url, '0.2.0'),
-});
+const server = new McpServer(
+  {
+    name: 'codesign-mcp-vision',
+    version: packageVersion(import.meta.url, '0.2.0'),
+  },
+  {
+    // server 级工作流说明：宿主会注入 Agent 系统上下文（Agent 不读 README，只有这里稳定可见）
+    instructions: [
+      'CoDesign 原型（Axure）→ 结构化需求文档（PRD）工作流：',
+      '1. get_prototype_outline 拿页面目录大纲（节点带完整路径；同名页面靠完整路径「父分组/页面名」消歧）。',
+      '2. get_requirement_doc（核心）：一次取整个需求分组的完整 PRD，自动遍历页面 + 分段截图 + VLM 解析。',
+      '   - 大分组会自动把文档写入 output/ 并只返回「文件路径 + 每页摘要」，按需读文件即可；要强制全文返回传 outputFile:false。',
+      '   - 超时/中断后可用 pageNames 只重跑指定页：已完成的页有缓存（DOM 未变跳过截图、VLM 结果按内容缓存），重跑秒回。',
+      '3. get_page_content 读取单页结构化内容（单页补充细节时用）。',
+      '4. 未配置 VLM_API_KEY 时自动降级为纯 DOM 文字提取（流程图/表格解析不可用，其余正常）。',
+      '5. url/password 可用环境变量 CODESIGN_URL / CODESIGN_PASSWORD 预置，调用时无需重复传。',
+    ].join('\n'),
+  }
+);
 
 // ─── 工具1：获取原型页面大纲 ───────────────────────────────────
 server.registerTool(
@@ -165,7 +180,11 @@ server.registerTool(
         await ensureOpened(access.url, access.password);
         return await getSinglePage(pageName, access.url);
       });
-      const merged = await processPage(pageData, access.url, { vlmEnabled });
+      const merged = await processPage(pageData, access.url, {
+        vlmEnabled,
+        // 页面名作为业务背景注入 VLM prompt（仅供语义参考）
+        context: `页面名称：${pageName}`,
+      });
 
       let result = `# ${merged.pageName}\n\n`;
       result += `**页面类型**：${typeLabel(merged.type)}\n\n`;
@@ -229,15 +248,27 @@ server.registerTool(
       }
 
       if (merged.images?.length) {
-        result += `**页面内嵌原型图**：${merged.images.length} 张\n\n`;
+        // 按尺寸聚合：画布页几十张内嵌图不再逐行刷屏
+        const dims = new Map<string, number>();
         merged.images.forEach((im) => {
-          result += `- ${im.width}x${im.height}${im.alt ? `（${im.alt}）` : ''}\n`;
+          const k = `${im.width}×${im.height}`;
+          dims.set(k, (dims.get(k) || 0) + 1);
         });
-        result += '\n';
+        const dimsText = [...dims.entries()].map(([k, n]) => `${k}${n > 1 ? `×${n}` : ''}`).join('、');
+        result += `**页面内嵌原型图**：${merged.images.length} 张（${dimsText}）\n\n`;
       }
 
-      if (!merged._hasVLM && merged.domText) {
-        result += `**页面文字**：\n\n${merged.domText}\n\n`;
+      if (!merged._hasVLM) {
+        // 画布型页面：空间区块（XY-cut 按空白带切分，每块通常对应一个界面/弹窗）
+        if (merged.sections?.length) {
+          result += `**空间区块**（画布型页面，按空白带切分为 ${merged.sections.length} 块，每块通常对应一个界面/弹窗；块内文字按画布位置排序）：\n\n`;
+          merged.sections.forEach((sec, i) => {
+            const imgNote = sec.images ? ` · 含 ${sec.images} 张内嵌图` : '';
+            result += `#### 区块 ${i + 1}（x ${sec.x}-${sec.x + sec.w}，y ${sec.y}-${sec.y + sec.h}${imgNote}）\n\n${sec.text}\n\n`;
+          });
+        } else if (merged.domText) {
+          result += `**页面文字**（⚠️ 未经视觉解析：以下为 DOM 原始文字，表格/图形的行列与布局关系可能已丢失，解读时保留怀疑）：\n\n${merged.domText}\n\n`;
+        }
       }
 
       if (merged.warnings?.length) {
@@ -272,27 +303,48 @@ server.registerTool(
       outputFile: z
         .boolean()
         .optional()
-        .describe('true 时文档写入 output/ 目录，返回文件路径+每页摘要而非全文，避免大文档占满上下文；之后按需读取文件'),
+        .describe('true 时文档写入 output/ 并返回路径+每页摘要；不传时文档超过 30KB 也自动落盘（Agent 按需读文件，避免撑爆上下文）；false 强制返回全文'),
+      pageNames: z
+        .array(z.string())
+        .optional()
+        .describe('只处理指定页面（叶子名或完整路径，来自大纲或上次返回的每页摘要）。大分组超时/中断后按页分块重跑——已完成的页有缓存，重跑秒回'),
     },
   },
-  async ({
-    url,
-    password,
-    groupName,
-    vlmEnabled = true,
-    detailLevel = 'standard',
-    outputFile,
-  }) => {
+  async (
+    { url, password, groupName, vlmEnabled = true, detailLevel = 'standard', outputFile, pageNames },
+    extra
+  ) => {
     try {
       const access = resolveAccess(url, password);
+      // 进度通知：仅当宿主在请求 _meta 里给了 progressToken 才发；通知失败不影响主流程
+      const progressToken = extra?._meta?.progressToken;
+      let step = 0;
+      const notify = (message: string): Promise<void> => {
+        if (progressToken === undefined) return Promise.resolve();
+        return extra
+          .sendNotification({
+            method: 'notifications/progress',
+            params: { progressToken, progress: step++, message },
+          })
+          .catch(() => undefined);
+      };
+
       // 爬取阶段独占浏览器（单页顺序导航无法并行）
       const pagesData = await withBrowserLock(async () => {
         await ensureOpened(access.url, access.password);
-        return await getGroupPages(groupName, access.url);
+        return await getGroupPages(groupName, access.url, {
+          pageNames,
+          onProgress: (m) => void notify(m),
+        });
       });
 
       // VLM 阶段不碰浏览器，放在锁外；所有页面的分段统一走一次全局并发
-      const mergedPages = await processPages(pagesData, access.url, { vlmEnabled });
+      const mergedPages = await processPages(pagesData, access.url, {
+        vlmEnabled,
+        onProgress: (m) => void notify(m),
+        // 需求分组/页面名作为业务背景注入 VLM prompt（仅供语义参考，见 contextHint 的防锚定声明）
+        contextFor: (page) => `需求分组：${groupName}；页面：${page.pageName}`,
+      });
 
       const doc = generateRequirementDoc({
         groupName,
@@ -301,7 +353,12 @@ server.registerTool(
         detailLevel,
       });
 
-      if (outputFile) {
+      // 大文档自动落盘：显式 outputFile:true 恒写文件；不传时超过 30KB 自动写；false 强制全文
+      const AUTO_WRITE_BYTES = 30 * 1024;
+      const docBytes = Buffer.byteLength(doc, 'utf8');
+      const shouldWrite = outputFile === true || (outputFile === undefined && docBytes > AUTO_WRITE_BYTES);
+
+      if (shouldWrite) {
         const outDir = path.join(process.cwd(), 'output');
         mkdirSync(outDir, { recursive: true });
         const filePath = path.join(outDir, `${safeGroupName(groupName)}_需求文档.md`);
@@ -312,8 +369,13 @@ server.registerTool(
           const warn = p.warnings?.length ? ` | ⚠️ ${p.warnings.join(';')}` : '';
           return `- ${p.pageName}（${typeLabel(p.type)}，${p._segmentCount || 0} 段）${warn}`;
         });
+        const header =
+          outputFile === true
+            ? []
+            : [`文档 ${docBytes} 字节，超过自动落盘阈值（30KB），已写入文件；如需直接返回全文请传 outputFile:false`, ''];
         return textResult(
           [
+            ...header,
             `文档已生成：${filePath}`,
             `共 ${mergedPages.length} 页，全文请按需读取该文件（可按章节偏移分段读取）。`,
             '',

@@ -95,18 +95,36 @@ export function generateRequirementDoc({
 }
 
 /**
- * 渲染页面内嵌原型图清单（设计稿/插画类图片，DOM 文字提取不到）
+ * 渲染页面内嵌原型图清单（按尺寸聚合——画布页几十张图不再逐行刷屏）
  */
 function renderImages(page: MergedPage): string {
   const imgs = page.images || [];
   if (imgs.length === 0) return '';
-  let out = `**页面内嵌原型图**：${imgs.length} 张\n\n`;
-  out += `| 尺寸 | alt 说明 |\n`;
-  out += `|---|---|\n`;
+  const dims = new Map<string, number>();
   imgs.forEach((im) => {
-    out += `| ${im.width}x${im.height} | ${im.alt || '-'} |\n`;
+    const k = `${im.width}×${im.height}`;
+    dims.set(k, (dims.get(k) || 0) + 1);
   });
-  return out + `\n`;
+  const dimsText = [...dims.entries()].map(([k, n]) => `${k}${n > 1 ? `×${n}` : ''}`).join('、');
+  return `**页面内嵌原型图**：${imgs.length} 张（${dimsText}）\n\n`;
+}
+
+/**
+ * 渲染未解析页面的文字：画布型页面用空间区块（XY-cut 切分），否则纯文字兜底
+ */
+function renderDomFallback(page: MergedPage): string {
+  if (page.sections?.length) {
+    let out = `**空间区块**（画布型页面，按空白带切分为 ${page.sections.length} 块，每块通常对应一个界面/弹窗）：\n\n`;
+    page.sections.forEach((sec, i) => {
+      const imgNote = sec.images ? ` · 含 ${sec.images} 张内嵌图` : '';
+      out += `#### 区块 ${i + 1}（x ${sec.x}-${sec.x + sec.w}，y ${sec.y}-${sec.y + sec.h}${imgNote}）\n\n${sec.text}\n\n`;
+    });
+    return out;
+  }
+  if (page.domText) {
+    return `**页面文字**（未经视觉解析，表格/图形布局可能已丢失）：\n\n${page.domText}\n\n`;
+  }
+  return '';
 }
 
 /** 渲染一组表格（带标题/序号与备注） */
@@ -206,10 +224,8 @@ function generateFlowchartSection(
     section += `\n`;
   }
 
-  // DOM 文字补充（VLM 未配置时）
-  if (!page._hasVLM && page.domText) {
-    section += `**页面文字**：\n\n${page.domText}\n\n`;
-  }
+  // DOM 文字补充（VLM 未配置时）：画布页用空间区块，否则纯文字兜底
+  section += renderDomFallback(page);
 
   return section;
 }
@@ -286,10 +302,8 @@ function generatePageSection(
     section += renderTables(page.tables);
   }
 
-  // DOM 文字补充（VLM 未配置时）
-  if (!page._hasVLM && page.domText) {
-    section += `**页面文字**：\n\n${page.domText}\n\n`;
-  }
+  // DOM 文字补充（VLM 未配置时）：画布页用空间区块，否则纯文字兜底
+  section += renderDomFallback(page);
 
   return section;
 }

@@ -68,6 +68,19 @@ export interface ExtractedContent {
   text: string;
   tables: DomTable[];
   images: PageImage[];
+  /** 画布型页面的空间切分区块（XY-cut 按空白带切分），无则缺省 */
+  sections?: PageSection[];
+}
+
+/** 画布空间切分出的区块（通常对应一个界面/弹窗） */
+export interface PageSection {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  text: string;
+  /** 区块内嵌的大图数量（如手机屏截图） */
+  images?: number;
 }
 
 // ─── screenshot ───────────────────────────────────────────────
@@ -89,6 +102,7 @@ export interface CrawledPage extends ScreenshotResult {
   text: string;
   tables: DomTable[];
   images: PageImage[];
+  sections?: PageSection[];
   /** 导航失败等原因写入，pipeline 会据此直接产出失败结果 */
   error?: string;
 }
@@ -204,6 +218,8 @@ export interface SegmentTask {
   segmentIndex: number;
   totalSegments: number;
   pageText?: string;
+  /** 背景上下文（需求分组/页面名），注入 VLM prompt 作业务语义参考 */
+  context?: string;
 }
 
 /** 单张图片解析的选项 */
@@ -211,6 +227,7 @@ export interface AnalyzeOptions {
   segmentIndex?: number;
   totalSegments?: number;
   pageText?: string;
+  context?: string;
 }
 
 // ─── merger 合并结果 ──────────────────────────────────────────
@@ -229,6 +246,8 @@ export interface MergedPage {
   domText: string;
   tables: MergedTable[];
   images: PageImage[];
+  /** 画布型页面的空间切分区块（经管线透传） */
+  sections?: PageSection[];
   vlmResult: VlmResult;
   warnings: string[];
   _segmentCount: number;
@@ -241,6 +260,7 @@ export interface MergePageInput {
   domText: string;
   domTables?: DomTable[];
   images?: PageImage[];
+  sections?: PageSection[];
   vlmSegments?: VlmResult[];
   type: PageType;
   screenshotCount?: number;
@@ -273,4 +293,8 @@ export interface ProcessOptions {
     pageName: string,
     info: { cached: boolean; segments: number; result: MergedPage }
   ) => void;
+  /** VLM 分段解析进度（done/total 为分段粒度），MCP 层转发为 progress 通知 */
+  onProgress?: (message: string) => void;
+  /** 按页生成背景上下文（需求分组/页面名），注入该页所有分段的 VLM prompt */
+  contextFor?: (page: CrawledPage) => string;
 }
