@@ -21,11 +21,8 @@ export interface DomSample {
 
 export type DiffField = 'x' | 'y' | 'width' | 'height' | 'color' | 'fill' | 'fontSize' | 'fontWeight' | 'lineHeight' | 'text';
 
+/** 单字段偏差（分组后的形态：layer/path/selector 等公共定位字段上移到组，避免每条重复） */
 export interface SpecDiff {
-  layer: string;
-  path: string;
-  selector: string;
-  matchBy: 'text' | 'position';
   field: DiffField;
   expected: string | number;
   actual: string | number;
@@ -37,10 +34,22 @@ export interface SpecDiff {
   textReason?: string;
 }
 
+/** 同一图层/选择器的偏差组：一个元素的多处偏差合并在一个对象里 */
+export interface SpecDiffGroup {
+  layer: string;
+  path: string;
+  selector: string;
+  matchBy: 'text' | 'position';
+  diffs: SpecDiff[];
+}
+
+/** 分组前的内部形态：带定位字段的扁平偏差 */
+type FlatDiff = SpecDiff & { layer: string; path: string; selector: string; matchBy: 'text' | 'position' };
+
 interface MatchPair {
   layer: DesignLayer;
   sample: DomSample;
-  matchBy: SpecDiff['matchBy'];
+  matchBy: SpecDiffGroup['matchBy'];
 }
 
 interface Offset {
@@ -56,7 +65,11 @@ export interface VerifySpecResult {
   offset: { dx: number; dy: number; anchors: number; rejected: number };
   // 比对前剔除的无效/状态栏图层，及其剔因分布
   denoised: { skipped: number; reasons: Record<string, number> };
-  diffs: SpecDiff[];
+  // 偏差按「组」输出（同图层/选择器一组），组按最重严重度排前；默认最多 50 组
+  diffs: SpecDiffGroup[];
+  diffCount: number;       // 字段偏差总条数（分组前）
+  diffGroupCount: number;  // 偏差组总数
+  diffsTruncated: boolean; // 是否因 maxDiffs 截断
   unmatchedLayers: string[];
   notes: string[];
   // 文案差异是否经视觉模型做了语义等价判定（key 未配时为 false，纯数据模式只报 warning）
@@ -69,10 +82,12 @@ export interface VerifySpecResult {
 export interface StyleInventory {
   designStyleCount: number;
   pageStyleCount: number;
-  // 设计稿有、页面没有 → 元素缺失 或 样式被覆盖（真缺陷嫌疑）
+  // 设计稿有、页面没有 → 元素缺失 或 样式被覆盖（真缺陷嫌疑）；最多展示 20 条
   missingOnPage: StyleInventoryItem[];
-  // 页面有、设计稿没有 → 样式漂移 / 硬编码（真缺陷嫌疑）
+  // 页面有、设计稿没有 → 样式漂移 / 硬编码（真缺陷嫌疑）；最多展示 20 条
   notInDesign: StyleInventoryItem[];
+  missingOnPageTotal: number;
+  notInDesignTotal: number;
 }
 
 export interface StyleInventoryItem {
@@ -189,8 +204,8 @@ const TOL = {
 };
 
 // 位置按全局偏移校正后比对：设计稿常带状态栏占位而页面用原生安全区，整体偏移不是缺陷
-function diffPair(layer: DesignLayer, s: DomSample, matchBy: SpecDiff['matchBy'], off: { dx: number; dy: number }): SpecDiff[] {
-  const out: SpecDiff[] = [];
+function diffPair(layer: DesignLayer, s: DomSample, matchBy: 'text' | 'position', off: { dx: number; dy: number }): FlatDiff[] {
+  const out: FlatDiff[] = [];
   // 图层名在蓝湖里大量重名（矩形/蒙版/编组），带上 parentPath 才能定位到具体是哪个
   const base = { layer: layer.name || '(未命名图层)', path: layer.parentPath || '', selector: s.selector, matchBy };
   // 文本层宽度随语言（中/英/繁）字长变化，不是严格几何，宽度差异只报 warning
@@ -353,7 +368,7 @@ function unambiguousAnchors(layers: DesignLayer[], samples: DomSample[]): MatchP
 
 // 锚点轮：只认文案，全局贪心分配（顺序贪心在重复 key 下会先到先得、整队错位）
 function matchAnchors(layers: DesignLayer[], samples: DomSample[], off: Offset) {
-  const cands: Array<{ li: number; si: number; score: number; matchBy: SpecDiff['matchBy'] }> = [];
+  const cands: Array<{ li: number; si: number; score: number; matchBy: 'text' | 'position' }> = [];
   layers.forEach((l, li) => {
     const text = l.text?.trim() || '';
     const shifted = { x: l.x + off.dx, y: l.y + off.dy, w: l.w, h: l.h };
@@ -511,7 +526,14 @@ function compareStyleInventory(layers: DesignLayer[], samples: DomSample[]): Sty
   }
   const missingOnPage = [...designMap.entries()].filter(([k]) => !pageMap.has(k)).map(([, v]) => v).sort((a, b) => b.count - a.count);
   const notInDesign = [...pageMap.entries()].filter(([k]) => !designMap.has(k)).map(([, v]) => v).sort((a, b) => b.count - a.count);
-  return { designStyleCount: designMap.size, pageStyleCount: pageMap.size, missingOnPage, notInDesign };
+  return {
+    designStyleCount: designMap.size,
+    pageStyleCount: pageMap.size,
+    missingOnPage,
+    notInDesign,
+    missingOnPageTotal: missingOnPage.length,
+    notInDesignTotal: notInDesign.length,
+  };
 }
 
 export async function verifyDesignSpec(opts: {
@@ -567,7 +589,7 @@ export async function verifyDesignSpec(opts: {
     const geo = matchByGeometry([...anchors.rest, ...rejectedLayers], samples, usedSampleIdx, off);
     const pairs = [...goodAnchors, ...geo.pairs];
 
-    const diffs: SpecDiff[] = [];
+    const diffs: FlatDiff[] = [];
     const textIdx: number[] = [];
     for (const { layer, sample, matchBy } of pairs) {
       for (const d of diffPair(layer, sample, matchBy, off)) {
@@ -587,7 +609,7 @@ export async function verifyDesignSpec(opts: {
         if (!v.same) d.severity = 'major';
       });
     }
-    const max = opts.maxDiffs ?? 200;
+    const max = opts.maxDiffs ?? 50;
 
     const notes: string[] = [];
     if (den.skipped) {
@@ -614,7 +636,36 @@ export async function verifyDesignSpec(opts: {
           '装饰层用 CSS/背景实现不产生 DOM 元素属正常，但含文案的未匹配需人工确认是否漏做'
       );
     }
-    if (diffs.length > max) notes.push(`偏差共 ${diffs.length} 条，已达上限 ${max} 条，建议先修 critical 再复检`);
+    if (diffs.length > 0) {
+      notes.push(
+        `字段偏差共 ${diffs.length} 条（按图层分组见 diffs，critical 组在前）；文案差异默认 minor，经视觉模型判为不同含义才升 major`
+      );
+    }
+
+    // 分组输出：同图层/选择器的偏差合成一组，公共定位字段只出现一次；组按最重严重度排前
+    const sevRank: Record<SpecDiff['severity'], number> = { critical: 0, major: 1, minor: 2 };
+    const groupMap = new Map<string, SpecDiffGroup>();
+    for (const d of diffs) {
+      const key = `${d.layer}\u0000${d.path}\u0000${d.selector}\u0000${d.matchBy}`;
+      let g = groupMap.get(key);
+      if (!g) {
+        g = { layer: d.layer, path: d.path, selector: d.selector, matchBy: d.matchBy, diffs: [] };
+        groupMap.set(key, g);
+      }
+      const { layer: _l, path: _p, selector: _s, matchBy: _m, ...field } = d;
+      g.diffs.push(field);
+    }
+    const allGroups = [...groupMap.values()]
+      .map((g) => ({ ...g, diffs: [...g.diffs].sort((a, b) => sevRank[a.severity] - sevRank[b.severity]) }))
+      .sort((a, b) => {
+        const wa = Math.min(...a.diffs.map((d) => sevRank[d.severity]));
+        const wb = Math.min(...b.diffs.map((d) => sevRank[d.severity]));
+        return wa - wb || b.diffs.length - a.diffs.length;
+      });
+    const diffGroups = allGroups.slice(0, max);
+    if (allGroups.length > max) {
+      notes.push(`偏差共 ${allGroups.length} 组 / ${diffs.length} 条字段偏差，已达上限 ${max} 组，建议先修 critical 再复检`);
+    }
 
     // 样式清单比对：永远在线、零标注依赖的安全网；只报「某样式漂移了 + 示例」，不做逐元素配对
     const inventory = compareStyleInventory(layers, samples);
@@ -636,11 +687,20 @@ export async function verifyDesignSpec(opts: {
         rejected: rejectedLayers.length,
       },
       denoised: den,
-      diffs: diffs.slice(0, max),
+      diffs: diffGroups,
+      diffCount: diffs.length,
+      diffGroupCount: allGroups.length,
+      diffsTruncated: allGroups.length > max,
       unmatchedLayers: geo.unmatched.slice(0, 50).map((l) => l.name || '(未命名图层)'),
       notes,
       textCheckedByVision,
-      inventory,
+      inventory: {
+        ...inventory,
+        missingOnPage: inventory.missingOnPage.slice(0, 20),
+        notInDesign: inventory.notInDesign.slice(0, 20),
+        missingOnPageTotal: inventory.missingOnPage.length,
+        notInDesignTotal: inventory.notInDesign.length,
+      },
     };
   } finally {
     await browser.close();

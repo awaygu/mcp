@@ -2,9 +2,10 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { readFileSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { fetchDesignViaApi, fetchDesignByIds, readSector, listDirectory, listUserTeams, downloadSlices, checkAuth } from './lanhu-client.js';
 import { verifyDesignSpec } from './verify-spec.js';
-import { callVision, DESIGN_ANALYZE_PROMPT, isAutoAnalyzeEnabled, isVisionConfigured } from './vision.js';
+import { callVision, designAnalyzePrompt, isAutoAnalyzeEnabled, isVisionConfigured } from './vision.js';
 import { shrinkForVision } from './image.js';
 import type { Credentials, DesignResult } from './types.js';
 
@@ -22,7 +23,8 @@ const MOCK_DESIGN: DesignResult = {
 };
 
 function jsonContent(obj: unknown) {
-  return { content: [{ type: 'text' as const, text: JSON.stringify(obj, null, 2) }] };
+  // 紧凑输出：pretty-print 缩进白费约 1/3 token，Agent 不需要可读排版
+  return { content: [{ type: 'text' as const, text: JSON.stringify(obj) }] };
 }
 
 // LANHU_COOKIE_FILE 文件内容即完整 cookie 串；读不到返回 undefined，由 resolveCookie 报错
@@ -54,13 +56,28 @@ async function shrinkB64(b64: string): Promise<string> {
   }
 }
 
+// 视觉入参统一入口：文件路径优先（Agent 不用把截图转成 base64 扛进上下文），base64 兜底。
+// 两种方式都在内存压缩，server 不落任何盘
+async function loadImageInput(opts: { b64?: string; path?: string; what: string }): Promise<string> {
+  if (opts.path) {
+    try {
+      const small = await shrinkForVision(await readFile(opts.path));
+      return `data:image/jpeg;base64,${small.toString('base64')}`;
+    } catch (e) {
+      throw new Error(`读取图片失败（${opts.path}）：${(e as Error).message}`);
+    }
+  }
+  if (opts.b64) return shrinkB64(opts.b64);
+  throw new Error(`${opts.what}：请传 imagePath（本地截图文件路径，推荐）或 imageBase64 之一`);
+}
+
 export function registerTools(server: McpServer): void {
   server.registerTool(
     'lanhu_fetch_design',
     {
       description:
         '读取蓝湖设计稿的结构化图层树（精确 x/y/宽高/色值/字号/圆角/描边/文本）。mode：api=官方Cookie接口(默认,无需浏览器) / mock=内置示例。analyze=true 时用配置的视觉模型理解设计稿封面图。' +
-        'analyze 默认值：已配置视觉模型（VLM_MODEL + VLM_API_KEY/MT_API_KEY）时默认 true，未配置则默认 false；显式传 true/false 始终优先。' +
+        'analyze 默认值：已配置视觉模型（VLM_MODEL + VLM_API_KEY）时默认 true，未配置则默认 false；显式传 true/false 始终优先。' +
         '使用纪律：一次只读当前要实现的那 1 张稿；不要为「了解全貌」批量读稿——分组稿目录用 lanhu_read_sector，它足够定位；返回的 layers 含精确数值，色值/字号从数据取，禁止靠视觉模型 OCR 小字。',
       inputSchema: {
         mode: z.enum(['api', 'mock']).default('api').describe('抽取后端'),
@@ -69,6 +86,7 @@ export function registerTools(server: McpServer): void {
         projectId: z.string().optional().describe('项目 UUID（imageId 模式必填；url 模式不需要）'),
         cookie: z.string().optional().describe('登录 cookie 串（也可用 LANHU_COOKIE / LANHU_COOKIE_FILE）'),
         analyze: z.boolean().optional().describe('用视觉模型理解封面图，返回 visionAnalysis；不传时按是否配置了视觉模型自动决定（配了就 true）'),
+        analyzeFocus: z.string().optional().describe('注入视觉模型的额外关注点/业务背景（如「重点分析签到奖励领取规则」「关注按钮的禁用态」），让分析更贴合当前任务；不影响返回 JSON 结构，仅 analyze 执行时生效'),
       },
     },
     async (args) => {
@@ -89,6 +107,8 @@ export function registerTools(server: McpServer): void {
       const r = args.url
         ? await fetchDesignViaApi(args.url, fetchOpts)
         : await fetchDesignByIds(args.imageId!, args.projectId!, fetchOpts);
+      // 切图 CDN URL 对 Agent 是死重：下载走 lanhu_download_slices（支持 sliceNames 按名过滤），按需重取
+      if (r.slices) r.slices = r.slices.map(({ imageUrl: _url, ...s }) => s);
       if (!analyze) return jsonContent(r);
 
       const { coverImageBase64, ...rest } = r;
@@ -98,7 +118,8 @@ export function registerTools(server: McpServer): void {
       }
       try {
         // 封面已在 client 压成 1x JPEG，补 mime 前缀喂模型
-        const analysis = await callVision({ images: [`data:image/jpeg;base64,${coverImageBase64}`], text: DESIGN_ANALYZE_PROMPT, detail: 'high' });
+        // 设计稿名 + 调用方关注点注入 prompt 作背景上下文（见 designAnalyzePrompt 内的防锚定声明）
+        const analysis = await callVision({ images: [`data:image/jpeg;base64,${coverImageBase64}`], text: designAnalyzePrompt(rest.meta?.docName ?? rest.name, args.analyzeFocus), detail: 'high' });
         return jsonContent({ ...rest, visionAnalysis: analysis });
       } catch (e) {
         console.error(`[fetch_design] 视觉分析失败，降级返回图层树：${(e as Error)?.message}`);
@@ -112,17 +133,20 @@ export function registerTools(server: McpServer): void {
   server.registerTool(
     'lanhu_verify_render',
     {
-      description: '把渲染页截图（可选：设计稿截图）调视觉模型做语义对比，返回 matchScore / verdict / diffs。传 context 可声明已知刻意差异，模型将跳过这些区域。结论仅是视觉线索，与 lanhu_verify_spec 数据比对冲突时以数据比对为准。',
+      description: '把渲染页截图（可选：设计稿截图）调视觉模型做语义对比，返回 matchScore / verdict / diffs。截图传 imagePath（本地文件路径，推荐）或 imageBase64 兜底。传 context 可声明已知刻意差异，模型将跳过这些区域。结论仅是视觉线索，与 lanhu_verify_spec 数据比对冲突时以数据比对为准。',
       inputSchema: {
-        actualImageBase64: z.string().describe('你渲染的页面截图 base64'),
-        designImageBase64: z.string().optional().describe('设计稿截图 base64；不传则只做单图内部一致性检查'),
+        actualImagePath: z.string().optional().describe('渲染页截图的本地文件路径（推荐，避免 base64 进上下文）'),
+        actualImageBase64: z.string().optional().describe('渲染页截图 base64（兜底；与 actualImagePath 二选一）'),
+        designImagePath: z.string().optional().describe('设计稿截图本地文件路径（可选，双图对比用）'),
+        designImageBase64: z.string().optional().describe('设计稿截图 base64（兜底）'),
         context: z.string().optional().describe('已知刻意差异说明，模型将跳过这些区域的报错。如「顶部44px是系统状态栏，页面由原生渲染」「底部按钮刻意加高到56px」'),
         detail: z.enum(['auto', 'low', 'high']).optional(),
       },
     },
     async (args) => {
+      const hasDesign = !!(args.designImagePath || args.designImageBase64);
       // 单图/双图 prompt 分支：单图时模型没有对比对象，硬按双图 prompt 会胡编
-      const text = args.designImageBase64
+      const text = hasDesign
         ? 'You are a senior frontend reviewer. Compare the RENDERED screenshot (first image) ' +
           'against the DESIGN reference (second image). Output a JSON: ' +
           '{"matchScore":<0-100>,"verdict":"pass|need_fix|fail",' +
@@ -144,8 +168,8 @@ export function registerTools(server: McpServer): void {
           '"suggestions":["..."]}. ' +
           `Known intentional differences (do NOT report these): ${args.context || 'none'}. ` +
           'Output discipline: at most 15 diffs, most important first. Only output JSON.';
-      const images = [await shrinkB64(args.actualImageBase64)];
-      if (args.designImageBase64) images.push(await shrinkB64(args.designImageBase64));
+      const images = [await loadImageInput({ b64: args.actualImageBase64, path: args.actualImagePath, what: '渲染页截图' })];
+      if (hasDesign) images.push(await loadImageInput({ b64: args.designImageBase64, path: args.designImagePath, what: '设计稿截图' }));
       return jsonContent(await callVision({ images, text, detail: args.detail || 'high' }));
     }
   );
@@ -153,9 +177,10 @@ export function registerTools(server: McpServer): void {
   server.registerTool(
     'vision_defect_check',
     {
-      description: '整页/局部 UI 缺陷检测：重叠、溢出、缺图、对比度、错位、截断、破图、占位残留等 12 类。返回 defects 数组与 pass。传 context 可声明已知刻意差异，模型将跳过这些区域。',
+      description: '整页/局部 UI 缺陷检测：重叠、溢出、缺图、对比度、错位、截断、破图、占位残留等 12 类。截图传 imagePath（本地文件路径，推荐）或 imageBase64 兜底。返回 defects 数组与 pass。传 context 可声明已知刻意差异，模型将跳过这些区域。',
       inputSchema: {
-        imageBase64: z.string().describe('截屏 base64'),
+        imagePath: z.string().optional().describe('截屏本地文件路径（推荐，避免 base64 进上下文）'),
+        imageBase64: z.string().optional().describe('截屏 base64（兜底；与 imagePath 二选一）'),
         context: z.string().optional().describe('已知刻意差异说明，模型将跳过这些区域的报错。如「顶部44px是系统状态栏，页面由原生渲染」'),
         language: z.string().optional().describe('语言，默认 zh-CN'),
         detail: z.enum(['auto', 'low', 'high']).optional(),
@@ -177,18 +202,23 @@ export function registerTools(server: McpServer): void {
         'For contrast defects, always include the estimated ratio in description as "ratio:x.x". ' +
         `Known intentional differences (do NOT report these): ${args.context || 'none'}. ` +
         'Output discipline: at most 15 defects, most severe first. Only output JSON.';
-      return jsonContent(await callVision({ images: [await shrinkB64(args.imageBase64)], text, detail: args.detail || 'auto' }));
+      return jsonContent(await callVision({
+        images: [await loadImageInput({ b64: args.imageBase64, path: args.imagePath, what: '截屏' })],
+        text,
+        detail: args.detail || 'auto',
+      }));
     }
   );
 
   server.registerTool(
     'vision_e2e_triage',
     {
-      description: 'E2E 测试失败时，分析截图+DOM 快照+错误文本，给出根因、类别、置信度与下一步动作建议。强烈建议传 expectedBehavior（测试预期行为）——归因质量取决于「预期 vs 实际」的差异分析，只给失败现场模型只能猜。',
+      description: 'E2E 测试失败时，分析截图+DOM 快照+错误文本，给出根因、类别、置信度与下一步动作建议。截图传 screenshotPath（本地文件路径，推荐）或 screenshotBase64 兜底。强烈建议传 expectedBehavior（测试预期行为）——归因质量取决于「预期 vs 实际」的差异分析，只给失败现场模型只能猜。',
       inputSchema: {
         expectedBehavior: z.string().optional().describe('测试的预期行为，如「点击提交按钮后 2s 内出现支付成功弹窗」——归因的基准线，强烈建议传入'),
         testSteps: z.string().optional().describe('失败前的操作步骤序列，如「打开页面 → 填写表单 → 点击提交」'),
-        screenshotBase64: z.string().optional().describe('失败时的截屏 base64'),
+        screenshotPath: z.string().optional().describe('失败截屏本地文件路径（推荐，避免 base64 进上下文）'),
+        screenshotBase64: z.string().optional().describe('失败截屏 base64（兜底；与 screenshotPath 二选一）'),
         domSnapshot: z.string().optional().describe('失败时的 DOM 快照文本'),
         errorText: z.string().optional().describe('错误消息/栈'),
       },
@@ -212,7 +242,9 @@ export function registerTools(server: McpServer): void {
         'confidence must be backed by evidence; confidence without evidence is meaningless. ' +
         `Expected behavior: ${args.expectedBehavior || '(not provided, base your analysis on the failure artifacts only)'}` +
         (args.testSteps ? `\nSteps before failure: ${args.testSteps}` : '');
-      const images = args.screenshotBase64 ? [await shrinkB64(args.screenshotBase64)] : [];
+      const images = args.screenshotPath || args.screenshotBase64
+        ? [await loadImageInput({ b64: args.screenshotBase64, path: args.screenshotPath, what: '失败截屏' })]
+        : [];
       const full = images.length ? text : 'No screenshot provided. Base your analysis on DOM + error text only.\n' + text;
       const dom = args.domSnapshot ? `\n\nDOM snapshot:\n${args.domSnapshot}` : '';
       const err = args.errorText ? `\n\nError text:\n${args.errorText}` : '';
@@ -313,7 +345,7 @@ export function registerTools(server: McpServer): void {
         designUrl: z.string().describe('蓝湖设计稿 URL（期望值来源）'),
         pageUrl: z.string().describe('已实现页面 URL（实际值来源），需可访问'),
         waitFor: z.string().optional().describe('页面加载后等待出现的选择器（如 .task-list），用于等待接口数据渲染'),
-        maxDiffs: z.number().optional().describe('返回偏差条数上限，默认 200'),
+        maxDiffs: z.number().optional().describe('返回偏差分组数上限，默认 50（按严重度排序，critical 组在前）'),
         cookie: z.string().optional(),
       },
     },

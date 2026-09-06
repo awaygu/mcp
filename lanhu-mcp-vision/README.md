@@ -4,7 +4,7 @@
 opencode）获得三件事：
 
 - **读蓝湖的眼睛**：通过蓝湖官方 API（Cookie 直调，无需浏览器）取结构化图层树
-  （x/y/宽高/色值/字号/圆角（含逐角）/描边/文本），精确数值来自结构化数据，**不靠视觉模型 OCR 截图上的小字**。
+  （x/y/宽高/色值/字号/圆角（含逐角）/描边/阴影（内外）/文本），精确数值来自结构化数据，**不靠视觉模型 OCR 截图上的小字**。
 - **按项目/分组组织**：`lanhu_list_directory` 一次拉全团队目录（**无需链接**，项目→分组一页地图），
   `lanhu_read_sector` 按分组列稿目录（不含图层树，防上下文爆炸），支持「团队 → 项目 → 分组（需求）→ 设计稿」完整层级。
 - **下载切图**：`lanhu_download_slices` 把设计稿切图素材拉到本地 assets，供开发引用。
@@ -62,9 +62,9 @@ node lanhu-login.mjs
       "command": "node",
       "args": ["./mcp/lanhu-mcp-vision/dist/index.js"],
       "env": {
-        "LLM_API_KEY": "${LLM_API_KEY}",
-        "VISION_BASE_URL": "https://api.deepseek.com",
-        "LANHU_VISION_MODEL": "deepseek-v4-flash-vision-exp",
+        "VLM_API_KEY": "${VLM_API_KEY}",
+        "VLM_BASE_URL": "https://api.deepseek.com",
+        "VLM_MODEL": "deepseek-v4-flash-vision-exp",
         "LANHU_COOKIE_FILE": "./.mcp-local/lanhu.cookie"
       }
     }
@@ -73,22 +73,22 @@ node lanhu-login.mjs
 ```
 
 `LANHU_COOKIE_FILE` 指向本地 cookie 文件（内容为完整 cookie 串，已 gitignore）；
-`${LLM_API_KEY}` 从 shell 环境变量展开。两者都不入库。
+`${VLM_API_KEY}` 从 shell 环境变量展开。两者都不入库。
 
 ## 工具一览
 
 | 工具 | 作用 | 关键入参 |
 |---|---|---|
 | `lanhu_check_auth` | 探活 cookie 是否有效（401 二次确认） | `cookie` |
-| `lanhu_fetch_design` | 读单个设计稿图层树（+视觉理解，配置了视觉模型时默认开） | `url` 或 `imageId+projectId` / `mode`(api/mock) / `analyze?` / `cookie` |
+| `lanhu_fetch_design` | 读单个设计稿图层树（+视觉理解，配置了视觉模型时默认开） | `url` 或 `imageId+projectId` / `mode`(api/mock) / `analyze?` / `analyzeFocus?`(关注点注入) / `cookie` |
 | `lanhu_list_teams` | 列出账号加入的全部团队（多团队发现入口） | `cookie` |
 | `lanhu_list_directory` | 一次拉团队目录（项目→分组）。约 1.6k tokens | `url?`(提 tid) / `teamId?` / `cookie` |
 | `lanhu_read_sector` | 按分组名列出稿目录（稿名/尺寸/层数，不含图层树——全量会撑爆上下文） | `url`(链接/UUID) / `sector` / `cookie` |
 | `lanhu_download_slices` | 下载切图到本地目录（单稿或分组批量，三层去重，并发下载，下载即压 2x） | `url` / `outputPath` / `sector?` / `sliceNames?` / `skipExisting?` |
 | `lanhu_verify_spec` | **设计稿验收**：图层树期望值 ↔ 页面计算样式，逐字段 diff 出偏差清单 | `designUrl` / `pageUrl` / `waitFor?` / `maxDiffs?` |
-| `lanhu_verify_render` | 渲染页 vs 设计稿 语义对比（主观线索，不作验收结论；不传 designImageBase64 时退化为单图一致性检查） | `actualImageBase64` / `designImageBase64?` / `context?`(已知刻意差异，跳过不报) |
-| `vision_defect_check` | 整页/局部 UI 缺陷检测（12 类缺陷枚举） | `imageBase64` / `context?` / `language?` |
-| `vision_e2e_triage` | E2E 失败截图+DOM 归因（期望-实际差异分析） | `expectedBehavior?`(强烈建议传) / `testSteps?` / `screenshotBase64?` / `domSnapshot?` / `errorText?` |
+| `lanhu_verify_render` | 渲染页 vs 设计稿 语义对比（主观线索，不作验收结论；不传 designImagePath 时退化为单图一致性检查） | `actualImagePath` / `designImagePath?` / `context?`(已知刻意差异，跳过不报)；base64 兜底 |
+| `vision_defect_check` | 整页/局部 UI 缺陷检测（12 类缺陷枚举） | `imagePath` / `context?` / `language?`；base64 兜底 |
+| `vision_e2e_triage` | E2E 失败截图+DOM 归因（期望-实际差异分析） | `expectedBehavior?`(强烈建议传) / `testSteps?` / `screenshotPath` / `domSnapshot?` / `errorText?` |
 
 ## 使用示例
 
@@ -120,6 +120,7 @@ lanhu_fetch_design({
 
 返回 `{ name, viewport, layers(精确坐标/色值/字号/文本), meta }`。
 layers 已清洗：过滤无样式纯容器层（实测省 20-30% 体积），每层带 `parentPath`（有语义的父容器名链）保分组语义；`meta.payloadBytes/droppedLayerCount` 报告数据体积与过滤量。
+二次清洗（面向输出形态）：alpha=1 颜色缩写为 hex；自动生成名（矩形/编组N/Rectangle 9943…）不输出（切图层豁免——名字是下载句柄）；空壳层剔除（仅透明度/仅圆角、无填充描边的层不渲染任何东西）；完全在画布外的层、逐字段一致的堆叠副本、同几何的重复切图标记（编组+子层各标一次，保留 type=image 的）剔除；被上方不透明纯色矩形完整遮挡的层剔除；可见面积占比过低（默认 <25%，只露出窄条）的矩形剔除；碎片装饰带剔除（同一容器内一排首尾相接的微小矢量段——高≤8/宽≤24/成带/宽度参差，等宽等距的分段与孤立小点保留）；「备份/backup」命名的备用层整棵子树剔除；布尔运算节点（Subtract/Union 等）的操作数子层折叠（操作数从不独立渲染，只留带真实填充的布尔节点）。各规则计数见 `meta.droppedLayerCount / dedupedLayerCount / outsideCanvasLayerCount / occludedLayerCount / sliverLayerCount / fragmentLayerCount / backupLayerCount / booleanOperandLayerCount`。切图 CDN URL 不随稿返回（按名下载走 `lanhu_download_slices` 的 `sliceNames`）。返回体为紧凑 JSON。
 
 ### 读 + 视觉理解设计稿（双重验证）
 
@@ -131,9 +132,10 @@ lanhu_fetch_design({
 })
 ```
 
-**`analyze` 默认自动开启**：已配置视觉模型（模型名 + `LLM_API_KEY`/`MT_API_KEY`）时，不传 `analyze` 也等价于 `analyze: true`；
+**`analyze` 默认自动开启**：已配置视觉模型（模型名 + `VLM_API_KEY`）时，不传 `analyze` 也等价于 `analyze: true`；
 未配置视觉能力时默认 `false`。显式传 `true`/`false` 始终优先于自动判断。
 想保留图层树、跳过视觉调用，显式传 `analyze: false`，或设 `LANHU_AUTO_ANALYZE=0` 全局关闭自动分析。
+`analyzeFocus` 可注入调用方关注点/业务背景（如「重点分析签到奖励领取规则」），视觉模型会将其融入分析但不改变 JSON 结构——同一张稿、不同关注点会得到不同侧重的分析结果。
 
 `analyze` 会返回 `visionAnalysis`（纯语义理解：page_type/版面区块/组件清单(position 用档位词+区块名)/视觉叠放层级/imagery(每张背景图的内容+与文字的关系+真伪占位)/氛围/动效暗示；精确数值一律不输出，由 layers 提供），**封面图 base64 不进上下文**，
 只在 server 内部喂给视觉模型——且喂前已压到 **1x JPEG**（4x 封面 1.6MB → 约 100KB 内）。
@@ -329,9 +331,9 @@ node scripts/compress-images.mjs src/assets/xxx/ [--factor 0.5] [--dry-run]
 ### 验收（做完页面后）
 
 ```
-vision_defect_check({ imageBase64: "<渲染页截图>", language: "zh-CN" })
-lanhu_verify_render({ actualImageBase64: "<渲染页>", designImageBase64: "<设计稿>" })
-vision_e2e_triage({ screenshotBase64: "<失败截图>", domSnapshot: "<DOM>", errorText: "<报错>" })
+vision_defect_check({ imagePath: "渲染页截图.png", language: "zh-CN" })
+lanhu_verify_render({ actualImagePath: "渲染页.png", designImagePath: "设计稿.png" })
+vision_e2e_triage({ screenshotPath: "失败截图.png", domSnapshot: "<DOM>", errorText: "<报错>" })
 ```
 
 ## 抽取后端（mode）
@@ -355,9 +357,12 @@ vision_e2e_triage({ screenshotBase64: "<失败截图>", domSnapshot: "<DOM>", er
 | `LANHU_AUTO_ANALYZE` | 否 | — | 设为 `0` 关闭 `lanhu_fetch_design` 的自动视觉分析（配置齐全时也默认不开） |
 | `LANHU_VISION_MAX_TOKENS` | 否 | `4096` | 输出上限。JSON Output 模式下不设会被截断 |
 | `LANHU_VISION_MAX_EDGE` | 否 | `1568` | 入参图压缩的最长边。DeepSeek 进模型前统一缩到约 800×800 等效像素、每张封顶 384 token，设 `1024` 可省流量 |
+| `LANHU_VISION_CACHE` | 否 | `1` | 设 `0` 关闭视觉结果缓存（`LANHU_VISION_CACHE_DIR` 可改缓存目录） |
 | `LANHU_VISION_TIMEOUT_MS` | 否 | `120000` | 单次视觉模型请求超时（毫秒） |
 | `VISION_USE_V1` | 否 | — | 设为 `0` 时端点用文档原生的 `/chat/completions`，默认 `/v1/chat/completions` |
 | `LANHU_SLICE_CONCURRENCY` | 否 | `6` | 切图下载并发数（分组批量下载时生效） |
+| `LANHU_MIN_VISIBLE_FRACTION` | 否 | `0.25` | 出画窄条剔除阈值：可见面积占比低于它的矩形被剔除，设 `0` 关闭该规则 |
+| `LANHU_PRUNE_FRAGMENTS` | 否 | `1` | 设 `0` 关闭碎片装饰带剔除（同容器一排首尾相接的微小矢量段） |
 | `LANHU_COOKIE` | 官方 api 模式必填（与 `LANHU_COOKIE_FILE` 二选一） | — | 蓝湖登录 Cookie 串（F12 复制） |
 | `LANHU_COOKIE_FILE` | 同上 | — | cookie 文件路径（内容为完整 cookie 串，已 gitignore）；`lanhu-login.bat` 续期时自动写入此文件 |
 | `LANHU_MOCK` | 否 | — | 设为 `1` 时 fetch_design 返回内置示例（无需联网） |
@@ -384,7 +389,7 @@ vision_e2e_triage({ screenshotBase64: "<失败截图>", domSnapshot: "<DOM>", er
 - HTTP 404 → 自动在 `/v1/chat/completions` 与 `/chat/completions` 之间切换一次；
 - HTTP 400 且错误指向 `response_format` → 剥掉 JSON Output，退回纯提示词约束再解析。
 
-> ⚠️ 401 `Authentication Fails`：说明 `VLM_API_KEY` / `MT_API_KEY` 不是 **DeepSeek 平台**的 key（其它厂商的 `sk-` key 打不通 api.deepseek.com）。去 <https://platform.deepseek.com/api_keys> 申请后替换。
+> ⚠️ 401 `Authentication Fails`：说明 `VLM_API_KEY` 不是 **DeepSeek 平台**的 key（其它厂商的 `sk-` key 打不通 api.deepseek.com）。去 <https://platform.deepseek.com/api_keys> 申请后替换。
 
 ## 开发 / 类型检查
 
@@ -415,7 +420,7 @@ COPY . .
 RUN npm install && npm run build
 CMD ["node", "dist/index.js"]
 ```
-构建：`docker build -t lanhu-mcp-vision .`，运行时通过 `-e LLM_API_KEY=...` 注入密钥。
+构建：`docker build -t lanhu-mcp-vision .`，运行时通过 `-e VLM_API_KEY=...` 注入密钥。
 
 ## 接入各 coding Agent
 
@@ -454,7 +459,7 @@ CMD ["node", "dist/index.js"]
 
 ## 红线（务必遵守）
 
-- `-exp` 模型契约不稳定：`LANHU_VISION_MODEL` 走环境变量，保留像素 diff / axe 兜底。
+- `-exp` 模型契约不稳定：`VLM_MODEL` 走环境变量，保留像素 diff / axe 兜底。
 - **蓝湖小字（色值、字号、间距）只从 `lanhu_fetch_design` 结构化数据取，绝不靠视觉模型 OCR 截图**——
   这是该视觉模型已知短板（图片压缩后 10px 数字/密集文本必读错）。
 - 视觉模型判断只当线索；**钱 / 权限 / 用户数据相关流程必须人审或留 fallback**。

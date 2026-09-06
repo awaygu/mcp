@@ -260,8 +260,9 @@ function collectSlices(node: any): SliceInfo[] {
       out.push({
         name: String(n.name || 'slice'),
         imageUrl: n.image.imageUrl,
-        x: Math.round(Number(f.x ?? 0)),
-        y: Math.round(Number(f.y ?? 0)),
+        // 蓝湖原始 frame 用 left/top 表坐标（无 x/y 字段），必须兜底，否则恒为 0,0
+        x: Math.round(Number(f.x ?? f.left ?? 0)),
+        y: Math.round(Number(f.y ?? f.top ?? 0)),
         w: Math.round(Number(f.width ?? 0)),
         h: Math.round(Number(f.height ?? 0)),
       });
@@ -477,7 +478,7 @@ export async function downloadSlices(
   downloaded: number;
   skipped: { dup: number; exist: number };
   failed: Array<{ name: string; url: string; status: number }>;
-  slices: Array<{ name: string; file: string; bytes: number; w: number; h: number }>;
+  slices: Array<{ name: string; file: string; bytes: number; w: number; h: number; x: number; y: number }>;
   designErrors?: string[]; // 分组模式下读取失败的稿（尽力而为：其余稿照常下载）
 }> {
   const skipExist = opts.skipExisting !== false; // 默认 true
@@ -535,7 +536,8 @@ export async function downloadSlices(
   mkdirSync(dir, { recursive: true });
 
   const seenUrl = new Set<string>();      // URL 去重
-  const pending: SliceInfo[] = [];
+  // 循环内已过滤无 imageUrl 的条目，pending 里必有 URL
+  const pending: Array<SliceInfo & { imageUrl: string }> = [];
   let dupCount = 0;
   for (const s of rawSlices) {
     const src = s.imageUrl;
@@ -543,10 +545,10 @@ export async function downloadSlices(
     if (nameFilter && !nameFilter.has(s.name)) continue;   // sliceNames 过滤
     if (seenUrl.has(src)) { dupCount++; continue; }
     seenUrl.add(src);
-    pending.push(s);
+    pending.push({ ...s, imageUrl: src });
   }
 
-  const out: Array<{ name: string; file: string; bytes: number; w: number; h: number }> = [];
+  const out: Array<{ name: string; file: string; bytes: number; w: number; h: number; x: number; y: number }> = [];
   const failed: Array<{ name: string; url: string; status: number }> = [];
   let existCount = 0;
 
@@ -566,7 +568,7 @@ export async function downloadSlices(
       // skipExisting：本地已存在就跳过
       if (skipExist && existsSync(filePath)) {
         existCount++;
-        out[idx] = { name: s.name, file: filePath, bytes: 0, w: s.w, h: s.h };
+        out[idx] = { name: s.name, file: filePath, bytes: 0, w: s.w, h: s.h, x: s.x, y: s.y };
         continue;
       }
 
@@ -586,7 +588,7 @@ export async function downloadSlices(
       let final: Buffer = buf;
       try { final = await compressSlicePng(buf, s.w, s.h); } catch { final = buf; }
       writeFileSync(filePath, final);
-      out[idx] = { name: s.name, file: filePath, bytes: final.length, w: s.w, h: s.h };
+      out[idx] = { name: s.name, file: filePath, bytes: final.length, w: s.w, h: s.h, x: s.x, y: s.y };
     }
   };
   const workers = Array.from(

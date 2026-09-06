@@ -3,3 +3,4 @@
 
 # Inspector 本地调试配置（含真实 LLM key，勿提交）
 inspector.config.json
+.env

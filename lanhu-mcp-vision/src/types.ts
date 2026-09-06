@@ -19,8 +19,8 @@ export interface DesignLayer {
   fontFamily?: string;
   lineHeight?: number | string;   // 'auto' 或 px 值
   letterSpacing?: number;         // px
-  align?: string;                 // 水平对齐 left|center|right|justify
-  verticalAlign?: string;
+  align?: string;                 // 水平对齐，仅非默认 left 时输出（center|right|justify）
+  verticalAlign?: string;         // 垂直对齐，仅非默认 top 时输出（center|bottom）
   italic?: boolean;
   underline?: boolean;
   linethrough?: boolean;
@@ -39,6 +39,20 @@ export interface DesignLayer {
     width: number;                // px
     alignment: 'inside' | 'outside' | 'center';  // 描边位置，CSS 需换算（inside 无需，outside 视觉上比 CSS border 宽 2×width）
   };
+  shadow?: {                      // 外阴影（text 层 → CSS text-shadow，其余 → box-shadow；取整 px）
+    color: string;
+    x: number;
+    y: number;
+    blur: number;
+    spread: number;
+  };
+  innerShadow?: {                 // 内阴影（CSS box-shadow inset）
+    color: string;
+    x: number;
+    y: number;
+    blur: number;
+    spread: number;
+  };
   // 图层透明度（仅无 fill/gradient/color 的图层导出，如 image 切图——有颜色的图层透明度已烘进 rgba
   // alpha，再叠此字段会双重叠加；image 图层 Agent 需自行写 CSS opacity）
   opacity?: number;
@@ -51,6 +65,13 @@ export interface DesignMeta {
   rawLayerCount: number;          // 全树遍历的图层数（含被清洗的容器层）
   totalLayerCount: number;
   droppedLayerCount?: number;     // 清洗过滤掉的无样式容器层数
+  dedupedLayerCount?: number;     // 二次清洗：逐字段一致的堆叠副本层数（保留顶层）
+  outsideCanvasLayerCount?: number; // 二次清洗：完全在画布外、不可见的层数
+  occludedLayerCount?: number;    // 二次清洗：被上方不透明纯色层完全遮挡的层数
+  sliverLayerCount?: number;      // 二次清洗：可见面积占比过低（默认 <25%，LANHU_MIN_VISIBLE_FRACTION 可调）只露窄条的层数
+  fragmentLayerCount?: number;    // 二次清洗：碎片装饰带（同容器一排首尾相接的微小矢量段，LANHU_PRUNE_FRAGMENTS=0 可关）剔除的层数
+  backupLayerCount?: number;      // 「备份/backup」命名的备用层剔除数（含子树）
+  booleanOperandLayerCount?: number; // 布尔运算（Subtract/Union 等）操作数子层的折叠数（不独立渲染）
   payloadBytes?: number;          // 清洗后 layers JSON 字节数（Agent 感知数据大小）
   docName?: string;
   capturedFrom?: string;
@@ -86,7 +107,7 @@ export interface SectorInfo {
 // 切图信息（一个设计稿的导出图层）
 export interface SliceInfo {
   name: string;
-  imageUrl: string;     // PNG
+  imageUrl?: string;    // PNG。collectSlices 内部收集时必有；fetch_design 输出前剥除（下载走 download_slices 按 sliceNames 重取）
   x: number;
   y: number;
   w: number;

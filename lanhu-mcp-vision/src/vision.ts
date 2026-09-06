@@ -1,9 +1,12 @@
 // vision.ts — 视觉模型调用（OpenAI 兼容端点）
 import { request as httpsRequest } from 'node:https';
 import { request as httpRequest } from 'node:http';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const MODEL = process.env.VLM_MODEL || 'deepseek-v4-flash-vision-exp';
-// MT_API_KEY 兜底：部分 MCP 客户端不展开 .mcp.json 里的 env，系统变量更可靠
 const API_KEY = process.env.VLM_API_KEY || '';
 // 剥掉尾部 /v1，加不加由 chatEndpoint 统一决定
 const BASE_URL = (process.env.VLM_BASE_URL || 'https://api.deepseek.com').replace(/\/+$/, '').replace(/\/v1$/, '');
@@ -62,6 +65,45 @@ export function visionStatus(): { model: string; baseUrl: string; hasApiKey: boo
   return { model: MODEL, baseUrl: BASE_URL, hasApiKey: Boolean(API_KEY), configured: isVisionConfigured() };
 }
 
+// ─── 视觉结果缓存：同 prompt + 同图 + 同模型的调用直接复用，analyze 54s → 0s ───
+// 键不含 TTL 语义（同输入 ⇒ 同输出，不会过期）；缓存目录默认随 server 安装位置（免受 cwd 影响）。
+// 注意 '../.mcp-local'：src/vision.ts 与 dist/vision.js 都只差一层到项目根
+const CACHE_DIR = process.env.LANHU_VISION_CACHE_DIR
+  || fileURLToPath(new URL('../.mcp-local/vision-cache/', import.meta.url));
+const cacheEnabled = process.env.LANHU_VISION_CACHE !== '0';
+
+function visionCacheKey(images: string[], text: string, detail: string): string {
+  const imgHash = createHash('sha1').update(images.join('\u0000')).digest('hex').slice(0, 16);
+  return createHash('sha1')
+    .update(`${text}\u0000${imgHash}\u0000${detail}\u0000${MODEL}\u0000${BASE_URL}`)
+    .digest('hex');
+}
+
+function readVisionCache(key: string): any | null {
+  if (!cacheEnabled) return null;
+  try {
+    const file = path.join(CACHE_DIR, `${key}.json`);
+    if (!existsSync(file)) return null;
+    const value = JSON.parse(readFileSync(file, 'utf8'));
+    console.error(`[vision] 缓存命中 ${key.slice(0, 8)}（跳过模型调用）`);
+    return value;
+  } catch {
+    return null; // 缓存损坏等同未命中
+  }
+}
+
+function writeVisionCache(key: string, value: unknown): void {
+  if (!cacheEnabled) return;
+  try {
+    mkdirSync(CACHE_DIR, { recursive: true });
+    const json = JSON.stringify(value);
+    if (json.length > 512 * 1024) return; // 异常大响应不缓存
+    writeFileSync(path.join(CACHE_DIR, `${key}.json`), json);
+  } catch (e) {
+    console.error(`[vision] 缓存写入失败: ${(e as Error).message}`);
+  }
+}
+
 // analyze 用的设计稿理解 prompt：精确数值在 layers 里，视觉模型只做语义理解，禁止 OCR 数值
 export const DESIGN_ANALYZE_PROMPT =
   'You are a senior UI/frontend engineer. Precise geometry (x/y/width/height/font sizes/hex colors) ' +
@@ -79,6 +121,26 @@ export const DESIGN_ANALYZE_PROMPT =
   '"style_atmosphere":"color mood + font character + corner/spacing style (compact/airy) in natural language, NO hex values",' +
   '"notes":"details data cannot express: implied motion, implied truncation, icon metaphors"}\n' +
   'Output discipline: each description ≤30 words; at most 15 components, most important first. Only output JSON.';
+
+// analyze 提示词组装：设计稿名 + 调用方关注点作为背景上下文注入（如「通行证-签到弹窗」能直接点明页面类型与业务含义）。
+// 两者都仅供参考——必须声明"只描述可见内容、保持 JSON 结构"，防止模型迎合名字脑补组件或被自由文本带偏格式
+export function designAnalyzePrompt(designName?: string, focus?: string): string {
+  const name = designName?.trim();
+  const hint = name
+    ? `\n\nContext: the design file is named "${name}" (from the design tool). Use it as background context only. ` +
+      'Describe ONLY what is actually visible in the image; if the visual contradicts the name, trust the visual.'
+    : '';
+  const callerFocus = focus?.trim()
+    ? `\n\nAdditional focus from the caller (business context / priorities — reflect them in your analysis, ` +
+      'but keep the SAME JSON structure and describe only what is visible):\n' +
+      `"${focus.trim()}"`
+    : '';
+  return DESIGN_ANALYZE_PROMPT + hint + callerFocus;
+}
+
+// 网关可能只认 /v1 或非 /v1 其中一条路径；首次 404/非 JSON 后探测成功的结果要记住，
+// 否则每次调用都白付一次 404 往返
+let preferredUseV1: boolean | null = null;
 
 // 带超时保护：代理延迟波动大，防无限挂起
 async function postJson(urlStr: string, body: unknown, apiKey?: string): Promise<{ status: number; json: any }> {
@@ -129,9 +191,27 @@ export interface VisionInput {
   detail?: string;
 }
 
-// 日志走 stderr：MCP stdio 下 stdout 是协议通道
+// 相同请求的在途去重：并发到来的同键调用等待并复用同一个结果，
+// 否则三个并发调用会同时读空缓存、同时打模型（白付 3 份延迟与 token）
+const inFlight = new Map<string, Promise<any>>();
+
 export async function callVision({ images = [], text, detail = 'auto' }: VisionInput): Promise<any> {
   assertImageLimits(images);
+  // 缓存查询：键覆盖完整 prompt（含设计稿名等注入内容）/ 图内容 / detail / 模型 / 端点
+  const cacheKey = visionCacheKey(images, text, detail);
+  const cached = readVisionCache(cacheKey);
+  if (cached) return cached;
+  const pending = inFlight.get(cacheKey);
+  if (pending) {
+    console.error('[vision] 相同请求在途，复用其结果');
+    return pending;
+  }
+  const task = doCallVision({ images, text, detail }, cacheKey).finally(() => inFlight.delete(cacheKey));
+  inFlight.set(cacheKey, task);
+  return task;
+}
+
+async function doCallVision({ images = [], text, detail = 'auto' }: VisionInput, cacheKey: string): Promise<any> {
   const content = [
     { type: 'text', text: ensureJsonKeyword(text) },
     // 格式按文件内容判定，声明的 MIME 不准也无妨
@@ -155,7 +235,7 @@ export async function callVision({ images = [], text, detail = 'auto' }: VisionI
   }
 
   let lastErr: Error | null = null;
-  let useV1 = USE_V1;
+  let useV1 = preferredUseV1 ?? USE_V1;
   let triedAltPath = false;
   let triedNoResponseFormat = false;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -175,6 +255,7 @@ export async function callVision({ images = [], text, detail = 'auto' }: VisionI
     if (status === 404 && !triedAltPath) {
       triedAltPath = true;
       useV1 = !useV1;
+      preferredUseV1 = useV1; // 记住探测成功的路径，后续调用不再白付 404 往返
       attempt--;
       console.error(`[vision] HTTP 404 → 切换端点为 ${chatEndpoint(useV1)}`);
       continue;
@@ -213,7 +294,9 @@ export async function callVision({ images = [], text, detail = 'auto' }: VisionI
       // 部分模型不守 json_object 约定，仍套 markdown 围栏
       const stripped = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
       try {
-        return JSON.parse(stripped);
+        const parsed = JSON.parse(stripped);
+        writeVisionCache(cacheKey, parsed); // 仅缓存成功解析的结果（_raw 兜底属失败态，重试才有机会变好）
+        return parsed;
       } catch {
         return { _raw: raw };
       }
