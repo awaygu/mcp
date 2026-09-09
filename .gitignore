@@ -9,3 +9,6 @@
 # 各 MCP 的本地登录态/密钥（不提交）
 .mcp-local/
 .env
+
+# 探测脚本与登录态（含 cookie），不入库
+.probe/
