@@ -5,6 +5,9 @@
 ## 功能特性
 
 - **6 个 MCP 工具**：获取原型大纲、读取单页内容、生成整份需求文档、单独分析流程图、查看/清理解析缓存
+- **结构化 DOM 提取**：不靠 `innerText` 揉成文本流，改用 Axure 导出自带的确定性语义——控件前导注释（类型）、`.table_cell` + viewbox 坐标（表格网格）、`.text > <p>`（行结构）、连接线 `_segN` 几何（流程图拓扑）
+- **确定性优先、VLM 补充**：表格与流程图优先用 DOM 还原（零调用成本、零幻觉），视觉模型负责组件/交互/状态等语义补充；两者分区输出并各自标注来源，文末汇总待确认项
+- **Agent 友好输出**：表格 / 流程 / 规则 / 界面文案 / 交互状态各成一节，同时产出机器可读的 JSON（`output/<分组>_结构化数据.json`），不用反解 Markdown
 - **分段截图**：超大页面自动网格分段滚动截图，宽图/长图内容完整不丢失
 - **VLM 解析**：流程图 / 表格 / 普通页面三类专用 Prompt 并行调用，输出结构化 JSON
 - **结果合并**：多段解析自动去重、补全、交叉验证，文末标注置信度与待确认项
@@ -26,10 +29,11 @@ npx playwright install chromium   # 仅首次需要
 常用脚本：
 
 ```bash
-npm run build      # tsc 编译：src、scripts → dist（仅 .js，不生成 .d.ts / sourcemap）
+npm run build      # esbuild 打包：src → dist/index.js（单文件 + minify）
 npm run typecheck  # 只做类型检查
 npm run dev        # tsx 直接以 TS 源码启动 MCP Server（stdio，免构建）
 npm start          # 运行编译产物 dist/index.js
+npm run verify     # 端到端自检：真实链接爬取 → 结构化提取 → 生成文档（加 -- --vlm 带视觉模型）
 ```
 
 ## 接入 Agent（MCP 配置）

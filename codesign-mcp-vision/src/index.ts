@@ -24,10 +24,9 @@ import {
   isVLMConfigured,
   analyzeSingleImage,
   flowchartToMermaid,
-  tableToMarkdown,
 } from './vlm.js';
 import { processPage, processPages } from './pipeline.js';
-import { generateRequirementDoc } from './doc-generator.js';
+import { generateRequirementDoc, generateSinglePageDoc } from './doc-generator.js';
 import { clearCache, cacheStats, cacheDir } from './cache.js';
 import { closeBrowser, getPage } from './browser.js';
 import { errorMessage, formatBytes, packageVersion } from './utils.js';
@@ -170,9 +169,13 @@ server.registerTool(
         .string()
         .describe('页面名称（叶子名或完整路径「父分组/页面名」，同名页面须用路径区分）'),
       vlmEnabled: z.boolean().optional().describe('是否启用 VLM 解析，默认 true'),
+      detailLevel: z
+        .enum(['summary', 'standard', 'full'])
+        .optional()
+        .describe('文档详细程度：summary(精简)/standard(标准)/full(完整)，默认 standard'),
     },
   },
-  async ({ url, password, pageName, vlmEnabled = true }) => {
+  async ({ url, password, pageName, vlmEnabled = true, detailLevel = 'standard' }) => {
     try {
       const access = resolveAccess(url, password);
       // 爬取需要独占浏览器；VLM 只依赖已落盘的截图，放在锁外避免长时间占用
@@ -186,95 +189,7 @@ server.registerTool(
         context: `页面名称：${pageName}`,
       });
 
-      let result = `# ${merged.pageName}\n\n`;
-      result += `**页面类型**：${typeLabel(merged.type)}\n\n`;
-
-      if (merged.type === 'flowchart' && merged.vlmResult) {
-        const fc = merged.vlmResult;
-        if (fc.summary) result += `**流程概述**：${fc.summary}\n\n`;
-        if (fc.main_flow?.length && fc.nodes) {
-          const nodeMap: Record<string, string> = {};
-          fc.nodes.forEach((n) => (nodeMap[n.id] = n.text));
-          result += `**主流程**：${fc.main_flow.map((id) => nodeMap[id] || id).join(' → ')}\n\n`;
-        }
-        if (fc.nodes?.length) {
-          result += `**流程节点**：\n\n`;
-          fc.nodes.forEach((n) => {
-            result += `- [${n.type}] ${n.text}\n`;
-          });
-          result += '\n';
-        }
-        if (fc.edges?.length) {
-          result += `**连线**：\n\n`;
-          fc.edges.forEach((e) => {
-            const from = fc.nodes?.find((n) => n.id === e.from)?.text || e.from;
-            const to = fc.nodes?.find((n) => n.id === e.to)?.text || e.to;
-            result += `- ${from} ${e.condition ? `--[${e.condition}]-->` : '-->'} ${to}\n`;
-          });
-          result += '\n';
-        }
-        if (fc.nodes?.length) {
-          result += `**流程图（Mermaid）**：\n\n${flowchartToMermaid(fc)}\n\n`;
-        }
-      } else if (merged.type === 'page' && merged.vlmResult) {
-        const ps = merged.vlmResult;
-        if (ps.page_type) result += `**页面类型**：${ps.page_type}\n\n`;
-        if (ps.layout) result += `**布局结构**：${ps.layout}\n\n`;
-        if (ps.components?.length) {
-          result += `**核心组件**：\n\n`;
-          ps.components.forEach((c) => {
-            result += `- [${c.type}] ${c.name}: ${c.description}\n`;
-          });
-          result += '\n';
-        }
-        if (ps.interactions?.length) {
-          result += `**交互行为**：\n\n`;
-          ps.interactions.forEach((i) => (result += `- ${i}\n`));
-          result += '\n';
-        }
-        if (ps.states?.length) {
-          result += `**页面状态**：\n\n`;
-          ps.states.forEach((s) => (result += `- ${s}\n`));
-          result += '\n';
-        }
-      }
-
-      if (merged.tables?.length) {
-        result += `**数据表格**：\n\n`;
-        merged.tables.forEach((table) => {
-          if (table.title) result += `**${table.title}**\n\n`;
-          result += tableToMarkdown(table) + '\n';
-        });
-      }
-
-      if (merged.images?.length) {
-        // 按尺寸聚合：画布页几十张内嵌图不再逐行刷屏
-        const dims = new Map<string, number>();
-        merged.images.forEach((im) => {
-          const k = `${im.width}×${im.height}`;
-          dims.set(k, (dims.get(k) || 0) + 1);
-        });
-        const dimsText = [...dims.entries()].map(([k, n]) => `${k}${n > 1 ? `×${n}` : ''}`).join('、');
-        result += `**页面内嵌原型图**：${merged.images.length} 张（${dimsText}）\n\n`;
-      }
-
-      if (!merged._hasVLM) {
-        // 画布型页面：空间区块（XY-cut 按空白带切分，每块通常对应一个界面/弹窗）
-        if (merged.sections?.length) {
-          result += `**空间区块**（画布型页面，按空白带切分为 ${merged.sections.length} 块，每块通常对应一个界面/弹窗；块内文字按画布位置排序）：\n\n`;
-          merged.sections.forEach((sec, i) => {
-            const imgNote = sec.images ? ` · 含 ${sec.images} 张内嵌图` : '';
-            result += `#### 区块 ${i + 1}（x ${sec.x}-${sec.x + sec.w}，y ${sec.y}-${sec.y + sec.h}${imgNote}）\n\n${sec.text}\n\n`;
-          });
-        } else if (merged.domText) {
-          result += `**页面文字**（⚠️ 未经视觉解析：以下为 DOM 原始文字，表格/图形的行列与布局关系可能已丢失，解读时保留怀疑）：\n\n${merged.domText}\n\n`;
-        }
-      }
-
-      if (merged.warnings?.length) {
-        result += `**注意事项**：\n\n`;
-        merged.warnings.forEach((w) => (result += `- ⚠️ ${w}\n`));
-      }
+      const result = generateSinglePageDoc(merged, detailLevel);
 
       return textResult(result);
     } catch (err) {
@@ -364,10 +279,44 @@ server.registerTool(
         const filePath = path.join(outDir, `${safeGroupName(groupName)}_需求文档.md`);
         writeFileSync(filePath, doc, 'utf-8');
 
+        // 机器可读的结构化数据（表格/流程/控件块/来源），供 Agent 直接消费或做二次处理，
+        // 不必再反解 Markdown。Markdown 面向人读，JSON 面向程序读。
+        const jsonPath = path.join(outDir, `${safeGroupName(groupName)}_结构化数据.json`);
+        writeFileSync(
+          jsonPath,
+          JSON.stringify(
+            {
+              groupName,
+              sourceUrl: access.url,
+              generatedAt: new Date().toISOString(),
+              pages: mergedPages.map((p) => ({
+                pageName: p.pageName,
+                type: p.type,
+                tables: p.tables,
+                blocks: p.blocks || [],
+                flow: p.flow || null,
+                images: p.images || [],
+                vlm: p.vlmResult,
+                warnings: p.warnings,
+                _hasVLM: p._hasVLM,
+                _segmentCount: p._segmentCount,
+              })),
+            },
+            null,
+            2
+          ),
+          'utf-8'
+        );
+
         // 返回文件路径 + 每页一行的摘要，Agent 按需读取文件内容
         const lines = mergedPages.map((p) => {
           const warn = p.warnings?.length ? ` | ⚠️ ${p.warnings.join(';')}` : '';
-          return `- ${p.pageName}（${typeLabel(p.type)}，${p._segmentCount || 0} 段）${warn}`;
+          const extra = [
+            p.tables?.length ? `${p.tables.length} 表` : '',
+            p.blocks?.length ? `${p.blocks.length} 块` : '',
+            p.flow ? `拓扑 ${p.flow.nodes.length}节点/${p.flow.edges.length}边` : '',
+          ].filter(Boolean).join('、');
+          return `- ${p.pageName}（${typeLabel(p.type)}${extra ? `，${extra}` : ''}，${p._segmentCount || 0} 段）${warn}`;
         });
         const header =
           outputFile === true
@@ -377,6 +326,7 @@ server.registerTool(
           [
             ...header,
             `文档已生成：${filePath}`,
+            `结构化数据：${jsonPath}`,
             `共 ${mergedPages.length} 页，全文请按需读取该文件（可按章节偏移分段读取）。`,
             '',
             ...lines,

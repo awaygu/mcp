@@ -63,6 +63,8 @@ export interface DomTable {
   rows: string[][];
 }
 
+import type { AxureBlock, AxureFlow } from './axure-dom.js';
+
 /** 从 Axure iframe 中提取的纯文本内容 */
 export interface ExtractedContent {
   text: string;
@@ -70,6 +72,10 @@ export interface ExtractedContent {
   images: PageImage[];
   /** 画布型页面的空间切分区块（XY-cut 按空白带切分），无则缺省 */
   sections?: PageSection[];
+  /** 按文档顺序排列的控件块（带控件类型与行结构） */
+  blocks?: AxureBlock[];
+  /** 连接线几何还原的流程图拓扑，非流程图页为 null */
+  flow?: AxureFlow | null;
 }
 
 /** 画布空间切分出的区块（通常对应一个界面/弹窗） */
@@ -103,6 +109,10 @@ export interface CrawledPage extends ScreenshotResult {
   tables: DomTable[];
   images: PageImage[];
   sections?: PageSection[];
+  /** 按文档顺序排列的控件块（带控件类型与行结构） */
+  blocks?: AxureBlock[];
+  /** 连接线几何还原的流程图拓扑 */
+  flow?: AxureFlow | null;
   /** 导航失败等原因写入，pipeline 会据此直接产出失败结果 */
   error?: string;
 }
@@ -248,6 +258,10 @@ export interface MergedPage {
   images: PageImage[];
   /** 画布型页面的空间切分区块（经管线透传） */
   sections?: PageSection[];
+  /** 结构化控件块（DOM 确定性提取） */
+  blocks?: AxureBlock[];
+  /** 连接线几何还原的流程图（DOM 确定性提取） */
+  flow?: AxureFlow | null;
   vlmResult: VlmResult;
   warnings: string[];
   _segmentCount: number;
@@ -261,6 +275,8 @@ export interface MergePageInput {
   domTables?: DomTable[];
   images?: PageImage[];
   sections?: PageSection[];
+  blocks?: AxureBlock[];
+  flow?: AxureFlow | null;
   vlmSegments?: VlmResult[];
   type: PageType;
   screenshotCount?: number;

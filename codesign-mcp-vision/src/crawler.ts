@@ -16,6 +16,7 @@ import { createHash } from 'crypto';
 import type { Frame, Page } from 'playwright';
 import { launchBrowser, getPage, waitForNetworkIdle } from './browser.js';
 import { capturePageSegments } from './screenshot.js';
+import { axureExtractExpression } from './axure-dom.js';
 import type {
   CrawledPage,
   ExtractedContent,
@@ -61,22 +62,11 @@ export async function openShareLink(url: string, password?: string): Promise<voi
       // 点击可能因导航而报错，忽略
     }
 
-    // 轮询等待目录树出现（页面导航后执行上下文会重建）
-    let treeReady = false;
-    for (let i = 0; i < 20; i++) {
-      await page.waitForTimeout(1000);
-      try {
-        const tree = await page.$('.t-tree');
-        if (tree) {
-          treeReady = true;
-          break;
-        }
-      } catch {
-        // 执行上下文可能还在重建，继续等待
-      }
-    }
-
-    if (!treeReady) {
+    // 等待目录树出现：用 waitForSelector 而非固定次数轮询——
+    // 条件满足立刻返回（不再白等到 20 次），且导航导致执行上下文重建时会自动重试。
+    try {
+      await page.waitForSelector('.t-tree', { timeout: 20000, state: 'attached' });
+    } catch {
       throw new Error('密码验证后未能加载原型页面（未找到目录树）');
     }
     await page.waitForTimeout(1000);
@@ -180,6 +170,25 @@ export async function getAxureFrame(): Promise<Frame | null> {
 }
 
 /**
+ * 声明式等待 Axure iframe 内出现正文（替代固定次数轮询）。
+ * blob iframe 被替换时 waitForFunction 会抛，调用方必须 catch 后兜底。
+ */
+async function waitForFrameContent(_page: Page, timeout: number): Promise<boolean> {
+  const frame = await getAxureFrame();
+  if (!frame) return false;
+  await frame.waitForFunction(
+    () => {
+      const b = document.body;
+      if (!b) return false;
+      return (b.innerText || b.textContent || '').trim().length > 5;
+    },
+    undefined,
+    { timeout, polling: 250 }
+  );
+  return true;
+}
+
+/**
  * 导航到指定页面（按目录树 DOM 索引点击）
  * @param domIndex - 目标节点在大纲数组中的索引
  * @param opts.quick - 快速模式：仅探测 iframe 是否切换（1.5s），用于判断分组节点是否有自身页面
@@ -206,18 +215,40 @@ export async function navigateToPageByIndex(
 
   if (!outcome.ok) return outcome;
 
-  // 等待 iframe 切换到新页面（URL 变化或元素被替换），替代固定 2s 睡眠
+  // 等待 iframe 切换到新页面（URL 变化或元素被替换）。
+  // 用 waitForFunction 声明式等待替代固定次数轮询：条件满足立刻返回，
+  // 且 blob iframe 被替换导致执行上下文销毁时 Playwright 会自动重试。
+  // 轮询兜底保留：waitForFunction 在 frame 彻底 detach 时会抛，不能丢。
   const oldFrame = await getAxureFrame();
   const oldFrameUrl = oldFrame?.url() || '';
-  let frameChanged = false;
-  const probes = quick ? 6 : 24;
-  for (let i = 0; i < probes; i++) {
-    await page.waitForTimeout(250);
-    const frame = await getAxureFrame();
-    if (!frame) continue;
-    if (frame !== oldFrame || frame.url() !== oldFrameUrl) {
-      frameChanged = true;
-      break;
+  const quickTimeout = 1500;
+  const fullTimeout = 6000;
+  let frameChanged = await page
+    .waitForFunction(
+      (prevUrl) => {
+        const el = document.querySelector('.axure-container iframe');
+        if (!el) return false;
+        const cur = (el as HTMLIFrameElement).src || (el as HTMLIFrameElement).getAttribute('src') || '';
+        // src 变化即视为切换；blob: src 不变的极端情况交给下面的兜底轮询
+        return cur !== prevUrl;
+      },
+      oldFrameUrl,
+      { timeout: quick ? quickTimeout : fullTimeout, polling: 250 }
+    )
+    .then(() => true)
+    .catch(() => false);
+
+  if (!frameChanged) {
+    // 兜底：src 未变但 iframe 元素可能被替换（同 URL 重渲染）
+    const probes = quick ? 6 : 24;
+    for (let i = 0; i < probes; i++) {
+      await page.waitForTimeout(250);
+      const frame = await getAxureFrame();
+      if (!frame) continue;
+      if (frame !== oldFrame || frame.url() !== oldFrameUrl) {
+        frameChanged = true;
+        break;
+      }
     }
   }
 
@@ -226,17 +257,12 @@ export async function navigateToPageByIndex(
 
   await waitForNetworkIdle(5000);
 
-  // 等待 iframe 中有内容
-  for (let i = 0; i < 20; i++) {
-    await page.waitForTimeout(250);
-    try {
-      const frame = await getAxureFrame();
-      if (frame) {
-        const text = await frame.evaluate(() => document.body?.innerText?.trim() || '');
-        if (text.length > 5) break;
-      }
-    } catch {
-      // frame 可能还在加载
+  // 等待 iframe 中有内容：声明式等待正文就绪，失败再退回轮询（frame 可能重建）
+  const contentReady = await waitForFrameContent(page, 5000).catch(() => false);
+  if (!contentReady) {
+    for (let i = 0; i < 20; i++) {
+      await page.waitForTimeout(250);
+      if (await waitForFrameContent(page, 200).catch(() => false)) break;
     }
   }
 
@@ -302,360 +328,18 @@ function describeNavigationFailure(nav: { ok: false; reason: string }): string {
 }
 
 /**
- * 提取当前页面的纯文本内容（从 Axure iframe 中提取，含表格与内嵌图片）
+ * 提取当前页面的结构化内容（在 Axure iframe 中执行）
  *
- * 表格双通道：
- * ① 真 <table> 元素（少见，保底）；
- * ② DOM 网格重建——Axure 的"表格"由绝对定位 div 按坐标摆出，没有真 <table> 可抓，
- *    innerText 会把行列关系撕碎。改为收集叶子文本块坐标，按 y 聚成行、按 x 起点聚成列，
- *    网格规律性达标才重建成 {headers, rows}（下游渲染为 Markdown 表格）。
+ * 用结构化提取替代旧的 container.innerText：保留表格二维结构、控件类型与
+ * 文本行结构，并尝试从连接线几何还原流程图拓扑（详见 axure-dom.ts）。
  */
 export async function extractPageText(): Promise<ExtractedContent> {
   const frame = await getAxureFrame();
   if (!frame) {
-    return { text: '', tables: [], images: [] };
+    return { text: '', tables: [], images: [], blocks: [], flow: null };
   }
-
-  return await frame.evaluate((): ExtractedContent => {
-    const container = document.body;
-    if (!container) return { text: '', tables: [], images: [] };
-
-    const tables: { headers: string[]; rows: string[][] }[] = [];
-    // ① 语义化表格（Axure 导出：.table_cell 单元格带精确坐标，行列天然对齐，实测 21×4 全对）
-    //    优先于几何重建——确定性输出，零猜测
-    const axureCells = Array.from(container.querySelectorAll('.table_cell'));
-    if (axureCells.length >= 4) {
-      const items = axureCells.map((cell) => {
-        const r = cell.getBoundingClientRect();
-        const textEl = cell.querySelector('.text') as HTMLElement | null;
-        // innerText 保留单元格内多段文本的换行结构（Axure 每行一个 <p>）
-        const text = ((textEl ? textEl.innerText : cell.textContent) || '').replace(/\r/g, '').trim();
-        return { x: r.left, y: r.top, text };
-      });
-      // 行：top 相差 ≤2px 聚为一行；列：left 相差 ≤3px 聚为一列（Axure 网格坐标精确）
-      const rowKeys: number[] = [];
-      for (const it of [...items].sort((a, b) => a.y - b.y)) {
-        if (!rowKeys.length || it.y - rowKeys[rowKeys.length - 1] > 2) rowKeys.push(it.y);
-      }
-      const colKeys: number[] = [];
-      for (const it of [...items].sort((a, b) => a.x - b.x)) {
-        if (!colKeys.length || it.x - colKeys[colKeys.length - 1] > 3) colKeys.push(it.x);
-      }
-      const nearest = (keys: number[], v: number): number => {
-        let best = 0;
-        let bestD = Infinity;
-        keys.forEach((k, i) => {
-          const d = Math.abs(v - k);
-          if (d < bestD) { bestD = d; best = i; }
-        });
-        return best;
-      };
-      const grid: string[][] = Array.from({ length: rowKeys.length }, () =>
-        Array.from({ length: colKeys.length }, () => ''));
-      for (const it of items) grid[nearest(rowKeys, it.y)][nearest(colKeys, it.x)] = it.text;
-      const filled = grid.flat().filter((c) => c !== '').length;
-      if (rowKeys.length >= 2 && colKeys.length >= 2 && filled / (rowKeys.length * colKeys.length) >= 0.3) {
-        tables.push({ headers: grid[0], rows: grid.slice(1) });
-      }
-    }
-
-    // 提取真 <table>
-    container.querySelectorAll('table').forEach((table) => {
-      const headers: string[] = [];
-      const rows: string[][] = [];
-      const allRows = table.querySelectorAll('tr');
-      allRows.forEach((row, idx) => {
-        const cells = row.querySelectorAll('th, td');
-        const rowData = Array.from(cells).map((c) => c.textContent?.trim() || '');
-        if (idx === 0) {
-          headers.push(...rowData);
-        } else {
-          rows.push(rowData);
-        }
-      });
-      if (headers.length > 0 || rows.length > 0) {
-        tables.push({ headers, rows });
-      }
-    });
-
-    // 提取内嵌原型图（设计稿/插画类大图，DOM 文字提取不到，过滤图标小图）
-    const images: { src: string; alt: string; width: number; height: number }[] = [];
-    const imgRects: Array<{ x: number; y: number; w: number; h: number }> = []; // 坐标仅供画布区块统计，不进返回体
-    container.querySelectorAll('img').forEach((img) => {
-      const rect = img.getBoundingClientRect();
-      const width = Math.round(rect.width);
-      const height = Math.round(rect.height);
-      if (width < 40 || height < 40) return;
-      images.push({
-        src: (img.currentSrc || img.src || '').slice(0, 200),
-        alt: img.alt?.trim() || '',
-        width,
-        height,
-      });
-      imgRects.push({ x: rect.left, y: rect.top, w: width, h: height });
-    });
-
-    // ── DOM 网格表格重建（Axure 定位式表格 → 结构化行列）──
-    // 算法（在真实 CoDesign 原型上校准）：
-    //   叶子块 = 「最深文本持有者」（Axure 文本控件内部嵌套，children.length 判定会漏）；
-    //   行簇 = y 区间重叠过半归同行（单元格多行文字会拆成多个行簇）；
-    //   列 = 表头行簇（首个 ≥2 块的行）的文本块区间做锚点，其余块按区间重叠度归列
-    //   ——不能用 x 起点聚类：居中单元格每行文字宽度不同，起点完全不同；
-    //   逻辑行 = 首列锚点块为记录边界（y 区间制），与上一首列块 y 间距 <25px 视为同格续行；
-    //   门槛：锚点列 ≥2、首列有数据、占用列 ≥2，否则维持纯文字输出（防普通版式误判成表格）。
-    const gridTables = ((): { headers: string[]; rows: string[][] }[] => {
-      interface Block { x: number; r: number; y: number; b: number; text: string }
-      const blocks: Block[] = [];
-      for (const el of Array.from(container.querySelectorAll('*'))) {
-        if (el.closest('table')) continue; // 真 table 已单独提取，避免重复
-        const hasDirectText = Array.from(el.childNodes).some((n) => n.nodeType === 3 && (n.textContent || '').trim());
-        if (!hasDirectText) continue;
-        const childHoldsText = Array.from(el.children).some((c) =>
-          Array.from(c.childNodes).some((n) => n.nodeType === 3 && (n.textContent || '').trim()));
-        if (childHoldsText) continue;
-        const text = (el.textContent || '').trim();
-        if (!text) continue;
-        const cs = getComputedStyle(el);
-        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
-        const r = el.getBoundingClientRect();
-        if (r.width < 4 || r.height < 4) continue;
-        blocks.push({ x: r.left, r: r.right, y: r.top, b: r.bottom, text: text.replace(/\s+/g, ' ') });
-        if (blocks.length >= 1500) break;
-      }
-      if (blocks.length < 9) return []; // 至少 3行×2列 才谈得上表格
-
-      blocks.sort((a, b) => a.y - b.y || a.x - b.x);
-      const rowClusters: Block[][] = [];
-      let cur: Block[] = [];
-      let top = 0;
-      let bottom = 0;
-      const flushRow = (): void => { if (cur.length) rowClusters.push(cur); cur = []; };
-      for (const bk of blocks) {
-        if (!cur.length) {
-          cur = [bk]; top = bk.y; bottom = bk.b;
-          continue;
-        }
-        const overlap = Math.min(bottom, bk.b) - Math.max(top, bk.y);
-        if (overlap > 0.5 * Math.min(bk.b - bk.y, bottom - top)) {
-          cur.push(bk);
-          top = Math.min(top, bk.y);
-          bottom = Math.max(bottom, bk.b);
-        } else {
-          flushRow();
-          cur = [bk]; top = bk.y; bottom = bk.b;
-        }
-      }
-      flushRow();
-
-      const headerIdx = rowClusters.findIndex((r) => r.length >= 2);
-      if (headerIdx < 0) return [];
-      const headerRow = rowClusters[headerIdx];
-      const body = rowClusters.slice(headerIdx + 1);
-      const bodyBlocks = body.flat();
-      if (!bodyBlocks.length) return [];
-      const minX = bodyBlocks.reduce((m, b) => Math.min(m, b.x), Infinity);
-      const maxX = bodyBlocks.reduce((m, b) => Math.max(m, b.r), -Infinity);
-
-      // 列检测：块 x 区间的覆盖事件扫描，找「零覆盖缝隙」（≥3px）切列。
-      // 不能用表头锚点做列边界——表头文字宽度 ≠ 列宽（实测"修改明细"表头 52px，列实际 340px）；
-      // 也不能按块左缘聚类——居中单元格每行起点都不同。零覆盖缝隙是数据驱动的真实列分隔。
-      // 事件扫描（左缘+1/右缘-1，+1 先于 -1 排序）保证浮点精确，无分桶误差
-      const events: Array<{ x: number; d: number }> = [];
-      for (const b of bodyBlocks) {
-        events.push({ x: b.x, d: 1 }, { x: b.r, d: -1 });
-      }
-      events.sort((a, b) => a.x - b.x || a.d - b.d);
-      const boundsX: number[] = [minX];
-      let active = 0;
-      let zeroStart = -1;
-      for (const ev of events) {
-        const prev = active;
-        active += ev.d;
-        if (prev > 0 && active === 0) zeroStart = ev.x; // 覆盖归零，缝隙开始
-        if (prev === 0 && active > 0) {
-          // 缝隙结束：内部缝隙（≥3px）是真实列边界；最左侧的空隙是页边距，不算
-          if (zeroStart >= 0 && ev.x - zeroStart >= 3 && zeroStart > minX) boundsX.push((zeroStart + ev.x) / 2);
-          zeroStart = -1;
-        }
-      }
-      boundsX.push(maxX);
-      const colCount = boundsX.length - 1;
-      if (colCount < 2) return []; // 无内部缝隙，非多列表格
-
-      const colOf = (bk: Block): number => {
-        let best = 0;
-        let bestOv = -1;
-        for (let i = 0; i < colCount; i++) {
-          const a = boundsX[i];
-          const r = boundsX[i + 1];
-          const ov = Math.min(r, bk.r) - Math.max(a, bk.x);
-          if (ov > bestOv) { bestOv = ov; best = i; }
-        }
-        return best;
-      };
-
-      // 逻辑行：首列（最左列）块为记录边界；与上一首列块 y 间距 <25px 视为同格续行（不拆新记录）。
-      // 其余块按「相邻首列块 y 的中点」归记录——模块名常在其明细块的垂直居中位置，按区间起点归会错位
-      const col0: Block[] = [];
-      for (const row of body) for (const bk of row) if (colOf(bk) === 0) col0.push(bk);
-      if (!col0.length) return []; // 首列无数据，非「首列驱动」的表格
-      col0.sort((a, b) => a.y - b.y);
-
-      const recTops: number[] = [];
-      const records: string[][][] = []; // records[记录][列] = 文本片段
-      for (const bk of col0) {
-        const lastTop = recTops[recTops.length - 1];
-        if (!recTops.length || bk.y - lastTop > 25) {
-          recTops.push(bk.y);
-          records.push(Array.from({ length: colCount }, () => [] as string[]));
-        }
-        records[records.length - 1][0].push(bk.text);
-      }
-      const assignRec = (y: number): number => {
-        for (let k = 0; k < recTops.length - 1; k++) {
-          if (y < (recTops[k] + recTops[k + 1]) / 2) return k;
-        }
-        return recTops.length - 1;
-      };
-      for (const row of body) {
-        for (const bk of row) {
-          const ci = colOf(bk);
-          if (ci === 0) continue; // 首列已随锚点入记录
-          records[assignRec(bk.y)][ci].push(bk.text);
-        }
-      }
-
-      const usedCols = new Set<number>();
-      let filled = 0;
-      records.forEach((rec) => rec.forEach((c, i) => {
-        if (c.length) { usedCols.add(i); filled++; }
-      }));
-      if (usedCols.size < 2) return [];
-      if (filled / (records.length * colCount) < 0.3) return []; // 网格占用率过低，多半是普通版式
-
-      // 门槛 3：单元格体积——真实表格的格子很少超过几百字；
-      // 原型画布（整页 UI 界面拼贴）会在这里产生塞满整个屏幕文字的巨型“格子”，必须拒绝
-      const maxCell = records.reduce(
-        (m, rec) => Math.max(m, ...rec.map((c) => c.join('').length)),
-        0
-      );
-      if (maxCell > 600) return [];
-      // 门槛 4：页面含 ≥3 张大尺寸内嵌图（宽≥250 且 高≥200 的手机屏截图）→ 这是原型画布，不是数据表
-      if (images.filter((im) => im.width >= 250 && im.height >= 200).length >= 3) return [];
-      // 门槛 5：平均每格块数 >4 → 文字碎块远多于网格容量，是自由版式
-      if (bodyBlocks.length / (records.length * colCount) > 4) return [];
-
-      // 单元格内多块用 <br> 连接：保留原始换行结构（Markdown 表格内换行的标准写法）
-      const cellText = (arr: string[]): string => arr.join('<br>').trim();
-      const headerCells: string[][] = Array.from({ length: colCount }, () => []);
-      for (const bk of headerRow) headerCells[colOf(bk)].push(bk.text.replace(/\s+/g, ' ').trim());
-      const headers = headerCells.map((c) => c.join(' ').trim());
-      if (!headers.some(Boolean)) return [];
-      const rows = records.map((rec) => rec.map(cellText));
-      if (rows.length < 2) return [];
-      return [{ headers, rows }];
-    })();
-    // 语义化表格或真 <table> 已命中时，几何重建不再叠加（避免同内容双表）
-    if (!tables.length) tables.push(...gridTables);
-
-    // ── 画布型页面空间切分（XY-cut）：无表格、含大图/长文字时，
-    //    按空白带把画布切成区块（每块通常对应一个界面/弹窗），输出结构化 sections ──
-    const canvasSections = ((): Array<{ x: number; y: number; w: number; h: number; text: string; images: number }> => {
-      if (tables.length > 0) return []; // 表格页是文档型内容，不做画布切分
-      const bigImgs = images.filter((im) => im.width >= 250 && im.height >= 200).length;
-      interface Blk { x: number; r: number; y: number; b: number; text: string }
-      const blocks: Blk[] = [];
-      for (const el of Array.from(container.querySelectorAll('*'))) {
-        if (el.closest('table')) continue;
-        const hasDirectText = Array.from(el.childNodes).some((n) => n.nodeType === 3 && (n.textContent || '').trim());
-        if (!hasDirectText) continue;
-        const childHoldsText = Array.from(el.children).some((c) =>
-          Array.from(c.childNodes).some((n) => n.nodeType === 3 && (n.textContent || '').trim()));
-        if (childHoldsText) continue;
-        const t = (el.textContent || '').replace(/[ 	]+/g, ' ').trim();
-        if (!t) continue;
-        const cs = getComputedStyle(el);
-        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
-        const r = el.getBoundingClientRect();
-        if (r.width < 4 || r.height < 4) continue;
-        blocks.push({ x: r.left, r: r.right, y: r.top, b: r.bottom, text: t });
-        if (blocks.length >= 2000) break;
-      }
-      if (blocks.length < 12) return [];
-      const totalChars = blocks.reduce((m, b) => m + b.text.length, 0);
-      if (bigImgs < 3 && totalChars < 3000) return []; // 短文档无需切分
-
-      // 画布切分：以大内嵌图（手机屏截图 ≥250×200）为锚点，文字块按就近原则聚类成界面区块。
-      // 不用 XY-cut 空白切分——画布上屏幕之间常有跨屏宽块（箭头/连线/宽表格）连通，零覆盖缝隙不可靠；
-      // 大图锚点就是界面本身，语义正确且不受跨屏块干扰
-      const out: Array<{ x: number; y: number; w: number; h: number; text: string; images: number }> = [];
-      const anchors = imgRects.filter((p) => p.w >= 250 && p.h >= 200).map((a) => ({ ...a }));
-      if (anchors.length) {
-        const distTo = (bk: Blk, a: { x: number; y: number; w: number; h: number }): number => {
-          const cx = (bk.x + bk.r) / 2;
-          const cy = (bk.y + bk.b) / 2;
-          const dx = Math.max(a.x - cx, 0, cx - (a.x + a.w));
-          const dy = Math.max(a.y - cy, 0, cy - (a.y + a.h));
-          return Math.hypot(dx, dy);
-        };
-        const clusters = anchors.map(() => [] as Blk[]);
-        const scattered: Blk[] = [];
-        for (const bk of blocks) {
-          let best = 0;
-          let bestD = Infinity;
-          anchors.forEach((a, i) => {
-            const d = distTo(bk, a);
-            if (d < bestD) { bestD = d; best = i; }
-          });
-          if (bestD <= 400) clusters[best].push(bk);
-          else scattered.push(bk);
-        }
-        const order = anchors
-          .map((a, i) => ({ a, i }))
-          .sort((p, q) => p.a.y - q.a.y || p.a.x - q.a.x);
-        for (const { a, i } of order) {
-          const texts = clusters[i]
-            .sort((p, q) => p.y - q.y || p.x - q.x)
-            .map((b) => b.text);
-          if (!texts.length) continue;
-          out.push({
-            x: Math.round(a.x),
-            y: Math.round(a.y),
-            w: Math.round(a.w),
-            h: Math.round(a.h),
-            text: texts.join('\n'),
-            images: 0,
-          });
-        }
-        if (scattered.length) {
-          scattered.sort((p, q) => p.y - q.y || p.x - q.x);
-          out.push({
-            x: Math.round(scattered[0].x),
-            y: Math.round(scattered[0].y),
-            w: 0,
-            h: 0,
-            text: '【画布散落文字，未邻近任何界面截图】\n' + scattered.map((b) => b.text).join('\n'),
-            images: 0,
-          });
-        }
-      }
-      return out.length ? out : [];
-    })();
-
-    // 提取纯文本
-    const rawText = container.innerText || container.textContent || '';
-    const textLines = rawText
-      .split('\n')
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0);
-
-    return {
-      text: textLines.join('\n'),
-      tables,
-      images,
-      sections: canvasSections,
-    };
-  });
+  // 走字符串表达式注入（而非直接传函数）：兼容 esbuild/tsx 的 keepNames 包装，见 axure-dom.ts
+  return (await frame.evaluate(axureExtractExpression())) as ExtractedContent;
 }
 
 /**
@@ -732,7 +416,7 @@ export async function getGroupPages(
     const before = await extractPageText();
     const selfNav = await navigateToPageByIndex(target.domIndex, { quick: true });
     if (selfNav.ok) {
-      const { text, tables, images, sections } = await extractPageText();
+      const { text, tables, images, sections, blocks, flow } = await extractPageText();
       // URL 未切换但文字变化也算切换（防同 URL 重渲染），空白页（无文字无图）不计入
       const switched = selfNav.frameChanged || text !== before.text;
       if (switched && (text.trim() || images.length > 0)) {
@@ -746,6 +430,8 @@ export async function getGroupPages(
           tables,
           images,
           sections,
+          blocks,
+          flow,
           segments: screenshotResult.segments,
           segmentCount: screenshotResult.segmentCount,
           isSegmented: screenshotResult.isSegmented,
@@ -808,7 +494,7 @@ export async function getGroupPages(
       continue;
     }
 
-    const { text, tables, images, sections } = await extractPageText();
+    const { text, tables, images, sections, blocks, flow } = await extractPageText();
     const screenshotResult = await screenshotPage(
       `${groupName}_${pageInfo.name}`,
       pageCacheKeyOf(url, pageInfo.name, text)
@@ -820,6 +506,8 @@ export async function getGroupPages(
       tables,
       images,
       sections,
+      blocks,
+      flow,
       segments: screenshotResult.segments,
       segmentCount: screenshotResult.segmentCount,
       isSegmented: screenshotResult.isSegmented,
@@ -858,7 +546,7 @@ export async function getSinglePage(pageName: string, url?: string): Promise<Cra
   const nav = await navigateToPageByIndex(located.target.domIndex);
   if (!nav.ok) throw new Error(describeNavigationFailure(nav));
 
-  const { text, tables, images, sections } = await extractPageText();
+  const { text, tables, images, sections, blocks, flow } = await extractPageText();
   const screenshotResult = await screenshotPage(
     pageName,
     pageCacheKeyOf(url, located.target.path, text)
@@ -870,6 +558,8 @@ export async function getSinglePage(pageName: string, url?: string): Promise<Cra
     tables,
     images,
     sections,
+    blocks,
+    flow,
     segments: screenshotResult.segments,
     segmentCount: screenshotResult.segmentCount,
     isSegmented: screenshotResult.isSegmented,

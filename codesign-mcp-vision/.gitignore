@@ -11,3 +11,6 @@ output
 # 编译产物
 dist
 *.tsbuildinfo
+
+# 调试产物
+.debug-out

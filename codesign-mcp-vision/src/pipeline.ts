@@ -80,6 +80,8 @@ function finalize(
     domTables: pageData.tables || [],
     images: pageData.images || [],
     sections: pageData.sections,
+    blocks: pageData.blocks,
+    flow: pageData.flow ?? null,
     vlmSegments,
     type,
     screenshotCount: pageData.segmentCount || 0,
@@ -127,6 +129,8 @@ interface PreparedPage {
   key?: CacheKeyParams;
   cached?: VlmResult[] | null;
   failed?: boolean;
+  /** 跳过 VLM（未启用/未配置/无截图）：必须显式标记，否则下面摊平任务时会把它当成待解析页 */
+  skipVlm?: boolean;
   vlmSegments: VlmResult[] | null;
   taskStart?: number;
   taskEnd?: number;
@@ -150,7 +154,7 @@ export async function processPages(
 
     const type = detectPageType(pageData.pageName, pageData.text);
     if (!vlmEnabled || !isVLMConfigured() || !pageData.segments?.length) {
-      return { pageData, type, vlmSegments: [] };
+      return { pageData, type, vlmSegments: [], skipVlm: true };
     }
 
     const key = pageCacheKey(pageData, url, type);
@@ -160,7 +164,7 @@ export async function processPages(
 
   const tasks: SegmentTask[] = [];
   prepared.forEach((item) => {
-    if (item.failed || item.cached || !item.pageData.segments?.length) return;
+    if (item.skipVlm || item.failed || item.cached || !item.pageData.segments?.length) return;
     item.taskStart = tasks.length;
     tasks.push(...segmentTasks(item.pageData, item.type, item.context));
     item.taskEnd = tasks.length;

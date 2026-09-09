@@ -405,13 +405,29 @@ export function mergePageStructures(segments: VlmResult[]): VlmPageStructure & V
 export function crossValidate(
   domText: string,
   vlmResult: VlmResult,
-  type: PageType
+  type: PageType,
+  /** 页面是否已有来自 DOM 的确定性结构化数据（表格/控件块/流程图），用于避免误报「依赖 VLM」 */
+  hasDomStructure = false
 ): { verified: VlmResult; warnings: string[] } {
   const warnings: string[] = [];
   const verified: VlmResult = { ...vlmResult };
 
+  const hasVLM =
+    !!vlmResult.nodes?.length ||
+    !!vlmResult.tables?.length ||
+    !!vlmResult.components?.length ||
+    !!vlmResult.interactions?.length ||
+    !!vlmResult.states?.length ||
+    !!vlmResult.key_info?.length ||
+    !!vlmResult.main_flow?.length;
+
   if (!domText || domText.length < 10) {
-    warnings.push('DOM 文字提取为空，完全依赖 VLM 识别');
+    // 有 DOM 结构化数据时不报警：表格/控件块/流程图已来自确定性提取
+    if (hasVLM) {
+      warnings.push('DOM 文字流较短，VLM 结果无法用 DOM 文字逐项核对，建议人工复核');
+    } else if (!hasDomStructure) {
+      warnings.push('DOM 文字提取为空，且无 VLM 识别，页面可能无结构化文字内容');
+    }
     return { verified, warnings };
   }
 
@@ -478,6 +494,8 @@ export function mergePageResult({
   domTables = [],
   images = [],
   sections,
+  blocks,
+  flow = null,
   vlmSegments = [],
   type,
   screenshotCount = 0,
@@ -507,14 +525,23 @@ export function mergePageResult({
   }
 
   // 2. 交叉验证
-  const { verified, warnings: validateWarnings } = crossValidate(domText, vlmMerged, type);
+  const hasDomStructure =
+    domTables.length > 0 || (blocks?.length ?? 0) > 0 || !!flow;
+  const { verified, warnings: validateWarnings } = crossValidate(
+    domText,
+    vlmMerged,
+    type,
+    hasDomStructure
+  );
   warnings.push(...validateWarnings);
 
   // 3. 合并 DOM 表格与 VLM 表格
+  // DOM 表格来自 .table_cell 语义网格，是确定性的，排在前面；
+  // VLM 表格作为补充（DOM 提取不到时才真正有价值），标记 _source 供人工复核。
   const finalTables: MergedTable[] = [...domTables];
-  if (type === 'table' && verified.tables) {
-    // VLM 识别的表格补充到 DOM 表格后
-    for (const vTable of verified.tables) {
+  const vlmTables = verified.tables || [];
+  if (vlmTables.length) {
+    for (const vTable of vlmTables) {
       // 检查是否与 DOM 表格重复
       const isDuplicate = finalTables.some(
         (dt) => calcHeadersSimilarity(dt.headers, vTable.headers) > 0.8
@@ -538,6 +565,8 @@ export function mergePageResult({
     tables: finalTables,
     images,
     sections,
+    blocks,
+    flow,
     vlmResult: verified,
     warnings,
     _segmentCount: screenshotCount || vlmSegments.length,
