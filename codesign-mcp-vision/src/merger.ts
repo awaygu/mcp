@@ -7,6 +7,7 @@
  * - 表格：表格匹配、行去重、截断行补全
  * - 普通页面：组件去重、交互合并、布局拼接
  */
+import type { AxureBlock } from './axure-dom.js';
 import type {
   FlowBranch,
   FlowEdge,
@@ -34,6 +35,44 @@ type MergedFlowchart = VlmFlowchart & {
 type TableWithRowKeys = VlmTableData & { _rowKeys?: Set<string> };
 
 // ─── 工具函数 ─────────────────────────────────────────────────
+
+/**
+ * DOM 表格标题推断：Axure 画布上的表格没有语义标题，但正上方通常会紧贴一个
+ * 标注文本块（如「装扮奖励列表(活动结束时钻石…手动发放…）」）。
+ * 只认正上方、垂直间距 ≤120px、水平方向有重叠、文本 2~80 字的块——实测下方/
+ * 远处的文本多属于相邻界面（mockup 标签、下一屏的说明），作标题必错；
+ * 超过 80 字的是规则正文不是标题。只填没有 title 的表（VLM 表格自带标题不覆盖）。
+ */
+export function inferTableTitles(tables: MergedTable[], blocks?: AxureBlock[]): void {
+  const candidates = (blocks || []).filter(
+    (b) => !!b.rect && b.lines.length > 0
+  ) as Array<AxureBlock & { rect: NonNullable<AxureBlock['rect']> }>;
+  if (!candidates.length) return;
+
+  const withRect = tables
+    .filter((t): t is MergedTable & { rect: NonNullable<MergedTable['rect']> } => !!t.rect && !t.title)
+    .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x); // 画布阅读序：靠上的表格优先占用标题块
+
+  for (const table of withRect) {
+    const r = table.rect;
+    let best: { block: AxureBlock; gap: number } | null = null;
+    for (const b of candidates) {
+      const br = b.rect;
+      const text = b.lines.join(' ').trim();
+      if (text.length < 2 || text.length > 80) continue;
+
+      const overlap = Math.min(br.x + br.w, r.x + r.w) - Math.max(br.x, r.x);
+      if (overlap < Math.min(r.w * 0.2, 80)) continue; // 水平无明显重叠 → 不像这张表的标注
+
+      if (br.y + br.h > r.y + 30) continue; // 只认正上方（允许 30px 轻微搭界）
+      const gap = r.y - (br.y + br.h);
+      if (gap > 120) continue;
+
+      if (!best || gap < best.gap) best = { block: b, gap };
+    }
+    if (best) table.title = best.block.lines.join(' ').trim();
+  }
+}
 
 /**
  * 计算两个字符串的相似度（0-1）
@@ -557,6 +596,9 @@ export function mergePageResult({
       }
     }
   }
+
+  // DOM 表格标题推断：用表格旁边的标注文本块补全语义标题（VLM 表格已带 title，不覆盖）
+  inferTableTitles(finalTables, blocks);
 
   return {
     pageName,

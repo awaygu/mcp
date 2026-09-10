@@ -44,18 +44,23 @@ function todayStamp(now = new Date()): string {
 
 /** 控件块分组结果 */
 interface BlockGroups {
-  /** 说明 / 规则类（多行或长文本） */
-  rules: { type: string; lines: string[] }[];
+  /** 说明 / 规则类（多行或长文本），整块文本相同的已合并并计数 */
+  rules: { type: string; lines: string[]; count: number }[];
+  /** 合并前的规则块总数（含重复），用于文案展示 */
+  rulesTotal: number;
   /** 界面文案类（短标签，去重并计数） */
   labels: { type: string; text: string; count: number }[];
 }
 
 /**
  * 把控件块按长度分成「说明/规则」与「界面文案」两类。
- * 原型里按钮/标签文案极多（去购买×4、用户头像×N），去重计数避免刷屏。
+ * 原型里按钮/标签文案极多（去购买×4、用户头像×N），去重计数避免刷屏；
+ * 规则块同理——画布页上同一块 UI 状态图会复制出多份相同说明（如飘屏文案×10），按整块文本合并。
  */
-function groupBlocks(blocks?: AxureBlock[]): BlockGroups {
+function splitBlocks(blocks?: AxureBlock[]): BlockGroups {
   const rules: BlockGroups['rules'] = [];
+  const ruleSeen = new Map<string, BlockGroups['rules'][number]>();
+  let rulesTotal = 0;
   const labelMap = new Map<string, { type: string; count: number }>();
 
   for (const b of blocks || []) {
@@ -65,11 +70,20 @@ function groupBlocks(blocks?: AxureBlock[]): BlockGroups {
       if (prev) prev.count += 1;
       else labelMap.set(b.lines[0], { type: b.type, count: 1 });
     } else {
-      rules.push({ type: b.type, lines: b.lines });
+      const key = b.lines.join('\n');
+      const prev = ruleSeen.get(key);
+      if (prev) prev.count += 1;
+      else {
+        const entry = { type: b.type, lines: b.lines, count: 1 };
+        ruleSeen.set(key, entry);
+        rules.push(entry);
+      }
+      rulesTotal += 1;
     }
   }
   return {
     rules,
+    rulesTotal,
     labels: [...labelMap.entries()].map(([text, v]) => ({ text, ...v })),
   };
 }
@@ -87,9 +101,56 @@ function renderImages(page: MergedPage): string {
   return `**内嵌原型图**：${imgs.length} 张（${dimsText}）\n\n`;
 }
 
-/** 渲染未解析页面的文字：画布型页面用空间区块，否则纯文字兜底 */
+/** 去除全部空白，用于重复 / 覆盖判定 */
+const squash = (s: string): string => s.replace(/\s+/g, '');
+
+/**
+ * 清理「页面文字」兜底文本流。它是 innerText 式的一维导出，画布页内容多时
+ * 与上方表格 / 控件块大面积重复，且混有 `<`、`?` 等纯符号控件占位。三步清理：
+ * ① 去纯符号行；② 去整行重复；③ 剔除已被结构化内容覆盖的行。
+ * 覆盖语料 = 表格单元格（按 <br>/换行 拆原子）+ 控件块文本行，按原顺序拼接——
+ * domText 的整段长行正是一块控件行以空格连接（axure-dom 的导出方式），
+ * 去空白后恰好是语料里的连续子串，可被包含判定命中。
+ */
+function cleanDomText(page: MergedPage): { lines: string[]; removed: number } {
+  const corpusParts: string[] = [];
+  for (const t of page.tables || []) {
+    [...(t.headers || []), ...(t.rows || []).flat()].forEach((c) =>
+      String(c ?? '')
+        .split(/<br\s*\/?>|\n/)
+        .forEach((a) => corpusParts.push(squash(a)))
+    );
+  }
+  for (const b of page.blocks || []) (b.lines || []).forEach((l) => corpusParts.push(squash(l)));
+  const corpus = corpusParts.join('');
+
+  const seen = new Set<string>();
+  const lines: string[] = [];
+  let removed = 0;
+  for (const raw of page.domText.split('\n')) {
+    const t = raw.trim();
+    if (!t) continue;
+    // 纯符号行（无文字/数字/中文）：关闭按钮、问号占位等，无信息量
+    if (/^[^\w\u4e00-\u9fa5]+$/.test(t)) { removed += 1; continue; }
+    const norm = squash(t);
+    if (seen.has(norm)) { removed += 1; continue; }
+    seen.add(norm);
+    // 已被表格/控件块覆盖：1 字行不做包含判定，避免误伤单字文案
+    if (corpus && norm.length >= 2 && corpus.includes(norm)) { removed += 1; continue; }
+    lines.push(t);
+  }
+  return { lines, removed };
+}
+
+/** 渲染未解析页面的文字：画布型页面用空间区块，否则纯文字兜底（已去重去噪） */
 function renderDomFallback(page: MergedPage): string {
   if (page.sections?.length) {
+    // 控件块已带区块归属（sec）时，内容在 renderBlocks 里按区块分组输出过了，
+    // 这里再 dump 一遍区块文本就是重复，只留索引行（末尾 w=0 的是散落伪区块，不计入）
+    if ((page.blocks || []).some((b) => b.sec !== undefined)) {
+      const real = page.sections.filter((s) => s.w > 0).length;
+      return `> 画布共 ${real} 个界面区块，文案已按区块归组见上「界面区块」\n\n`;
+    }
     let out = `**空间区块**（画布型页面，按大内嵌图锚点切分为 ${page.sections.length} 块，每块通常对应一个界面/弹窗）：\n\n`;
     page.sections.forEach((sec, i) => {
       const imgNote = sec.images ? ` · 含 ${sec.images} 张内嵌图` : '';
@@ -98,16 +159,42 @@ function renderDomFallback(page: MergedPage): string {
     return out;
   }
   if (page.domText) {
-    return `**页面文字**（未经视觉解析，表格/图形布局可能已丢失）：\n\n${page.domText}\n\n`;
+    const { lines, removed } = cleanDomText(page);
+    if (!lines.length) return '';
+    const note = removed > 0 ? `；已剔除 ${removed} 行与上方重复/纯符号内容` : '';
+    return `**页面文字**（未经视觉解析，表格/图形布局可能已丢失${note}）：\n\n${lines.join('\n')}\n\n`;
   }
   return '';
 }
 
-/** 渲染一组表格（带标题/序号与备注） */
+/** 相邻且表头相同的表合并（Axure 常把一张长表按视图拆成两段，行序号连续） */
+function mergeAdjacentTables(tables: MergedTable[]): MergedTable[] {
+  const merged: MergedTable[] = [];
+  const headerKey = (t: MergedTable) => (t.headers || []).join('\u0001');
+  for (const t of tables) {
+    const prev = merged[merged.length - 1];
+    if (
+      prev &&
+      (t.headers?.length ?? 0) > 0 &&
+      headerKey(prev) === headerKey(t) &&
+      prev._source === t._source &&
+      (!t.title || t.title === prev.title)
+    ) {
+      prev.rows.push(...(t.rows || []));
+      if (t.notes) prev.notes = [prev.notes, t.notes].filter(Boolean).join('；');
+    } else {
+      // 拷贝后聚合：page.tables 还会原样写进结构化 JSON，不能原地改动
+      merged.push({ ...t, rows: [...(t.rows || [])] });
+    }
+  }
+  return merged;
+}
+
+/** 渲染一组表格（带标题/序号与备注；标题来自 VLM 或 DOM 空间推断，序号便于交叉引用） */
 function renderTables(tables: MergedTable[]): string {
   let out = '';
-  tables.forEach((table, i) => {
-    if (table.title) out += `**${table.title}**：\n\n`;
+  mergeAdjacentTables(tables).forEach((table, i) => {
+    if (table.title) out += `**表格 ${i + 1} · ${table.title}**：\n\n`;
     else out += `**表格 ${i + 1}**：\n\n`;
     out += tableToMarkdown(table) + `\n`;
     if (table.notes) out += `> 备注：${table.notes}\n\n`;
@@ -166,32 +253,94 @@ function renderDomFlow(flow: AxureFlow, detailLevel: DetailLevel): string {
   return out;
 }
 
-/** 渲染「说明与规则 + 界面文案」两块（结构化 DOM 提取的主产出） */
-function renderBlocks(page: MergedPage, detailLevel: DetailLevel): string {
-  const { rules, labels } = groupBlocks(page.blocks);
-  if (!rules.length && !labels.length) return '';
-
+/** 规则/说明块渲染为条目列表（整块去重 ×N；块内多行作子条目） */
+function renderRuleList(rules: BlockGroups['rules']): string {
   let out = '';
-  if (rules.length) {
-    out += `**说明与规则**（${rules.length} 条，DOM 确定性提取）：\n\n`;
-    rules.forEach((r) => {
-      out += `- ${r.lines[0]}\n`;
-      r.lines.slice(1).forEach((l) => { out += `  - ${l}\n`; });
-    });
-    out += `\n`;
+  rules.forEach((r) => {
+    out += `- ${r.lines[0]}${r.count > 1 ? ` ×${r.count}` : ''}\n`;
+    r.lines.slice(1).forEach((l) => { out += `  - ${l}\n`; });
+  });
+  return out;
+}
+
+/** 界面文案渲染为单行内联清单（去重 ×N；比逐条 bullet 省行数，适合区块内少量文案） */
+function renderLabelsInline(labels: BlockGroups['labels']): string {
+  if (!labels.length) return '';
+  return labels.map((l) => `${l.text}${l.count > 1 ? ` ×${l.count}` : ''}`).join('、');
+}
+
+/**
+ * 渲染「说明与规则 + 界面文案」两块（结构化 DOM 提取的主产出）。
+ * 空间切分过的页面（block.sec 已标注）按界面区块分组：mockup 的示例文案归属到
+ * 所属界面，画布散落文字（全局规则/标题）单列一节，不再页面级平铺混作一堆；
+ * 未切分页面保持原有的平铺两段式。
+ */
+function renderBlocks(page: MergedPage, detailLevel: DetailLevel): string {
+  const blocks = page.blocks || [];
+  if (!blocks.length) return '';
+
+  if (!blocks.some((b) => b.sec !== undefined)) {
+    const { rules, rulesTotal, labels } = splitBlocks(blocks);
+    if (!rules.length && !labels.length) return '';
+
+    let out = '';
+    if (rules.length) {
+      const dupNote = rulesTotal > rules.length ? `，${rulesTotal - rules.length} 条重复已合并` : '';
+      out += `**说明与规则**（${rules.length} 条${dupNote}，DOM 确定性提取）：\n\n`;
+      out += renderRuleList(rules);
+      out += `\n`;
+    }
+
+    if (labels.length) {
+      const limit = detailLevel === 'full' ? Infinity : 60;
+      const shown = labels.slice(0, limit);
+      out += `**界面文案清单**（${labels.length} 个，已去重；\`类型\` 为 Axure 控件类型）：\n\n`;
+      shown.forEach((l) => {
+        out += `- ${l.text}${l.count > 1 ? ` ×${l.count}` : ''} \`${l.type}\`\n`;
+      });
+      if (shown.length < labels.length) {
+        out += `- …（其余 ${labels.length - shown.length} 个，用 detailLevel:full 查看全部）\n`;
+      }
+      out += `\n`;
+    }
+    return out;
   }
 
-  if (labels.length) {
-    const limit = detailLevel === 'full' ? Infinity : 60;
-    const shown = labels.slice(0, limit);
-    out += `**界面文案清单**（${labels.length} 个，已去重；\`类型\` 为 Axure 控件类型）：\n\n`;
-    shown.forEach((l) => {
-      out += `- ${l.text}${l.count > 1 ? ` ×${l.count}` : ''} \`${l.type}\`\n`;
+  // ── 按界面区块分组 ──────────────────────────────────────────
+  const groups = new Map<number, AxureBlock[]>();
+  blocks.forEach((b) => {
+    const key = b.sec === undefined ? -1 : b.sec; // 无坐标块（少量）归画布级
+    const list = groups.get(key);
+    if (list) list.push(b);
+    else groups.set(key, [b]);
+  });
+
+  let out = '';
+  const secKeys = [...groups.keys()].filter((k) => k >= 0).sort((a, b) => a - b);
+  if (secKeys.length) {
+    out += `**界面区块**（${secKeys.length} 块，按画布阅读序编号；每块的文案即该界面的 UI 文字与示例内容）：\n\n`;
+    secKeys.forEach((k) => {
+      const s = page.sections?.[k];
+      const pos = s ? `（y ${s.y}~${s.y + s.h}${s.images ? `，含 ${s.images} 张内嵌图` : ''}）` : '';
+      const g = splitBlocks(groups.get(k));
+      out += `##### 区块 ${k + 1}${pos}\n\n`;
+      if (g.labels.length) out += `界面文案：${renderLabelsInline(g.labels)}\n\n`;
+      if (g.rules.length) {
+        out += `示例与说明：\n${renderRuleList(g.rules)}\n`;
+      }
     });
-    if (shown.length < labels.length) {
-      out += `- …（其余 ${labels.length - shown.length} 个，用 detailLevel:full 查看全部）\n`;
+  }
+
+  const canvas = groups.get(-1);
+  if (canvas?.length) {
+    const g = splitBlocks(canvas);
+    if (g.rules.length || g.labels.length) {
+      const dupNote = g.rulesTotal > g.rules.length ? `，${g.rulesTotal - g.rules.length} 条重复已合并` : '';
+      out += `**画布级说明与规则**（不邻近任何界面截图的文字——全局规则 / 页面标题 / 交叉备注；${g.rules.length} 条${dupNote}）：\n\n`;
+      out += renderRuleList(g.rules);
+      if (g.labels.length) out += `\n画布文案：${renderLabelsInline(g.labels)}\n`;
+      out += `\n`;
     }
-    out += `\n`;
   }
   return out;
 }
@@ -417,8 +566,10 @@ function generateTableSection(page: MergedPage, index: number | null): string {
   // 配置表页也常有规则说明，来自 DOM 结构化提取
   section += renderBlocks(page, 'standard');
   if (!page._hasVLM && page.domText) {
-    const firstLines = page.domText.split('\n').slice(0, 5).join('\n');
-    section += `**页面文字**（未视觉解析）：\n\n${firstLines}\n\n`;
+    const { lines } = cleanDomText(page);
+    if (lines.length) {
+      section += `**页面文字**（未视觉解析，已去重去噪）：\n\n${lines.slice(0, 5).join('\n')}\n\n`;
+    }
   }
   section += renderPageWarnings(page);
   return section;

@@ -61,6 +61,8 @@ export interface PageImage {
 export interface DomTable {
   headers: string[];
   rows: string[][];
+  /** 表格边界矩形（.table_cell 的 viewbox 画布坐标聚合），用于标题推断与空间定位；真 <table> 兜底提取时缺省 */
+  rect?: { x: number; y: number; w: number; h: number } | null;
 }
 
 import type { AxureBlock, AxureFlow } from './axure-dom.js';

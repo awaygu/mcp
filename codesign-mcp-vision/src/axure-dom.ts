@@ -35,6 +35,8 @@ export interface AxureBlock {
   imgs: number;
   /** 控件矩形；无坐标信息时为 null */
   rect: { x: number; y: number; w: number; h: number } | null;
+  /** 画布空间归属：≥0 = 第 N 个界面区块（y/x 阅读序，对应 sections 下标）；-1 = 画布散落文字（不邻近任何界面截图）。未做空间切分的页面缺省 */
+  sec?: number;
 }
 
 /** 流程图节点（由带文本的控件充当） */
@@ -137,10 +139,16 @@ export function axureExtract(): AxureExtract {
   }
 
   /**
-   * 控件矩形：优先读内联 svg 的 viewbox（Axure 把画布坐标写在这里，不依赖 CSS/布局），
-   * 没有时退回 getBoundingClientRect（线上页面 CSS 已加载，坐标可用）。
+   * 控件矩形：优先 getBoundingClientRect——CoDesign 查看器的画布位置由运行时 JS
+   * 注入内联样式，渲染后即为真实文档坐标（提取发生在截图滚屏之前，无滚动偏移）。
+   * svg viewBox 只是控件局部坐标（原点在控件自身左上，y 只有 0~150 的小偏移），
+   * 不能反映画布位置，仅作布局未就绪（gBCR 退化）时的兜底。
    */
   function rectOf(el: Element): Rect | null {
+    const r = el.getBoundingClientRect();
+    if (r.width >= 1 && r.height >= 1) {
+      return { x: r.left, y: r.top, w: r.width, h: r.height };
+    }
     const svg = el.querySelector('svg[viewbox], svg[viewBox]');
     if (svg) {
       const raw = svg.getAttribute('viewbox') || svg.getAttribute('viewBox') || '';
@@ -149,9 +157,7 @@ export function axureExtract(): AxureExtract {
         return { x: vb[0], y: vb[1], w: vb[2], h: vb[3] };
       }
     }
-    const r = el.getBoundingClientRect();
-    if (r.width < 1 || r.height < 1) return null;
-    return { x: r.left, y: r.top, w: r.width, h: r.height };
+    return null;
   }
 
   // ─── 1. 内嵌原型图 ─────────────────────────────────────────
@@ -216,7 +222,19 @@ export function axureExtract(): AxureExtract {
     const filled = grid.flat().filter((c) => c !== '').length;
     const cellsTotal = rowKeys.length * colKeys.length;
     if (rowKeys.length >= 2 && colKeys.length >= 2 && filled / cellsTotal >= 0.3) {
-      tables.push({ headers: grid[0], rows: grid.slice(1) });
+      // 边界矩形：供标题推断（找表格旁边的标注文本块）与空间定位
+      const x0 = Math.min(...items.map((it) => it.r.x));
+      const y0 = Math.min(...items.map((it) => it.r.y));
+      tables.push({
+        headers: grid[0],
+        rows: grid.slice(1),
+        rect: {
+          x: x0,
+          y: y0,
+          w: Math.max(...items.map((it) => it.r.x + it.r.w)) - x0,
+          h: Math.max(...items.map((it) => it.r.y + it.r.h)) - y0,
+        },
+      });
     }
   });
 
@@ -268,7 +286,8 @@ export function axureExtract(): AxureExtract {
   }
 
   function buildSections(): PageSection[] {
-    if (tables.length > 0) return []; // 表格页是文档型内容，不做画布切分
+    // 不再按「有表格就跳过」豁免：表格 + 界面截图混排的画布页恰恰需要切分，
+    // 把 mockup 示例文案归到所属界面；纯表格页通常没有 ≥250×200 的内嵌大图，锚点为空自然不切
     const bigImgs = images.filter((im) => im.width >= 250 && im.height >= 200).length;
     const withRect = blocks.filter((b) => b.rect && (b.lines.length || b.imgs));
     if (!withRect.length) return [];
@@ -293,6 +312,7 @@ export function axureExtract(): AxureExtract {
     });
 
     const out: PageSection[] = [];
+    const anchorSec = new Map<number, number>();
     anchors
       .map((a, i) => ({ a, i }))
       .sort((p, q) => p.a.y - q.a.y || p.a.x - q.a.x)
@@ -304,6 +324,7 @@ export function axureExtract(): AxureExtract {
           return pr.y - qr.y || pr.x - qr.x;
         });
         if (!list.length) return;
+        anchorSec.set(entry.i, out.length);
         out.push({
           x: Math.round(a.x), y: Math.round(a.y), w: Math.round(a.w), h: Math.round(a.h),
           text: list.map((b) => b.lines.join('\n')).filter(Boolean).join('\n'),
@@ -311,7 +332,15 @@ export function axureExtract(): AxureExtract {
         });
       });
 
+    // 区块归属回写到控件块：文档生成据此按界面分组，而不是页面级平铺
+    clusters.forEach((list, rawIdx) => {
+      const s = anchorSec.get(rawIdx);
+      if (s === undefined) return;
+      list.forEach((b) => { b.sec = s; });
+    });
+
     if (scattered.length) {
+      scattered.forEach((b) => { b.sec = -1; });
       const first = scattered[0].rect as Rect;
       out.push({
         x: Math.round(first.x), y: Math.round(first.y), w: 0, h: 0,
