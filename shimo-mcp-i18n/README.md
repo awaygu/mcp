@@ -40,7 +40,8 @@ npm run build    # esbuild 打包到 dist/index.js（单文件）
       "command": "node",
       "args": ["./mcp/shimo-mcp-i18n/dist/index.js"],
       "env": {
-        "SHIMO_COOKIE_FILE": "./.mcp-local/shimo.cookie"
+        "SHIMO_COOKIE_FILE": "./.mcp-local/shimo.cookie",
+        "SHIMO_URL": "https://shimo.im/sheets/xxx/yyy"
       }
     }
   }
@@ -52,10 +53,12 @@ npm run build    # esbuild 打包到 dist/index.js（单文件）
 | 工具 | 作用 | 关键入参 |
 |---|---|---|
 | `shimo_check_auth` | 探活 cookie（可顺带返回文档名/权限/更新时间） | `url?` / `cookie` |
-| `shimo_read_sheet` ⭐ | 读单个工作表：表头+数据行（带 `_row` 石墨行号），自动识别语言列 | `url` / `sheet` / `rows?` / `languages?` / `limit?` |
-| `shimo_list_sheets` | 列出全部工作表名（走 xlsx 导出通道解析，约 5~20s） | `url` |
-| `shimo_export_xlsx` | 导出 xlsx 落盘；传 `sheet` 则从整文档抽取该单个工作表另存为独立 xlsx | `url` / `sheet?` / `outputPath?` / `fileName?` |
-| `shimo_export_i18n` | 生成各语言 key→文案映射（直接返回或落盘 `<lang>.json`） | `url` / `sheet` / `languages?` / `keyColumn?` / `outputPath?` |
+| `shimo_read_sheet` ⭐ | 读单个工作表：表头+数据行（带 `_row` 石墨行号），自动识别语言列 | `url?` / `sheet` / `rows?` / `languages?` / `limit?` |
+| `shimo_list_sheets` | 列出全部工作表名（走 xlsx 导出通道解析，约 5~20s） | `url?` |
+| `shimo_export_xlsx` | 导出 xlsx 落盘；传 `sheet` 则从整文档抽取该单个工作表另存为独立 xlsx | `url?` / `sheet?` / `outputPath?` / `fileName?` |
+| `shimo_export_i18n` | 生成各语言 key→文案映射（直接返回或落盘 `<lang>.json`） | `url?` / `sheet` / `languages?` / `keyColumn?` / `outputPath?` |
+
+`url?` 表示可不传：未传时使用环境变量 `SHIMO_URL` 配置的默认文档链接。
 
 ### 使用示例
 
@@ -110,10 +113,12 @@ xlsx 导出：POST /panda-api/drive/batch_downloads {guids:[guid]}
 |---|---|---|---|
 | `SHIMO_COOKIE` | 与 `SHIMO_COOKIE_FILE` 二选一 | — | 石墨登录 Cookie 串（F12 复制） |
 | `SHIMO_COOKIE_FILE` | 同上 | — | Cookie 文件路径（内容为完整 cookie 串，gitignore） |
+| `SHIMO_URL` | 否 | — | 默认石墨文档链接；工具调用不传 `url` 时使用 |
 | `SHIMO_BASE_URL` | 否 | `https://shimo.im` | 石墨端点（私有部署可改） |
 | `SHIMO_EXPORT_DIR` | 否 | `./.mcp-local` | `shimo_list_sheets` 临时产物落盘目录 |
 
 > cookie 优先级：工具入参 `cookie` > `SHIMO_COOKIE` > `SHIMO_COOKIE_FILE` 文件。
+> url 优先级：工具入参 `url` > `SHIMO_URL`；都没有时报错提示。注意 `SHIMO_URL` 是文档链接，`SHIMO_BASE_URL` 是站点端点，两者互不相干。
 
 ## 语言码对照（表头自动识别）
 

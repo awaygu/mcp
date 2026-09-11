@@ -39,10 +39,13 @@ function credentials(args: { cookie?: string }): Credentials {
   return { cookie };
 }
 
-/** 解析 url/id 入参：必须能提取 guid */
+/** 解析 url/id 入参：入参 > SHIMO_URL（默认文档链接），最终必须能提取 guid */
 function requireGuid(url?: string): string {
-  if (!url) throw new Error('缺少 url 参数（石墨文档链接，如 https://shimo.im/sheets/xxx/yyy）');
-  return extractFileId(url);
+  const resolved = url || process.env.SHIMO_URL;
+  if (!resolved) {
+    throw new Error('缺少 url 参数（石墨文档链接，如 https://shimo.im/sheets/xxx/yyy），且未设置环境变量 SHIMO_URL');
+  }
+  return extractFileId(resolved);
 }
 
 // ─── Server ─────────────────────────────────────────────────────
@@ -57,6 +60,7 @@ const server = new McpServer(
       '3. shimo_read_sheet 读单个工作表：默认返回前 200 行；文档更新后只看改动时传 rows:[行号]（行号=石墨 UI 行号，表头恒在第 1 行），或 languages:[语言码] 只要某几列。',
       '4. shimo_export_xlsx 把整个文档导出为 xlsx 落盘（本地解析出 sheet 清单；产物可直接给 Excel 用户）。',
       '5. 色值/文案一律以结构化数据为准，不要用截图 OCR。',
+      '6. url 可用环境变量 SHIMO_URL 预置默认文档链接，配置后调用无需重复传 url。',
     ].join('\n'),
   }
 );
@@ -71,12 +75,13 @@ server.registerTool(
       '任何 shimo 工具报 401/403 或空数据时先调本工具：ok=true 但仍 403 → 是该文档无权限（找文档所有者开通）；' +
       'reason=cookie_expired → 真过期，提示用户重新登录 shimo.im 复制 Cookie 更新配置。',
     inputSchema: {
-      url: z.string().optional().describe('石墨文档链接（可选；传了会顺带返回该文档的名称/权限/更新时间）'),
+      url: z.string().optional().describe('石墨文档链接；不传时使用环境变量 SHIMO_URL（都没有则只探活 cookie，不返回文档信息）'),
       cookie: z.string().optional(),
     },
   },
   async (args) => {
-    const guid = args.url ? extractFileId(args.url) : undefined;
+    const docUrl = args.url || process.env.SHIMO_URL;
+    const guid = docUrl ? extractFileId(docUrl) : undefined;
     const result = await checkAuth(credentials(args), guid);
     return { content: [{ type: 'text', text: JSON.stringify(result) }] };
   }
@@ -92,7 +97,7 @@ server.registerTool(
       '支持增量场景：rows 传行号列表只取指定行（如只看上次缺失的行）；languages 传语言码/表头名只取指定列（如 ["en","ja"]）——文档更新后不必全量重拉。' +
       '默认最多 200 行，truncated=true 表示还有更多，用 rows 传后续行号（如 [201,202,…]）继续取。工作表名是石墨底部标签页名称。',
     inputSchema: {
-      url: z.string().describe('石墨文档链接'),
+      url: z.string().optional().describe('石墨文档链接；不传时使用环境变量 SHIMO_URL'),
       sheet: z.string().describe('工作表名（底部标签页名称，来自 shimo_list_sheets 或用户指定）'),
       rows: z.array(z.number()).optional().describe('只取这些行（石墨 UI 行号，1-based；表头恒在第 1 行自动带出）。增量/补拉场景用'),
       languages: z.array(z.string()).optional().describe('只取这些语言列（语言码 en/in/ms/pt/es/hi/vi/tr/ar/zh-TW… 或表头原文「英文/印尼语」）。默认全部列'),
@@ -139,7 +144,7 @@ server.registerTool(
       '列出石墨表格的全部工作表名（底部标签页）。石墨没有 sheet 清单 API，本工具走一次 xlsx 导出通道并本地解析（约 5~20 秒），' +
       '顺带返回每个工作表的行列数、表头语言列与落盘的 xlsx 路径。结果较稳定可少量复用；仅需要数据时直接用 shimo_read_sheet。',
     inputSchema: {
-      url: z.string().describe('石墨文档链接'),
+      url: z.string().optional().describe('石墨文档链接；不传时使用环境变量 SHIMO_URL'),
       cookie: z.string().optional(),
     },
   },
@@ -186,7 +191,7 @@ server.registerTool(
       '导出走石墨「批量下载」通道（整文档一个 xlsx，约 5~20 秒）；传 sheet 参数则从整文档 xlsx 中抽取该单个工作表另存为独立 xlsx 文件（零依赖本地重写）。' +
       '需要按语言拆分 JSON 时用 shimo_read_sheet 的数据自行组装。',
     inputSchema: {
-      url: z.string().describe('石墨文档链接'),
+      url: z.string().optional().describe('石墨文档链接；不传时使用环境变量 SHIMO_URL'),
       sheet: z.string().optional().describe('只导出这一个工作表（名称需精确匹配，来自 shimo_list_sheets）。不传=导出整文档全部工作表'),
       outputPath: z.string().optional().describe('输出目录，默认 ./.mcp-local'),
       fileName: z.string().optional().describe('输出文件名（不含 .xlsx 也可），默认：整文档用文档名；单 sheet 用工作表名'),
@@ -262,7 +267,7 @@ server.registerTool(
       '读取指定工作表并生成各语言的 key→文案 映射 JSON（落盘或直接返回）。' +
       'key 列自动识别（key/文案名/中文列），语言列按表头自动识别；languages 可只导出指定语言。适合直接喂给前端 i18n 框架。',
     inputSchema: {
-      url: z.string().describe('石墨文档链接'),
+      url: z.string().optional().describe('石墨文档链接；不传时使用环境变量 SHIMO_URL'),
       sheet: z.string().describe('工作表名'),
       languages: z.array(z.string()).optional().describe('只要这些语言（语言码或表头名）。默认全部识别到的语言'),
       keyColumn: z.string().optional().describe('作为 key 的列名，默认按 key/文案名/中文 顺序自动识别'),
