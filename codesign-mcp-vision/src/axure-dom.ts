@@ -164,16 +164,24 @@ export function axureExtract(): AxureExtract {
 
   const images: PageImage[] = [];
   const imgRects: Rect[] = [];
-  container.querySelectorAll('img').forEach((img) => {
+  container.querySelectorAll('img').forEach((img, i) => {
     const r = img.getBoundingClientRect();
     const width = Math.round(r.width);
     const height = Math.round(r.height);
     if (width < 40 || height < 40) return;
+    const src = (img.currentSrc || img.src || '').slice(0, 200);
+    // Axure 的连接线由 *_segN.svg 逐段拼出，不是内容图；
+    // 图标级小图（<120px）通常是装饰，都不值得单独送视觉模型解析
+    const isSegment = /_seg\d+\.svg(\?|$)/i.test(src);
     images.push({
-      src: (img.currentSrc || img.src || '').slice(0, 200),
+      src,
       alt: img.alt?.trim() || '',
       width,
       height,
+      x: Math.round(r.left + window.scrollX),
+      y: Math.round(r.top + window.scrollY),
+      imgIndex: i,
+      isContent: !isSegment && width >= 120 && height >= 120,
     });
     imgRects.push({ x: r.left, y: r.top, w: width, h: height });
   });

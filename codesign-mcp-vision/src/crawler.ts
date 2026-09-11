@@ -15,13 +15,14 @@
 import { createHash } from 'crypto';
 import type { Frame, Page } from 'playwright';
 import { launchBrowser, getPage, waitForNetworkIdle } from './browser.js';
-import { capturePageSegments } from './screenshot.js';
+import { capturePageSegments, captureContentImageShots } from './screenshot.js';
 import { axureExtractExpression } from './axure-dom.js';
 import type {
   CrawledPage,
   ExtractedContent,
   NavigationResult,
   OutlineNode,
+  PageImage,
   ScreenshotResult,
   TreeMatchResult,
   TreeNode,
@@ -343,6 +344,23 @@ export async function extractPageText(): Promise<ExtractedContent> {
 }
 
 /**
+ * 采集当前页面「内容图」的定向截图（内嵌原型图/设计稿），供视觉模型单独解析。
+ * 已过滤连接线段与图标级小图（判定见 axure-dom 的 isContent）。
+ * 截图失败不抛错——它只是增强项，不该阻断主流程。
+ */
+export async function capturePageContentImages(
+  pageName: string,
+  images: PageImage[]
+): Promise<PageImage[]> {
+  try {
+    const frame = await getAxureFrame();
+    return await captureContentImageShots(frame, pageName, images);
+  } catch {
+    return [];
+  }
+}
+
+/**
  * 截取当前页面（分段截图，超长页面自动分段）
  * @param filename - 文件名（不含扩展名）
  * @param pageCacheKey - 页面级缓存键（url+页面名+文字哈希），命中时跳过截图
@@ -424,11 +442,13 @@ export async function getGroupPages(
           `${groupName}_分组页`,
           pageCacheKeyOf(url, target.path, text)
         );
+        const imageShots = await capturePageContentImages(target.name, images);
         results.push({
           pageName: target.name,
           text,
           tables,
           images,
+          imageShots,
           sections,
           blocks,
           flow,
@@ -500,11 +520,13 @@ export async function getGroupPages(
       pageCacheKeyOf(url, pageInfo.name, text)
     );
 
+    const imageShots = await capturePageContentImages(pageInfo.name, images);
     results.push({
       pageName: pageInfo.name,
       text,
       tables,
       images,
+      imageShots,
       sections,
       blocks,
       flow,
@@ -552,11 +574,13 @@ export async function getSinglePage(pageName: string, url?: string): Promise<Cra
     pageCacheKeyOf(url, located.target.path, text)
   );
 
+  const imageShots = await capturePageContentImages(pageName, images);
   return {
     pageName,
     text,
     tables,
     images,
+    imageShots,
     sections,
     blocks,
     flow,

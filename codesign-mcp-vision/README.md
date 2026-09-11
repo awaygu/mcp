@@ -24,7 +24,8 @@
 
 ```bash
 cd codesign-mcp-vision
-npm install            # 自动执行 prepare → npm run build 编译到 dist/
+npm install            # 只装依赖，不再自动构建
+npm run build          # 编译到 dist/index.js（首次或改 src/ 后需手动执行）
 npx playwright install chromium   # 仅首次需要
 ```
 

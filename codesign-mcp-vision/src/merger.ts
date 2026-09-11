@@ -343,6 +343,48 @@ function calcHeadersSimilarity(h1?: string[], h2?: string[]): number {
 /**
  * 合并多段普通页面解析结果
  */
+// ─── 播放器工具 UI 过滤 ────────────────────────────────────────
+
+/**
+ * 判定文本是否属于原型播放器自带的工具界面（而非产品需求内容）。
+ *
+ * 实测一份 714 行输出里「3/6」页码出现 33 次、「默认比例」19 次，全部来自
+ * Axure 播放器。这类噪音不仅无用，Agent 还可能照着生成页码组件。
+ * 只匹配设计工具专有名词，避免误伤产品自身的「顶部栏」「导航栏」等内容。
+ */
+function isToolUiText(text: unknown): boolean {
+  const t = String(text || '');
+  if (!t) return false;
+  if (/axure|figma|墨刀|mockplus|axshare|sketch/i.test(t)) return true;
+  if (/原型(播放器|查看器|工具|分页|文档)|设计工具|文档工具/.test(t)) return true;
+  if (/(默认|显示|缩放)比例|缩放(下拉|选项)/.test(t)) return true;
+  if (/翻页|上翻|下翻/.test(t)) return true;
+  if (/缩略图|画板总览/.test(t)) return true;
+  if (/查看器|播放器|分页控件|文档工具栏|设计工具(栏|条)|原型工具(栏|条)/.test(t)) return true;
+  // 页码（3/6）：仅在文本较短（组件名/类型）或明确含「页」时判定，避免误伤日期
+  if (/\d+\s*\/\s*\d+/.test(t) && (t.length <= 12 || /页/.test(t))) return true;
+  return false;
+}
+
+/** 过滤字符串数组中的工具 UI 条目 */
+function filterToolUiList(list: string[] | undefined): string[] {
+  return (list || []).filter((s) => !isToolUiText(s));
+}
+
+/** 过滤页面结构中的播放器工具 UI（组件 / 交互 / 状态 / 关键信息） */
+export function filterToolUi<T extends VlmPageStructure>(structure: T): T {
+  return {
+    ...structure,
+    components: (structure.components || []).filter(
+      (c) => !isToolUiText(c.name) && !isToolUiText(c.type) && !isToolUiText(c.description)
+    ),
+    interactions: filterToolUiList(structure.interactions),
+    states: filterToolUiList(structure.states),
+    states_detail: (structure.states_detail || []).filter((s) => !isToolUiText(s.element)),
+    key_info: filterToolUiList(structure.key_info),
+  };
+}
+
 export function mergePageStructures(segments: VlmResult[]): VlmPageStructure & VlmMeta {
   const valid = validSegments(segments);
   if (valid.length === 0) {
@@ -357,7 +399,7 @@ export function mergePageStructures(segments: VlmResult[]): VlmPageStructure & V
     };
   }
 
-  if (valid.length === 1) return valid[0];
+  if (valid.length === 1) return filterToolUi(valid[0]);
 
   valid.sort((a, b) => (a._segmentIndex || 0) - (b._segmentIndex || 0));
 
@@ -424,7 +466,7 @@ export function mergePageStructures(segments: VlmResult[]): VlmPageStructure & V
     .filter(Boolean)
     .join(' ');
 
-  return {
+  return filterToolUi({
     page_type: pageType,
     layout: layouts.join('\n'),
     components: mergedComponents,
@@ -433,7 +475,7 @@ export function mergePageStructures(segments: VlmResult[]): VlmPageStructure & V
     visual_hierarchy: visualHierarchy,
     key_info: mergedKeyInfo,
     _segmentCount: valid.length,
-  };
+  });
 }
 
 // ─── DOM 与 VLM 交叉验证 ──────────────────────────────────────
@@ -522,6 +564,78 @@ export function crossValidate(
   return { verified, warnings };
 }
 
+// ─── 数值冲突检测 ─────────────────────────────────────────────
+
+/** 「中文前缀 + 数字 + 单位」三元组，如「白银场20积分开启」→ 白银场 / 20 / 积分 */
+interface NumFact {
+  key: string;
+  value: string;
+  unit: string;
+}
+
+// 前缀须允许含数字：真实文案常写成「白银场获胜1场 +2积分」，纯中文前缀匹配不到后半段
+const NUM_UNIT_SOURCE =
+  '([\\u4e00-\\u9fa5A-Za-z0-9]{2,8})\\s*[:：+]?\\s*(\\d+(?:\\.\\d+)?)\\s*(积分|分|钻石|蓝宝石|元|天|个|场|级|%|K|W|M|D)';
+
+function extractNumFacts(text: string, dedupe = true): NumFact[] {
+  const re = new RegExp(NUM_UNIT_SOURCE, 'g');
+  const out: NumFact[] = [];
+  const seen = new Set<string>();
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const [, key, value, unit] = m;
+    const id = `${key}|${unit}`;
+    // dedupe：同一 key+unit 只取首次出现（VLM 多段重复时避免自相打架）
+    if (dedupe && seen.has(id)) continue;
+    seen.add(id);
+    out.push({ key, value, unit });
+  }
+  return out;
+}
+
+/**
+ * 检测 DOM 与 VLM 的数值冲突：同一「前缀+单位」在两边取值不同。
+ *
+ * DOM 表格是确定性提取，为真源；VLM 数值仅用于校验。实测出现过
+ * 「白银场 +3 积分（DOM）vs +2 积分（VLM）」这类矛盾被静默采信的情况——
+ * 现有 crossValidate 只校验「VLM 文字是否出现在 DOM 中」，查不出数值打架。
+ *
+ * 冲突不自动修正，只进「待确认项」交由人工判断（宁可多报，不可静默出错）。
+ */
+export function detectNumericConflicts(domText: string, vlmTexts: string[], max = 8): string[] {
+  if (!domText) return [];
+  // DOM 侧不去重：同一 key 常有多个不同语义的合法数值（如「白银场」既有 20 积分
+  // 开启门槛、又有获胜 +3 积分），只取首次会把不同含义的数字混为一谈
+  const domFacts = extractNumFacts(domText, false);
+  if (!domFacts.length) return [];
+
+  const domValues = new Map<string, Set<string>>();
+  for (const f of domFacts) {
+    const id = `${f.key}|${f.unit}`;
+    let set = domValues.get(id);
+    if (!set) domValues.set(id, (set = new Set()));
+    set.add(f.value);
+  }
+
+  const conflicts: string[] = [];
+  const seen = new Set<string>();
+  for (const text of vlmTexts) {
+    for (const f of extractNumFacts(text)) {
+      const id = `${f.key}|${f.unit}`;
+      const set = domValues.get(id);
+      // VLM 的值在 DOM 中出现过 → 视为一致，不报
+      if (!set || set.has(f.value) || seen.has(id)) continue;
+      seen.add(id);
+      const recorded = [...set].slice(0, 3).join('、');
+      conflicts.push(
+        `「${f.key}」VLM 识别为 ${f.value}${f.unit}，DOM 中未出现该值（DOM 记录：${recorded}${f.unit}）——以 DOM 为准，请复核`
+      );
+      if (conflicts.length >= max) return conflicts;
+    }
+  }
+  return conflicts;
+}
+
 // ─── 统一合并入口 ─────────────────────────────────────────────
 
 /**
@@ -532,6 +646,7 @@ export function mergePageResult({
   domText,
   domTables = [],
   images = [],
+  imageAnalysis,
   sections,
   blocks,
   flow = null,
@@ -574,6 +689,29 @@ export function mergePageResult({
   );
   warnings.push(...validateWarnings);
 
+  // 2.5 数值冲突检测：DOM 为唯一真源，VLM 数值仅用于校验（不覆盖、不自动修正）
+  const vlmNumericTexts: string[] = [
+    ...(verified.key_info || []),
+    ...(verified.interactions || []),
+    ...(verified.states || []),
+    ...(verified.components || []).flatMap((c) => [c.name ?? '', c.description ?? '']),
+    ...(verified.nodes || []).map((n) => n.text ?? ''),
+    ...(verified.tables || []).flatMap((t) => (t.rows || []).map((r) => r.join(' '))),
+    // 图内文字（P1 新增数据源）：同样会携带与 DOM 冲突的数值，
+    // 实测「积分规则图」写着 +1/+2/+3/+5，而 DOM 表格是 1/3/5/15——必须纳入比对
+    ...(imageAnalysis || []).flatMap((a) => [a.summary ?? '', ...(a.texts || [])]),
+  ].filter(Boolean);
+  warnings.push(...detectNumericConflicts(domText, vlmNumericTexts));
+
+  // 内嵌图解析失败必须显式告警：图内文字是数值冲突检测的输入之一，
+  // 静默丢图会连带让本该报出的冲突消失（实测「积分规则图」+2/+3/+5 vs DOM 1/3/5/15）
+  const failedImageCount = (imageAnalysis || []).filter((a) => a.error).length;
+  if (failedImageCount > 0) {
+    warnings.push(
+      `内嵌图解析失败 ${failedImageCount} 张，未产出图内文字，该部分数值未经校验，建议重跑或人工查看截图`
+    );
+  }
+
   // 3. 合并 DOM 表格与 VLM 表格
   // DOM 表格来自 .table_cell 语义网格，是确定性的，排在前面；
   // VLM 表格作为补充（DOM 提取不到时才真正有价值），标记 _source 供人工复核。
@@ -609,6 +747,7 @@ export function mergePageResult({
     sections,
     blocks,
     flow,
+    imageAnalysis,
     vlmResult: verified,
     warnings,
     _segmentCount: screenshotCount || vlmSegments.length,

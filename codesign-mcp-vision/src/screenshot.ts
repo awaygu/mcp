@@ -14,7 +14,7 @@ import { createHash } from 'crypto';
 import type { Frame } from 'playwright';
 import { getPage } from './browser.js';
 import { safeName, sleep } from './utils.js';
-import type { ScreenshotResult } from './types.js';
+import type { PageImage, ScreenshotResult } from './types.js';
 
 const SCREENSHOT_DIR = path.join(process.cwd(), '.codesign-mcp', 'screenshots');
 const PAGE_CACHE_DIR = path.join(process.cwd(), '.codesign-mcp', 'pagecache');
@@ -438,4 +438,46 @@ function planNeededCells(rects: ContentRect[], plan: GridPlan): Set<number> | nu
 export async function captureSinglePage(filename: string, frame?: Frame): Promise<string> {
   const result = await capturePageSegments(filename, frame ?? null);
   return result.segments[0] || '';
+}
+
+/** 单页内嵌图定向截图上限：画布型页面可能有几十张，全截会拖慢并重复烧 token */
+const MAX_CONTENT_IMAGES = 20;
+
+/**
+ * 对页面内的「内容图」逐个定向截图。
+ *
+ * 与整页分段截图的区别：
+ * - 画面只含这一张图 → 识别更准，且同一张图不会在多个分段里被重复解析
+ * - 已过滤连接线段（*_segN.svg）与图标级小图（见 axure-dom 的 isContent 判定）
+ * 截图失败（元素被遮挡/不可见）的图直接跳过，不影响主流程。
+ *
+ * @returns 填充了 localPath 的图列表
+ */
+export async function captureContentImageShots(
+  frame: Frame | null,
+  pageName: string,
+  images: PageImage[]
+): Promise<PageImage[]> {
+  if (!frame) return [];
+  const targets = images.filter((im) => im.isContent && im.imgIndex !== undefined);
+  if (!targets.length) return [];
+
+  const dir = path.join(SCREENSHOT_DIR, `${safeName(pageName)}_imgs`);
+  fs.mkdirSync(dir, { recursive: true });
+
+  const out: PageImage[] = [];
+  for (const [i, im] of targets.entries()) {
+    if (out.length >= MAX_CONTENT_IMAGES) break;
+    const file = path.join(dir, `img${i + 1}.png`);
+    try {
+      await frame
+        .locator('img')
+        .nth(im.imgIndex as number)
+        .screenshot({ path: file, animations: 'disabled', timeout: 15000 });
+      out.push({ ...im, localPath: file });
+    } catch {
+      // 元素不可见/被遮挡/索引失效时跳过单张，不影响其余
+    }
+  }
+  return out;
 }

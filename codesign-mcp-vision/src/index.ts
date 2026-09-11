@@ -441,6 +441,7 @@ function typeLabel(type: PageType): string {
     flowchart: '流程图',
     table: '配置表',
     page: '普通页面',
+    image: '内嵌图',
   };
   return labels[type] || type;
 }

@@ -9,7 +9,7 @@
 // ─── 基础枚举 ─────────────────────────────────────────────────
 
 /** 页面解析类型：流程图 / 配置表 / 普通页面 */
-export type PageType = 'flowchart' | 'table' | 'page';
+export type PageType = 'flowchart' | 'table' | 'page' | 'image';
 
 /** 文档详细程度 */
 export type DetailLevel = 'summary' | 'standard' | 'full';
@@ -55,6 +55,25 @@ export interface PageImage {
   alt: string;
   width: number;
   height: number;
+  /** 文档坐标（含滚动偏移），用于定向裁剪与空间定位 */
+  x?: number;
+  y?: number;
+  /** 在所有 <img> 中的原始序号，供 Node 侧按序号定位元素做定向截图 */
+  imgIndex?: number;
+  /**
+   * 是否为内容图：已排除 Axure 连接线段（*_segN.svg）与微小装饰图标。
+   * 只有内容图才值得单独送视觉模型解析。
+   */
+  isContent?: boolean;
+  /** 定向截图落盘路径（captureContentImageShots 填充） */
+  localPath?: string;
+}
+
+/** 结构化视觉状态：{元素, 状态, 触发条件} */
+export interface VisualState {
+  element: string;
+  state: string;
+  condition?: string;
 }
 
 /** DOM 提取的表格 */
@@ -115,6 +134,8 @@ export interface CrawledPage extends ScreenshotResult {
   blocks?: AxureBlock[];
   /** 连接线几何还原的流程图拓扑 */
   flow?: AxureFlow | null;
+  /** 内容图定向截图（已过滤连接线段与图标），供内嵌图单独解析 */
+  imageShots?: PageImage[];
   /** 导航失败等原因写入，pipeline 会据此直接产出失败结果 */
   error?: string;
 }
@@ -186,6 +207,8 @@ export interface VlmPageStructure {
   states?: string[];
   visual_hierarchy?: string;
   key_info?: string[];
+  /** 结构化状态 {元素,状态,触发条件}：存在时优先于 states 渲染，states 保留兼容旧输出 */
+  states_detail?: VisualState[];
 }
 
 /**
@@ -218,10 +241,34 @@ export interface VlmMeta {
  * VLM 单段解析结果。三类 Prompt 产出的字段做成了联合——
  * 具体字段是否存在取决于 type，使用处按类型分支访问。
  */
+/** 内嵌图定向解析结果（type='image'）：只提取 DOM 拿不到的图内文字 */
+export interface VlmImageContent {
+  /** 这张图是什么（如「直播间界面截图」「活动规则海报」） */
+  summary?: string;
+  /** 图内可见文字，按阅读序 */
+  texts?: string[];
+  /** 是否主要是占位/示例数据（人气值、余额、时间戳等） */
+  is_placeholder?: boolean;
+  /** 是否有值得开发关注的真实需求信息 */
+  note?: string;
+}
+
 export type VlmResult = VlmFlowchart &
   VlmTableResult &
   VlmPageStructure &
+  VlmImageContent &
   VlmMeta;
+
+/** 单张内嵌图的解析产物（图 + 提取到的文字） */
+export interface ImageAnalysis {
+  src: string;
+  localPath: string;
+  summary?: string;
+  texts: string[];
+  isPlaceholder?: boolean;
+  note?: string;
+  error?: string;
+}
 
 /** 提交给全局并发队列的单段解析任务 */
 export interface SegmentTask {
@@ -264,6 +311,8 @@ export interface MergedPage {
   blocks?: AxureBlock[];
   /** 连接线几何还原的流程图（DOM 确定性提取） */
   flow?: AxureFlow | null;
+  /** 内嵌图定向解析结果（图内文字，DOM 提取不到） */
+  imageAnalysis?: ImageAnalysis[];
   vlmResult: VlmResult;
   warnings: string[];
   _segmentCount: number;
@@ -279,6 +328,8 @@ export interface MergePageInput {
   sections?: PageSection[];
   blocks?: AxureBlock[];
   flow?: AxureFlow | null;
+  /** 内嵌图定向解析结果（图内文字） */
+  imageAnalysis?: ImageAnalysis[];
   vlmSegments?: VlmResult[];
   type: PageType;
   screenshotCount?: number;

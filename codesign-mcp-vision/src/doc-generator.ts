@@ -17,6 +17,7 @@ const TYPE_LABELS: Record<PageType, string> = {
   flowchart: '流程图',
   table: '配置表',
   page: '普通页面',
+  image: '内嵌图',
 };
 
 /** 短文案阈值：单行且不超过该长度判定为「界面文案」，否则算「说明/规则」 */
@@ -345,6 +346,47 @@ function renderBlocks(page: MergedPage, detailLevel: DetailLevel): string {
   return out;
 }
 
+/**
+ * 渲染内嵌图定向解析结果——图内文字是 DOM 完全提取不到的部分，
+ * 因此单独成节并标注来源；纯占位数据的图不展开文字，避免噪音。
+ */
+function renderImageAnalysis(page: MergedPage): string {
+  const all = page.imageAnalysis || [];
+  const items = all.filter((a) => !a.error && (a.texts.length > 0 || a.summary));
+  const failed = all.filter((a) => a.error);
+  if (!items.length && !failed.length) return '';
+
+  let out = '';
+
+  // 解析失败的图显式点名，不再静默丢弃：否则文档看起来「内嵌图已全覆盖」，
+  // 而漏掉的恰恰可能是唯一携带业务规则的那张
+  if (failed.length) {
+    const names = failed
+      .map((a) => (a.localPath || a.src || '').split(/[\\/]/).pop() || '')
+      .filter(Boolean);
+    out += `**内嵌图解析失败**（${failed.length} 张，未产出图内文字）：${names.slice(0, 5).join('、')}${
+      names.length > 5 ? ` 等 ${names.length} 张` : ''
+    }——建议重跑或人工查看截图\n\n`;
+  }
+
+  if (!items.length) return out;
+
+  out += `**内嵌图文字**（${items.length} 张，DOM 提取不到，定向解析）：\n\n`;
+  for (const [i, a] of items.entries()) {
+    const label = a.summary || `图 ${i + 1}`;
+    if (a.isPlaceholder) {
+      // 示例数据（人气值/余额/时间戳等）对开发无意义，折叠成一行说明即可
+      out += `- ${label}：主要为示例数据${a.texts.length ? `（${a.texts.slice(0, 3).join('、')}）` : ''}，无需求信息\n`;
+      continue;
+    }
+    out += `- **${label}**\n`;
+    if (a.texts.length) out += `  - 图内文字：${a.texts.join(' / ')}\n`;
+    if (a.note) out += `  - 备注：${a.note}\n`;
+  }
+  out += `\n`;
+  return out;
+}
+
 /** 渲染 VLM 补充信息（组件/交互/状态/关键信息） */
 function renderVlmExtras(page: MergedPage, detailLevel: DetailLevel): string {
   const ps = page.vlmResult || {};
@@ -370,7 +412,15 @@ function renderVlmExtras(page: MergedPage, detailLevel: DetailLevel): string {
     ps.interactions.forEach((i) => { out += `- ${i}\n`; });
     out += `\n`;
   }
-  if (ps.states?.length && detailLevel !== 'summary') {
+  // 状态优先用结构化三元组（元素/状态/触发条件），无结构化结果时退回字符串列表
+  const statesDetail = (ps.states_detail || []).filter((s) => s.element || s.state);
+  if (statesDetail.length && detailLevel !== 'summary') {
+    out += `页面状态：\n\n| 元素 | 状态 | 触发条件 |\n|---|---|---|\n`;
+    statesDetail.forEach((s) => {
+      out += `| ${s.element || ''} | ${s.state || ''} | ${s.condition || '—'} |\n`;
+    });
+    out += `\n`;
+  } else if (ps.states?.length && detailLevel !== 'summary') {
     out += `页面状态：\n`;
     ps.states.forEach((s) => { out += `- ${s}\n`; });
     out += `\n`;
@@ -441,28 +491,34 @@ export function generateRequirementDoc({
   doc += `> 阅读说明：表格 / 流程 / 规则来自 DOM 确定性提取，可直接使用；标注「视觉模型补充」的内容来自 VLM，含推测成分；文末「待确认项」需人工核对。\n\n`;
   doc += `---\n\n`;
 
+  // 章节编号动态递增：三个正文章节都是条件渲染的，写死编号会在缺章时
+  // 出现「一、三 缺失而二、四 存在」的跳号，读起来像断章（对 AI Agent 更不友好）
+  const CN_NUM = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十'];
+  let sectionNo = 0;
+  const nextHeading = (title: string): string => `## ${CN_NUM[sectionNo++] ?? sectionNo}、${title}\n\n`;
+
   if (flowchartPages.length > 0) {
-    doc += `## 一、业务流程\n\n`;
+    doc += nextHeading('业务流程');
     flowchartPages.forEach((page, idx) => {
       doc += generateFlowchartSection(page, idx + 1, detailLevel, flowchartPages.length);
     });
   }
 
   if (normalPages.length > 0) {
-    doc += `## 二、页面详情\n\n`;
+    doc += nextHeading('页面详情');
     normalPages.forEach((page, idx) => {
       doc += generatePageSection(page, idx + 1, detailLevel);
     });
   }
 
   if (tablePages.length > 0) {
-    doc += `## 三、配置与规则\n\n`;
+    doc += nextHeading('配置与规则');
     tablePages.forEach((page, idx) => {
       doc += generateTableSection(page, idx + 1);
     });
   }
 
-  doc += generateAppendix(pages);
+  doc += generateAppendix(pages, sectionNo + 1);
   return doc;
 }
 
@@ -530,6 +586,7 @@ function generatePageSection(
 
   if (page.tables?.length) section += renderTables(page.tables);
   section += renderBlocks(page, detailLevel);
+  section += renderImageAnalysis(page);
   section += renderVlmExtras(page, detailLevel);
 
   // 空间区块 / 纯文字兜底：VLM 没覆盖时用 DOM 结构化结果顶上
@@ -589,11 +646,12 @@ export function generateSinglePageDoc(
   return doc;
 }
 
-/** 生成附录 */
-function generateAppendix(pages: MergedPage[]): string {
-  let appendix = `## 四、附录\n\n`;
+/** 生成附录。appendixNo 为附录的章节序号（1 起），用于保持与正文编号连续 */
+function generateAppendix(pages: MergedPage[], appendixNo: number): string {
+  const CN_NUM = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十'];
+  let appendix = `## ${CN_NUM[appendixNo - 1] ?? appendixNo}、附录\n\n`;
 
-  appendix += `### 4.1 解析来源与置信度\n\n`;
+  appendix += `### ${appendixNo}.1 解析来源与置信度\n\n`;
   appendix += `| 页面 | 类型 | 解析方式 | 分段数 | 表格 | 控件块 | 置信度 | 备注 |\n`;
   appendix += `|---|---|---|---|---|---|---|---|\n`;
 
@@ -626,7 +684,7 @@ function generateAppendix(pages: MergedPage[]): string {
   });
   appendix += `\n`;
 
-  appendix += `### 4.2 待确认项\n\n`;
+  appendix += `### ${appendixNo}.2 待确认项\n\n`;
   const allWarnings: string[] = [];
   pages.forEach((p) => {
     (p.warnings || []).forEach((w) => allWarnings.push(`[${p.pageName}] ${w}`));

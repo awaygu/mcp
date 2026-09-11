@@ -2,7 +2,7 @@
  * 文档输出清理回归验证：说明与规则去重 / 相邻同表头表格合并 / 页面文字去重去噪。
  * 用合成页面复现画布型大页的三类冗余，断言清理后输出。运行：npx tsx scripts/verify-doc-cleanup.ts
  */
-import { generateSinglePageDoc } from '../src/doc-generator.js';
+import { generateSinglePageDoc, generateRequirementDoc } from '../src/doc-generator.js';
 import type { MergedPage } from '../src/types.js';
 
 const CONGRATS = '恭喜【用户昵称】为【主播昵称】赢得【礼物名称】';
@@ -134,5 +134,40 @@ const titledDoc = generateSinglePageDoc(
   'standard'
 );
 check('表格标题渲染：编号 + 语义标题', titledDoc.includes(`**表格 1 · ${TITLE}**`));
+
+// ─── 章节编号连续性 ───────────────────────────────────────────
+// 三个正文章节都是条件渲染的，编号写死过 → 没有流程图页时会直接从标题跳到
+// 「二、页面详情」，读起来像断章。编号必须动态递增。
+const plainPage = { ...page, type: 'page' as const, tables: [], images: [], imageAnalysis: [] } as MergedPage;
+const docNoFlow = generateRequirementDoc({
+  groupName: 'G',
+  sourceUrl: 'u',
+  pages: [plainPage],
+  detailLevel: 'standard',
+});
+const headings = docNoFlow.match(/^## .+$/gm) || [];
+check(
+  '章节编号连续（无流程图页时页面详情为「一」）',
+  headings[0] === '## 一、页面详情' && headings[1] === '## 二、附录',
+  headings.join(' / ')
+);
+check('附录子编号跟随章节号', docNoFlow.includes('### 2.1 解析来源与置信度') && docNoFlow.includes('### 2.2 待确认项'));
+
+// ─── 内嵌图解析失败可见性 ──────────────────────────────────────
+// 失败图曾被静默丢弃：文档看上去「内嵌图已全覆盖」，实际漏掉的可能是关键规则图
+const docImgFail = generateSinglePageDoc(
+  {
+    ...page,
+    tables: [],
+    images: [],
+    imageAnalysis: [
+      { src: 'img14.png', localPath: 'shots/原型_imgs/img14.png', texts: [], error: 'VLM 返回内容无法解析为结构化结果' },
+      { src: 'img16.png', localPath: 'shots/原型_imgs/img16.png', texts: ['青铜场'], summary: '场次门槛图', isPlaceholder: false },
+    ],
+  } as MergedPage,
+  'standard'
+);
+check('内嵌图解析失败被点名而非静默丢弃', docImgFail.includes('**内嵌图解析失败**（1 张') && docImgFail.includes('img14.png'));
+check('正常图仍照常渲染', docImgFail.includes('**场次门槛图**') && docImgFail.includes('青铜场'));
 
 process.exit(failed ? 1 : 0);

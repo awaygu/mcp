@@ -54,7 +54,11 @@ let rateLimitPenaltyMs = 2000;
 const MAX_TOKENS = Math.max(1000, parseInt(process.env.VLM_MAX_TOKENS || '8192', 10) || 8192);
 
 // 改动下方任意 Prompt 时必须递增，否则会命中旧 Prompt 产生的缓存
-const PROMPT_VERSION = 'v1';
+const PROMPT_VERSION = 'v2';
+
+// 单段 VLM 输出 components 上限：画布型页面跨段重复严重（实测单段 30+ 组件，
+// 大半是重复描述与播放器工具 UI），限流后输出长度显著下降且不影响结构理解
+const MAX_COMPONENTS = 12;
 
 // 网关可能只认 /v1 或非 /v1 其中一条路径；探测成功的路径要记住，否则每次调用白付一次 404 往返
 let preferredUseV1: boolean | null = null;
@@ -322,8 +326,9 @@ async function callVLMWithRetry(content: ContentPart[], options: CallOptions = {
 /**
  * 根据页面名称和 DOM 文字判断页面类型
  */
-export function detectPageType(pageName: string, domText = ''): PageType {
-  const name = pageName.toLowerCase();
+export function detectPageType(pageName?: string, domText = ''): PageType {
+  // pageName 缺失时按空串处理：页面名只是加权项，DOM 结构才是主判据，不该因此整页崩溃
+  const name = (pageName || '').toLowerCase();
   const text = (domText || '').toLowerCase();
 
   // 流程图页面：页面名命中即判；正文判定收紧——单次偶然命中（如变更记录正文出现"送礼流程"）
@@ -419,11 +424,11 @@ function tablePrompt(segmentIndex: number, totalSegments: number, context?: stri
  */
 function pagePrompt(segmentIndex: number, totalSegments: number, pageText = '', context?: string): string {
   const textHint = pageText
-    ? `\n\n页面已提取的文字内容（辅助参考）：\n${pageText.slice(0, 2000)}`
+    ? `\n\n【已由 DOM 精确提取的文字——禁止重复输出】：\n${pageText.slice(0, 2000)}`
     : '';
   const segmentHint =
     totalSegments > 1
-      ? `\n注意：这是长页面的第 ${segmentIndex}/${totalSegments} 段，只描述你能看清的区域。`
+      ? `\n注意：这是长页面的第 ${segmentIndex}/${totalSegments} 段，只描述你能看清的区域，不要描述其他段已涵盖的内容。`
       : '';
 
   return `你是一个资深前端工程师和产品分析师。这是一张产品原型页面截图，请分析页面结构。${textHint}
@@ -435,11 +440,47 @@ function pagePrompt(segmentIndex: number, totalSegments: number, pageText = '', 
     {"name": "组件名称", "type": "按钮/列表/卡片/表单/表格/Tab/弹窗/进度条/标签等", "position": "位置描述", "description": "功能说明和当前状态"}
   ],
   "interactions": ["可交互元素及预期行为，如点击按钮弹出确认框"],
-  "states": ["页面可能的状态，如空状态/加载态/错误态/已签到/未签到"],
+  "states_detail": [
+    {"element": "元素名", "state": "状态（置灰/高亮/选中/禁用/加载/空态等）", "condition": "触发该状态的条件，看不出则留空"}
+  ],
+  "states": ["仅当无法结构化时才用；可留空"],
   "visual_hierarchy": "视觉层级说明（什么是主操作、什么是次要信息、什么是装饰元素）",
-  "key_info": ["页面中的关键信息元素，如标题、数据展示、状态标识、金额数字等"]
+  "key_info": ["页面中的关键信息元素，如标题、数据展示、状态标识等"]
 }${segmentHint}
+
+【输出约束，务必遵守】
+1. 禁止描述原型播放器的工具界面：页码（如 3/6）、缩放/默认比例下拉、翻页箭头、缩略图、画板导航、Axure/Figma 工具条、原型查看器与播放器控件。这些不是产品功能。
+2. 上面「已由 DOM 精确提取的文字」清单里出现过的内容，禁止在任何字段中重复输出——它已由确定性方式提取，重复只会产生噪音。你只需补充清单里没有的信息。
+3. 禁止输出任何量化数值（金额、积分、时长、ID、数量、门槛值）。数值以结构化表格为唯一真源，你只描述语义、状态与关系。
+4. components 最多 ${MAX_COMPONENTS} 个，按视觉重要性排序，只保留理解界面结构真正必需的。
+5. 状态优先用 states_detail 结构化输出（元素 / 状态 / 触发条件），states 仅在无法结构化时使用。
+6. 不确定或看不清的内容不要猜测，宁可留空。
+
 只输出 JSON，不要输出其他文字${contextHint(context)}`;
+}
+
+/**
+ * 内嵌图定向解析 Prompt
+ *
+ * 与整页截图解析的区别：只针对单张内嵌图（界面截图/设计稿/规则海报），
+ * 且只做一件事——提取 DOM 拿不到的图内文字。不做布局描述、不做组件猜测。
+ */
+function imagePrompt(context?: string): string {
+  return `这是一张产品原型里的内嵌图片（可能是界面截图、设计稿或规则海报），它的内容无法从页面 DOM 中提取。
+请只做一件事：把图里**看得见的文字**提取出来。
+
+请输出 JSON 格式：
+{
+  "summary": "一句话说明这张图是什么（如：直播间界面截图 / 活动规则海报 / 榜单设计稿）",
+  "texts": ["图内出现的文字，按从上到下、从左到右排序，保留原始文案"],
+  "is_placeholder": true,
+  "note": "图内是否有值得开发关注的真实需求信息；若主要是示例数据请说明"
+}
+说明：
+1. 只输出图中确实能看清的文字，不要推测、不要补全、不要翻译
+2. is_placeholder：若图内主要是占位/示例数据（如 98.3K 人气、62 余额、18:12 时间戳）填 true
+3. 不要描述布局、组件类型或视觉层级——这些由设计稿承担，不需要你输出
+4. 只输出 JSON，不要输出其他文字${contextHint(context)}`;
 }
 
 // ─── 单段解析 ─────────────────────────────────────────────────
@@ -466,6 +507,9 @@ export async function analyzeSingleImage(
       break;
     case 'table':
       prompt = tablePrompt(segmentIndex, totalSegments, context);
+      break;
+    case 'image':
+      prompt = imagePrompt(context);
       break;
     case 'page':
     default:

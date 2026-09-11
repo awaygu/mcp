@@ -26,6 +26,7 @@ const TYPE_LABELS: Record<PageType, string> = {
   flowchart: '流程图',
   table: '配置表',
   page: '普通页面',
+  image: '内嵌图',
 };
 
 /** 解析 --key=value 形式的命令行参数 */
