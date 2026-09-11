@@ -1,75 +1,138 @@
-# mcp
+<div align="center">
 
-个人 MCP server 集合容器。每个子目录是一个独立、零依赖、可直接分发的 MCP server。
+# 🧰 MCP Toolbox
 
-## 子项
+**让 AI Coding Agent 读懂设计稿、产品原型与多语言翻译表**
 
-| 目录 | 说明 | 接入方式 |
+蓝湖 · 腾讯 CoDesign · 石墨文档 —— 把国内团队日常开发里的"设计资产"，
+变成 AI 编码助手可直接消费的结构化数据。
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](https://nodejs.org/)
+[![Protocol](https://img.shields.io/badge/Model%20Context%20Protocol-stdio-blue)](https://modelcontextprotocol.io/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178c6)](https://www.typescriptlang.org/)
+
+</div>
+
+## 这解决什么问题
+
+AI 编码 Agent（Claude Code / Cursor / Trae / opencode…）写代码很快，但在国内团队的日常开发里，它一直缺几双"眼睛"：
+
+- 需求原型画在 **腾讯 CoDesign（Axure）** 里 —— 它读不到 PRD，只能靠你复制粘贴；
+- 设计稿挂在 **蓝湖** 上 —— 它拿不到精确的图层/色值/字号，只能靠截图 OCR 猜；
+- 翻译文案锁在 **石墨表格** 里 —— 它取不出 i18n 数据，只能让你手动导出。
+
+本仓库把这三步全部接进 [MCP 协议](https://modelcontextprotocol.io/)，形成一条 **"需求 → 设计 → 文案 → 验收"** 的 AI 编码数据供给闭环：
+
+```
+get_requirement_doc  →  拿到结构化 PRD（原型自动遍历 + 视觉解析）
+lanhu_fetch_design   →  拿到图层树精确数值（x/y/色值/字号/圆角…）
+        ↓  AI 写代码
+shimo_export_i18n    →  一键产出各语言 JSON（漏填自动预警）
+vision_defect_check  →  渲染结果 vs 设计稿验收（缺陷检测 / E2E 归因）
+```
+
+## 工具一览
+
+| MCP Server | 一句话 | 杀手级特性 |
 | --- | --- | --- |
-| `lanhu-mcp-vision/` | 蓝湖设计稿读取（官方 API + 分组枚举）+ 视觉理解/验收（UI 缺陷检测 / E2E 归因）的零依赖 stdio MCP server | 见其内 `README.md` 与 `.mcp.json` |
-| `codesign-mcp-vision/` | 腾讯 CoDesign 原型（Axure）读取：分段截图 + VLM 视觉解析，生成纯文本结构化需求文档（PRD）的 stdio MCP server | 见其内 `README.md` |
-| `shimo-mcp-i18n/` | 石墨文档多语言翻译表读取（Cookie 直调 values API，行号/语言过滤）+ xlsx 导出与 i18n JSON 生成的 stdio MCP server | 见其内 `README.md` 与 `.mcp.json` |
+| **[lanhu-mcp-vision](./lanhu-mcp-vision/)** | 蓝湖设计稿读取 + 视觉理解/验收 | 官方 API 结构化图层树（**不靠 OCR 猜小字**）；团队→项目→分组→稿 全层级枚举；切图下载；渲染对比 / UI 缺陷检测 / E2E 失败归因 |
+| **[codesign-mcp-vision](./codesign-mcp-vision/)** | 腾讯 CoDesign 原型 → 结构化 PRD | 一个调用遍历整个需求分组：分段截图 + VLM 解析成纯文本需求文档；大文档自动落盘防撑爆上下文；两级缓存，重跑秒回 |
+| **[shimo-mcp-i18n](./shimo-mcp-i18n/)** | 石墨多语言翻译表 → i18n JSON | Cookie 直调官方 values API（零浏览器依赖）；行号/语言列增量取数；自动识别语言列；`txt_中文首字码+行号` key 规则、分组行识别、漏填预警 |
 
-## 约定
+三者均为 **stdio MCP server**，可被任意支持 MCP 的宿主接入：Claude Code / Cursor / Trae / opencode / MCP Inspector…
 
-- **新增一个 MCP**：在仓库根建 `<your-mcp>/` 子目录，内部自带 `package.json` / `.mcp.json` / `README.md`，尽量零依赖。
-- 每个 MCP server 仅用 Node 内置模块实现 stdio JSON-RPC，可被 Trae / Cursor / Claude Code / opencode 等任意 Agent 通过 `.mcp.json` 注册。
-- 登录态 / 密钥放各子目录的 `.auth/`（已被各子目录 `.gitignore` 忽略），**勿提交**。
+## 30 秒接入（以 shimo 为例，无需任何 API Key）
 
-## 本地调试（MCP Inspector）
+```bash
+git clone https://github.com/awaygu/mcp-design-toolbox.git
+cd mcp/shimo-mcp-i18n && npm install && npm run build
+```
 
-三个 MCP 共用官方调试工具 [MCP Inspector](https://github.com/modelcontextprotocol/inspector)：命令行参数与环境变量可写进本地配置文件，Web UI 里可视化调用工具、查看 JSON-RPC 报文，免每次重填。
-
-仓库根建 `inspector.config.json`（已 gitignore，含明文密钥勿提交），`env` 写法与各项目 `.mcp.json` 的 env 块一致，可互搬：
+浏览器登录石墨 → F12 → Network → 复制任意请求的 `Cookie` 头，存进 `.mcp-local/shimo.cookie`，然后在项目根 `.mcp.json` 注册：
 
 ```json
 {
   "mcpServers": {
     "shimo-i18n": {
-      "type": "stdio",
       "command": "node",
-      "args": ["dist/index.js"],
-      "cwd": "/path/to/mcp/shimo-mcp-i18n",
-      "env": { "SHIMO_COOKIE_FILE": "./.mcp-local/shimo.cookie" }
-    },
-    "lanhu-vision": {
-      "type": "stdio",
-      "command": "node",
-      "args": ["dist/index.js"],
-      "cwd": "/path/to/mcp/lanhu-mcp-vision",
+      "args": ["D:/path/to/mcp/shimo-mcp-i18n/dist/index.js"],
       "env": {
-        "VLM_API_KEY": "sk-xxx",
-        "VLM_BASE_URL": "https://api.deepseek.com",
-        "VLM_MODEL": "deepseek-v4-flash-vision-exp",
-        "LANHU_COOKIE_FILE": "./.mcp-local/lanhu.cookie"
+        "SHIMO_COOKIE_FILE": "D:/path/to/.mcp-local/shimo.cookie",
+        "SHIMO_URL": "https://shimo.im/sheets/xxx/yyy"
       }
-    },
-    "codesign-vision": {
-      "type": "stdio",
-      "command": "node",
-      "args": ["dist/index.js"],
-      "cwd": "/path/to/mcp/codesign-mcp-vision",
-      "env": { "VLM_API_KEY": "sk-xxx" }
     }
   }
 }
 ```
 
+重启 Agent，直接说"读一下翻译表里的 1v1活动 工作表，导出 en/ar 的 i18n JSON"即可。✅
+
+> 蓝湖 / CoDesign 的接入分别见其目录内 README（蓝湖带双击即用的登录脚本；两者配一个 OpenAI 兼容视觉模型的 Key 即可解锁截图解析）。
+
+## 共同设计理念
+
+- **结构化数据优先**：精确数值一律来自 API / DOM（色值、行号、图层几何），视觉模型只做语义补充，禁止用截图 OCR 冒充精确数据。
+- **上下文友好**：分页读取、大文档自动落盘只回路径、解析结果按内容缓存——为大表/大原型做了大量"别撑爆 Agent 上下文"的工程。
+- **低依赖、可分发**：除官方 MCP SDK 外零强制依赖（蓝湖登录脚本可选装 Playwright），`npm run build` 后单文件分发。
+- **登录态安全**：Cookie/Key 只进本地 gitignore 文件（`.mcp-local/`、`.auth/`），不入库、不打日志。
+- **环境变量兜底**：`url` / `cookie` / 密码都遵循"工具入参 > 环境变量 > 文件"优先级，MCP 配置里写一次即可。
+
+## 目录结构
+
+```
+mcp/
+├── lanhu-mcp-vision/      # 蓝湖：读稿 + 视觉验收
+├── codesign-mcp-vision/   # CoDesign：原型 → PRD
+├── shimo-mcp-i18n/        # 石墨：翻译表 → i18n JSON
+└── scripts/               # 仓库级辅助脚本（Inspector 补丁等）
+```
+
+每个子目录自包含 `package.json` / `README.md` /（部分含）`.mcp.json` 示例，可独立使用、独立分发。
+
+## 本地调试（MCP Inspector）
+
+三个 MCP 共用官方调试工具 [MCP Inspector](https://github.com/modelcontextprotocol/inspector)：命令行参数与环境变量写进仓库根的本地配置文件 `inspector.config.json`（已 gitignore），Web UI 里可视化调用、查看 JSON-RPC 报文：
+
 ```bash
 npx @modelcontextprotocol/inspector --config inspector.config.json   # Web UI，下拉选 server
 ```
 
-要点：
+<details>
+<summary>调试要点（踩坑总结）</summary>
 
-- **`env` 即注入 server 进程的环境变量**；**`cwd` 写绝对路径**钉住子项目目录（官方文档未定义相对路径的解析基准），这样 `./.mcp-local/*.cookie` 相对路径才可靠——示例中 `/path/to/mcp` 是占位符，实际填本机仓库绝对路径。各项目完整环境变量表见其内 `README.md`。
-- **改代码免 build**：`command` 换 `"npx"`、`args` 换 `["tsx", "src/index.ts"]`（tsx 已在各项目 devDependencies）。
-- **三种加载方式**：`--config <path>` 只读（Inspector 保证不回写文件，明文密钥安全，文件缺失报错）；`--catalog <path>` 可写（UI 内编辑后保存回文件，首次不存在自动播种）；不带参数用全局 `~/.mcp-inspector/mcp.json`（可用 `MCP_CATALOG_PATH` 改）。`--config` 与 `--catalog` 互斥。
-- **`--server <名字>` 仅 `--cli` 模式生效**，可脱离 UI 脚本化调试：
-  `npx @modelcontextprotocol/inspector --config inspector-config.json --server shimo-i18n --cli --method tools/list`
-- 配置文件**不支持 `${VAR}` 插值**：密钥要么写实际值（配合 gitignore），要么只传 `*_COOKIE_FILE` 路径、真实 cookie 留 `.mcp-local/`。
-- **环境变量优先级：工具入参 > 环境变量 > cookie 文件**。曾设过的 `LANHU_COOKIE` / `SHIMO_COOKIE` 环境变量会压制文件内容——`login` 脚本续期写入文件后仍 401，就是旧环境变量在生效，删掉或统一走文件方式。
-- **npx / npm link**：三个子包均声明 `bin`，`npm install && npm run build` 后于子目录 `npm link` 即得全局命令；发布 npm 后 `npx -p <pkg> <pkg>` 可用。开发期 Agent 接入建议直接 `node` + `dist/index.js` 绝对路径（Windows 下部分 Agent 拉 npx 需 `cmd /c` 包一层）。
+- **`env` 即注入 server 进程的环境变量**；**`cwd` 写绝对路径**钉住子项目目录（官方未定义相对路径解析基准），`./.mcp-local/*.cookie` 相对路径才可靠。
+- **改代码免 build**：`command` 换 `"npx"`、`args` 换 `["tsx", "src/index.ts"]`。
+- **CLI 模式脚本化调试**：`--server <名字> --cli --method tools/list`；MCP Inspector web 模式有 60s 后端等待限制，跑一次根目录 `node scripts/patch-inspector.mjs` 解除（详见 codesign README）。
+- **配置文件不支持 `${VAR}` 插值**：密钥写实际值（配合 gitignore），或只传 `*_COOKIE_FILE` 路径。
+- **优先级陷阱**：工具入参 > 环境变量 > cookie 文件。设过 `LANHU_COOKIE`/`SHIMO_COOKIE` 旧环境变量会压制文件内容——login 脚本续期后仍 401 就是这个原因。
+
+</details>
+
+## FAQ
+
+<details>
+<summary><b>需要视觉模型吗？不配会怎样？</b></summary>
+
+不配也能用：蓝湖读稿走官方 API 纯结构化数据；石墨完全不需要。CoDesign 的原型解析和蓝湖的封面理解/渲染验收依赖视觉模型——配任意 **OpenAI Chat Completion 兼容**的 `VLM_BASE_URL` + `VLM_API_KEY` 即可（GLM / 通义 / DeepSeek / OpenAI 均可）。
+</details>
+
+<details>
+<summary><b>Cookie 会泄露吗？过期了怎么办？</b></summary>
+
+Cookie 是你的完整登录态，只发往对应服务的官方域名，写入本地 gitignore 文件，不入库、不打日志。过期后各工具会先探活区分「真过期」与「单文档无权限」，提示你重新复制；蓝湖还提供双击即用的登录脚本自动续期。
+</details>
+
+<details>
+<summary><b>私有部署 / 企业版服务能用吗？</b></summary>
+
+石墨支持 `SHIMO_BASE_URL` 指向私有部署端点；蓝湖/CoDesign 走官方云端 API。有需求欢迎提 issue。
+</details>
+
+## 贡献
+
+欢迎 PR / issue：新增工作流 MCP（在根目录建自包含子目录，参考现有三个的结构与 README 风格）、修复、文档改进都欢迎。顺手点个 ⭐ 就是最大的鼓励！
 
 ## License
 
-MIT —— 见 [LICENSE](./LICENSE)。
+[MIT](./LICENSE) © [awaygu](https://github.com/awaygu)
