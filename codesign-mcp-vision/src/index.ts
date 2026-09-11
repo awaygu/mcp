@@ -29,7 +29,7 @@ import { processPage, processPages } from './pipeline.js';
 import { generateRequirementDoc, generateSinglePageDoc } from './doc-generator.js';
 import { clearCache, cacheStats, cacheDir } from './cache.js';
 import { closeBrowser, getPage } from './browser.js';
-import { errorMessage, formatBytes, packageVersion } from './utils.js';
+import { errorMessage, formatBytes, packageVersion, createProgressNotifier, withHeartbeat } from './utils.js';
 import type { PageType } from './types.js';
 
 /** 访问凭据（分享链接 + 访问密码） */
@@ -131,12 +131,14 @@ server.registerTool(
         .describe('访问密码（4位）；不传时使用环境变量 CODESIGN_PASSWORD'),
     },
   },
-  async ({ url, password }) => {
+  async ({ url, password }, extra) => {
+    const notify = createProgressNotifier(extra);
     try {
       const text = await withBrowserLock(async () => {
         const access = resolveAccess(url, password);
-        await ensureOpened(access.url, access.password);
-        const outline = await getPageOutline();
+        await withHeartbeat(notify, () => ensureOpened(access.url, access.password), { stage: '打开原型' });
+        notify('提取页面目录…');
+        const outline = await withHeartbeat(notify, () => getPageOutline(), { stage: '提取目录' });
 
         const lines = ['# 原型页面大纲\n'];
         outline.forEach((item) => {
@@ -175,19 +177,27 @@ server.registerTool(
         .describe('文档详细程度：summary(精简)/standard(标准)/full(完整)，默认 standard'),
     },
   },
-  async ({ url, password, pageName, vlmEnabled = true, detailLevel = 'standard' }) => {
+  async ({ url, password, pageName, vlmEnabled = true, detailLevel = 'standard' }, extra) => {
+    const notify = createProgressNotifier(extra);
     try {
       const access = resolveAccess(url, password);
       // 爬取需要独占浏览器；VLM 只依赖已落盘的截图，放在锁外避免长时间占用
       const pageData = await withBrowserLock(async () => {
-        await ensureOpened(access.url, access.password);
-        return await getSinglePage(pageName, access.url);
+        await withHeartbeat(notify, () => ensureOpened(access.url, access.password), { stage: '打开原型' });
+        return await withHeartbeat(notify, () => getSinglePage(pageName, access.url), { stage: `定位页面「${pageName}」` });
       });
-      const merged = await processPage(pageData, access.url, {
-        vlmEnabled,
-        // 页面名作为业务背景注入 VLM prompt（仅供语义参考）
-        context: `页面名称：${pageName}`,
-      });
+      notify(`页面截图完成（${pageData.segments?.length || 0} 段），开始解析…`);
+      const merged = await withHeartbeat(
+        notify,
+        () =>
+          processPage(pageData, access.url, {
+            vlmEnabled,
+            // 页面名作为业务背景注入 VLM prompt（仅供语义参考）
+            context: `页面名称：${pageName}`,
+            onProgress: (m) => notify(m),
+          }),
+        { stage: 'VLM 解析' }
+      );
 
       const result = generateSinglePageDoc(merged, detailLevel);
 
@@ -231,35 +241,29 @@ server.registerTool(
   ) => {
     try {
       const access = resolveAccess(url, password);
-      // 进度通知：仅当宿主在请求 _meta 里给了 progressToken 才发；通知失败不影响主流程
-      const progressToken = extra?._meta?.progressToken;
-      let step = 0;
-      const notify = (message: string): Promise<void> => {
-        if (progressToken === undefined) return Promise.resolve();
-        return extra
-          .sendNotification({
-            method: 'notifications/progress',
-            params: { progressToken, progress: step++, message },
-          })
-          .catch(() => undefined);
-      };
+      const notify = createProgressNotifier(extra);
 
       // 爬取阶段独占浏览器（单页顺序导航无法并行）
       const pagesData = await withBrowserLock(async () => {
-        await ensureOpened(access.url, access.password);
+        await withHeartbeat(notify, () => ensureOpened(access.url, access.password), { stage: '打开原型' });
         return await getGroupPages(groupName, access.url, {
           pageNames,
-          onProgress: (m) => void notify(m),
+          onProgress: (m) => notify(m),
         });
       });
 
       // VLM 阶段不碰浏览器，放在锁外；所有页面的分段统一走一次全局并发
-      const mergedPages = await processPages(pagesData, access.url, {
-        vlmEnabled,
-        onProgress: (m) => void notify(m),
-        // 需求分组/页面名作为业务背景注入 VLM prompt（仅供语义参考，见 contextHint 的防锚定声明）
-        contextFor: (page) => `需求分组：${groupName}；页面：${page.pageName}`,
-      });
+      const mergedPages = await withHeartbeat(
+        notify,
+        () =>
+          processPages(pagesData, access.url, {
+            vlmEnabled,
+            onProgress: (m) => notify(m),
+            // 需求分组/页面名作为业务背景注入 VLM prompt（仅供语义参考，见 contextHint 的防锚定声明）
+            contextFor: (page) => `需求分组：${groupName}；页面：${page.pageName}`,
+          }),
+        { stage: 'VLM 解析' }
+      );
 
       const doc = generateRequirementDoc({
         groupName,
@@ -350,7 +354,8 @@ server.registerTool(
       imagePath: z.string().describe('流程图图片的本地文件路径'),
     },
   },
-  async ({ imagePath }) => {
+  async ({ imagePath }, extra) => {
+    const notify = createProgressNotifier(extra);
     try {
       if (!isVLMConfigured()) {
         return errorResult(
@@ -358,10 +363,16 @@ server.registerTool(
         );
       }
 
-      const flowchart = await analyzeSingleImage(imagePath, 'flowchart', {
-        segmentIndex: 1,
-        totalSegments: 1,
-      });
+      notify('提交 VLM 分析流程图…');
+      const flowchart = await withHeartbeat(
+        notify,
+        () =>
+          analyzeSingleImage(imagePath, 'flowchart', {
+            segmentIndex: 1,
+            totalSegments: 1,
+          }),
+        { stage: '流程图分析' }
+      );
       const mermaid = flowchartToMermaid(flowchart);
 
       let result = `# 流程图分析结果\n\n`;

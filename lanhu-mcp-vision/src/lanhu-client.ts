@@ -4,7 +4,7 @@
 import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
-import { normalizeSketch } from './normalize.js';
+import { normalizeSketch, toLegacySketchJson } from './normalize.js';
 import { compressSlicePng, coverTo1xJpeg } from './image.js';
 import type { Credentials, DesignLayer, DesignMeta, DesignResult, SectorInfo, SliceInfo } from './types.js';
 
@@ -213,11 +213,13 @@ async function fetchDesignByImageId(
     // CDN 403/404 常见于标注数据过期，需明确报状态码，别让 SyntaxError 刷屏
     if (!jsonRes.ok) throw new Error(`下载设计稿标注数据失败：HTTP ${jsonRes.status}（${jsonUrl}）`);
     const json = decodeJsonBody(await jsonRes.arrayBuffer(), jsonRes.headers.get('content-type') || '');
-    const norm = normalizeSketch(json);
+    // 新版插件格式（sketchPlugin 扁平 info[]）先转旧版树：normalize 与 artboard/切图提取都按旧结构走
+    const legacy = toLegacySketchJson(json);
+    const norm = normalizeSketch(legacy);
     layers = norm.layers;
     meta = norm.meta;
     // 画布尺寸取 artboard.frame（图层坐标基准）；detail.width 是缩放后的显示尺寸
-    const ab = json?.artboard;
+    const ab = legacy?.artboard;
     if (ab?.frame) {
       canvasWidth = Math.round(Number(ab.frame.width || 0)) || canvasWidth;
       canvasHeight = Math.round(Number(ab.frame.height || 0)) || canvasHeight;

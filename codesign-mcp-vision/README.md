@@ -76,7 +76,11 @@ npm run test:doc   # 文档输出清理回归：规则去重 / 表格合并 / �
 
 `get_requirement_doc` 默认把大文档（>30KB）自动写入 `output/<分组名>_需求文档.md` 并返回**文件路径 + 每页摘要**（显式传 `outputFile:true` 恒写文件、`outputFile:false` 强制全文），避免大文档占满上下文；之后按需读文件即可。`detailLevel` 默认 `standard`，分组名不确定时直接调用，失败会返回候选列表。
 
-**断点续跑/分块**：超时或中断后，用 `pageNames: ["页面A","页面B"]` 只重跑指定页——已完成的页有缓存（DOM 未变跳过截图、VLM 结果按内容缓存），重跑秒回；未命中的页面名会在返回中以错误条目列出可用页面。宿主支持进度通知时，逐页爬取与 VLM 解析进度会以 progress 通知上报。
+**断点续跑/分块**：超时或中断后，用 `pageNames: ["页面A","页面B"]` 只重跑指定页；缓存是**段级增量**的——每个分段/内嵌图解析完成立即落盘，重跑只补缺失的段，已完成的段（甚至已完成的页）秒回，不再整组从头再来；未命中的页面名会在返回中以错误条目列出可用页面。
+
+**进度上报与宿主超时**：`get_prototype_outline` / `get_page_content` / `get_requirement_doc` / `analyze_flowchart` 四个长工具均支持 progress 通知（宿主在请求 `_meta` 里带 `progressToken` 时生效）：逐页爬取、逐段 VLM 解析实时上报，单次 VLM 调用期间（实测可达 100s+）另有 15s 心跳兜底。大多数宿主（Claude/Code 等）每收到一条进度就重置请求计时器，长任务不会再撞默认 60s 请求超时。
+
+> **MCP Inspector 注意**：v2 的 config 文件 server 条目支持 `"requestTimeout": 600000`（毫秒），web 与 TUI 模式会接到 SDK 客户端；**web 模式**另有一层后端 `/api/mcp/send` 的 60s 等待不受 progress 和该配置影响，需跑一次仓库根目录的 `node scripts/patch-inspector.mjs`（npx 缓存清理或 inspector 升级后重跑；把后端等待改为读 `MCP_SEND_WAIT_TIMEOUT_MS`，默认 1800s = 30 分钟）。**CLI 模式** v2.6.0 有 bug：config 的 requestTimeout 被解析但从未传给客户端（TUI/web 均正常），补丁脚本会一并注入环境变量接线：调用时设 `MCP_REQUEST_TIMEOUT_MS=600000` 即可。
 
 ## 命令行脚本
 

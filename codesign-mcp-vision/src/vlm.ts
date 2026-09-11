@@ -556,7 +556,12 @@ export async function analyzeSingleImage(
  */
 export async function analyzeSegmentsGlobal(
   tasks: SegmentTask[],
-  options: { concurrency?: number; onProgress?: (done: number, total: number) => void } = {}
+  options: {
+    concurrency?: number;
+    onProgress?: (done: number, total: number) => void;
+    /** 每个分段完成的即时回调（含失败结果）：上层用它逐段落盘，超时中断后已完成的段不丢 */
+    onTaskDone?: (index: number, result: VlmResult) => void;
+  } = {}
 ): Promise<VlmResult[]> {
   const concurrency = Math.max(1, options.concurrency || MAX_PARALLEL);
   const results = new Array<VlmResult>(tasks.length);
@@ -582,6 +587,7 @@ export async function analyzeSegmentsGlobal(
           _type: task.type,
         };
       }
+      options.onTaskDone?.(idx, results[idx]);
       completed++;
       options.onProgress?.(completed, tasks.length);
     }
@@ -600,7 +606,12 @@ export async function analyzeSegmentsGlobal(
 export async function analyzeSegmentsParallel(
   imagePaths: string[],
   type: PageType,
-  options: { pageText?: string; context?: string } = {}
+  options: {
+    pageText?: string;
+    context?: string;
+    onProgress?: (done: number, total: number) => void;
+    onTaskDone?: (index: number, result: VlmResult) => void;
+  } = {}
 ): Promise<VlmResult[]> {
   return analyzeSegmentsGlobal(
     imagePaths.map((imagePath, i) => ({
@@ -610,7 +621,8 @@ export async function analyzeSegmentsParallel(
       totalSegments: imagePaths.length,
       pageText: options.pageText,
       context: options.context,
-    }))
+    })),
+    { onProgress: options.onProgress, onTaskDone: options.onTaskDone }
   );
 }
 

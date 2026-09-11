@@ -44,18 +44,6 @@ function pageTextWithImages(pageData: CrawledPage): string {
   return `${pageData.text || ''}\n\n[该页面包含 ${imgs.length} 张内嵌原型图]\n${lines}`;
 }
 
-function segmentTasks(pageData: CrawledPage, type: PageType, context?: string): SegmentTask[] {
-  const segments = pageData.segments || [];
-  return segments.map((imagePath, i) => ({
-    imagePath,
-    type,
-    segmentIndex: i + 1,
-    totalSegments: segments.length,
-    pageText: pageTextWithImages(pageData),
-    context,
-  }));
-}
-
 function failedResult(pageData: CrawledPage, type: PageType, reason: string): MergedPage {
   return {
     pageName: pageData.pageName,
@@ -97,17 +85,8 @@ function finalize(
 /**
  * 内嵌图解析任务：每个内容图一个任务，type='image'（专用 prompt，只提取图内文字）。
  * 与整页分段分开排队，结果也单独收集——不能混进 vlmSegments，否则会被当成页面结构处理。
+ * （段级缓存改造后由调用方内联构造任务；此说明保留以记录两类任务不混排的设计约束。）
  */
-function imageTasks(pageData: CrawledPage, context?: string): SegmentTask[] {
-  const shots = (pageData.imageShots || []).filter((im) => im.localPath);
-  return shots.map((im, i) => ({
-    imagePath: im.localPath as string,
-    type: 'image' as PageType,
-    segmentIndex: i + 1,
-    totalSegments: shots.length,
-    context,
-  }));
-}
 
 /** 把图片解析结果归并成结构化产物；全占位且无文字的图不输出，避免噪音 */
 function toImageAnalysis(pageData: CrawledPage, results: VlmResult[]): ImageAnalysis[] {
@@ -132,15 +111,77 @@ function toImageAnalysis(pageData: CrawledPage, results: VlmResult[]): ImageAnal
 }
 
 /**
+ * 段级缓存解析：命中的段直接复用，只把缺失的段提交 VLM。
+ * 每段完成立即落盘（onTaskDone）——长分组跑一半超时/中断后，
+ * 重跑只需补缺失的段，而不是整页/整组从头再来。
+ * @returns 与 paths 等长、按原顺序对齐的解析结果
+ */
+async function analyzeSegmentsResumable(
+  url: string,
+  pageName: string,
+  paths: string[],
+  type: PageType,
+  opts: {
+    pageText?: string;
+    context?: string;
+    onProgress?: (done: number, total: number) => void;
+  } = {}
+): Promise<VlmResult[]> {
+  const segKey = (p: string): CacheKeyParams => ({
+    url,
+    pageName,
+    imagePaths: [p],
+    type,
+    vlmVersion: getVlmVersion(),
+  });
+  const filled: (VlmResult | null)[] = paths.map((p) => {
+    const c = getCache(segKey(p));
+    return c && c.length === 1 && !hasParseFailure(c) ? c[0] : null;
+  });
+  const missingIdx = paths.map((_p, i) => i).filter((i) => filled[i] === null);
+  if (!missingIdx.length) return filled as VlmResult[];
+
+  const results = await analyzeSegmentsParallel(
+    missingIdx.map((i) => paths[i]),
+    type,
+    {
+      pageText: opts.pageText,
+      context: opts.context,
+      onProgress: opts.onProgress,
+      onTaskDone: (idx, r) => {
+        const origIdx = missingIdx[idx];
+        filled[origIdx] = r;
+        // 失败的段不落盘（重试才有机会变好），与整页缓存的写入纪律一致
+        if (!hasParseFailure([r])) setCache(segKey(paths[origIdx]), [r]);
+      },
+    }
+  );
+  // onTaskDone 已填成功的段；这里兜底填失败段（含 _error），保证返回数组无空洞
+  missingIdx.forEach((origIdx, j) => {
+    if (filled[origIdx] === null) filled[origIdx] = results[j];
+  });
+  return filled as VlmResult[];
+}
+
+/**
  * 处理单个页面
  * @param pageData - crawler 产出的页面数据
  * @param url - 分享链接
- * @param options - { vlmEnabled }
+ * @param options - { vlmEnabled, onProgress }
  */
 export async function processPage(
   pageData: CrawledPage,
   url: string,
-  { vlmEnabled = true, context }: { vlmEnabled?: boolean; context?: string } = {}
+  {
+    vlmEnabled = true,
+    context,
+    onProgress,
+  }: {
+    vlmEnabled?: boolean;
+    context?: string;
+    /** VLM 解析进度（分段/内嵌图两个粒度），MCP 层转发为 progress 通知 */
+    onProgress?: (message: string) => void;
+  } = {}
 ): Promise<MergedPage> {
   if (pageData.error) return failedResult(pageData, 'page', pageData.error);
 
@@ -155,9 +196,10 @@ export async function processPage(
       if (cached) {
         vlmSegments = cached;
       } else {
-        vlmSegments = await analyzeSegmentsParallel(pageData.segments, type, {
+        vlmSegments = await analyzeSegmentsResumable(url, pageData.pageName, pageData.segments, type, {
           pageText: pageData.text,
           context,
+          onProgress: (done, total) => onProgress?.(`解析分段 ${done}/${total}`),
         });
         if (!hasParseFailure(vlmSegments)) setCache(key, vlmSegments);
       }
@@ -173,12 +215,12 @@ export async function processPage(
     const imageCached = imageKey ? getCache(imageKey) : null;
     if (imageCached) {
       imageResults = imageCached;
-    } else {
-      const imgTasks = imageTasks(pageData, context);
-      if (imgTasks.length) {
-        imageResults = await analyzeSegmentsGlobal(imgTasks);
-        if (!hasParseFailure(imageResults) && imageKey) setCache(imageKey, imageResults);
-      }
+    } else if (imgPaths.length) {
+      imageResults = await analyzeSegmentsResumable(url, pageData.pageName, imgPaths, 'image', {
+        context,
+        onProgress: (done, total) => onProgress?.(`解析内嵌图 ${done}/${total}`),
+      });
+      if (!hasParseFailure(imageResults) && imageKey) setCache(imageKey, imageResults);
     }
   }
 
@@ -198,12 +240,25 @@ interface PreparedPage {
   vlmSegments: VlmResult[] | null;
   taskStart?: number;
   taskEnd?: number;
+  /** 段级缓存：与 pageData.segments 对齐；命中的段预填，待解析段为 null */
+  segFilled?: (VlmResult | null)[];
+  /** 待解析段在 pageData.segments 中的下标（全局队列只排这些） */
+  queuedSegIdx?: number[];
   /** 内嵌图任务在全局队列中的区间（与页面分段分开记录，结果不混用） */
   imageTaskStart?: number;
   imageTaskEnd?: number;
   imageResults?: VlmResult[];
+  /** 内嵌图段级缓存：与 imageShots（有 localPath 的）对齐 */
+  imgFilled?: (VlmResult | null)[];
+  queuedImgIdx?: number[];
   /** 内嵌图独立缓存键（与页面分段缓存分开，见下方 processPages 说明） */
   imageKey?: CacheKeyParams;
+}
+
+/** 段级缓存查询：单段命中且未失败时返回结果，否则 null */
+function segCacheHit(url: string, pageName: string, path: string, type: PageType): VlmResult | null {
+  const c = getCache({ url, pageName, imagePaths: [path], type, vlmVersion: getVlmVersion() });
+  return c && c.length === 1 && !hasParseFailure(c) ? c[0] : null;
 }
 
 /**
@@ -240,37 +295,89 @@ export async function processPages(
 
     const key = pageCacheKey(pageData, url, type);
     const cached = getCache(key);
+
+    // 段级缓存：整页未命中时按段查，全局队列只排缺失的段——
+    // 长分组超时中断后，已完成段落盘过，重跑只补缺口
+    let vlmSegments = cached || null;
+    let segFilled: (VlmResult | null)[] | undefined;
+    let queuedSegIdx: number[] | undefined;
+    let allSegsCached = false;
+    if (!cached) {
+      segFilled = pageData.segments.map((p) => segCacheHit(url, pageData.pageName, p, type));
+      queuedSegIdx = pageData.segments.map((_p, i) => i).filter((i) => segFilled![i] === null);
+      if (!queuedSegIdx.length) {
+        vlmSegments = segFilled as VlmResult[];
+        allSegsCached = true;
+      }
+    }
+
+    // 内嵌图同理按张查缓存
+    let imgFilled: (VlmResult | null)[] | undefined;
+    let queuedImgIdx: number[] | undefined;
+    let imageResults = imageCached || undefined;
+    if (imageKey && !imageCached) {
+      imgFilled = imgPaths.map((p) => segCacheHit(url, pageData.pageName, p, 'image'));
+      queuedImgIdx = imgPaths.map((_p, i) => i).filter((i) => imgFilled![i] === null);
+      if (!queuedImgIdx.length) imageResults = imgFilled as VlmResult[];
+    }
+
     return {
       pageData,
       type,
       context: contextFor?.(pageData),
       key,
-      cached,
-      vlmSegments: cached || null,
+      cached: cached || (allSegsCached ? vlmSegments : null),
+      vlmSegments,
+      segFilled,
+      queuedSegIdx,
       imageKey,
-      imageResults: imageCached || undefined,
+      imageResults,
+      imgFilled,
+      queuedImgIdx,
     };
   });
 
   const tasks: SegmentTask[] = [];
+  /** 与 tasks 对齐：onTaskDone 用它定位「哪个页的哪张图」并即时落盘 */
+  const taskMeta: Array<{ item: PreparedPage; kind: 'seg' | 'img'; path: string }> = [];
   prepared.forEach((item) => {
     if (item.skipVlm || item.failed) return;
 
     // 内嵌图单独排队：即使该页没有分段截图（如表格页），内容图依然值得解析。
     // 是否排队只取决于图自己的缓存，与页面分段缓存无关。
-    if (item.imageKey && !item.imageResults?.length) {
-      const imgs = imageTasks(item.pageData, item.context);
-      if (imgs.length) {
-        item.imageTaskStart = tasks.length;
-        tasks.push(...imgs);
-        item.imageTaskEnd = tasks.length;
-      }
+    if (item.queuedImgIdx?.length) {
+      const shots = (item.pageData.imageShots || []).filter((im) => im.localPath);
+      item.imageTaskStart = tasks.length;
+      item.queuedImgIdx.forEach((origIdx) => {
+        const p = shots[origIdx].localPath as string;
+        taskMeta.push({ item, kind: 'img', path: p });
+        tasks.push({
+          imagePath: p,
+          type: 'image',
+          segmentIndex: origIdx + 1,
+          totalSegments: shots.length,
+          context: item.context,
+        });
+      });
+      item.imageTaskEnd = tasks.length;
     }
 
-    if (item.cached) return; // 分段已缓存，不再排段
-    if (item.pageData.segments?.length) {
+    if (item.cached) return; // 整页缓存或全段缓存命中，不再排段
+    if (item.queuedSegIdx?.length) {
+      const segments = item.pageData.segments!;
       item.taskStart = tasks.length;
-      tasks.push(...segmentTasks(item.pageData, item.type, item.context));
+      item.queuedSegIdx.forEach((origIdx) => {
+        const p = segments[origIdx];
+        taskMeta.push({ item, kind: 'seg', path: p });
+        tasks.push({
+          imagePath: p,
+          type: item.type,
+          segmentIndex: origIdx + 1,
+          totalSegments: segments.length,
+          pageText: pageTextWithImages(item.pageData),
+          context: item.context,
+        });
+      });
       item.taskEnd = tasks.length;
     }
   });
@@ -279,16 +386,38 @@ export async function processPages(
     const results = await analyzeSegmentsGlobal(tasks, {
       concurrency,
       onProgress: (done, total) => onProgress?.(`VLM 解析分段 ${done}/${total}`),
+      // 每段完成立即落盘：客户端超时放弃后，server 继续跑完的部分也不会白费
+      onTaskDone: (idx, r) => {
+        const meta = taskMeta[idx];
+        if (!meta || hasParseFailure([r])) return;
+        setCache(
+          {
+            url,
+            pageName: meta.item.pageData.pageName,
+            imagePaths: [meta.path],
+            type: meta.kind === 'img' ? 'image' : meta.item.type,
+            vlmVersion: getVlmVersion(),
+          },
+          [r]
+        );
+      },
     });
     prepared.forEach((item) => {
       if (item.taskStart !== undefined && item.taskEnd !== undefined) {
-        const segments = results.slice(item.taskStart, item.taskEnd);
-        item.vlmSegments = segments;
+        const queuedResults = results.slice(item.taskStart, item.taskEnd);
+        item.queuedSegIdx!.forEach((origIdx, j) => {
+          item.segFilled![origIdx] = queuedResults[j];
+        });
+        item.vlmSegments = item.segFilled as VlmResult[];
         // 失败的段落不写缓存，否则一次网络抖动会被固化，后续重试永远拿不到正确结果
-        if (!hasParseFailure(segments) && item.key) setCache(item.key, segments);
+        if (!hasParseFailure(item.vlmSegments) && item.key) setCache(item.key, item.vlmSegments);
       }
       if (item.imageTaskStart !== undefined && item.imageTaskEnd !== undefined) {
-        item.imageResults = results.slice(item.imageTaskStart, item.imageTaskEnd);
+        const queuedResults = results.slice(item.imageTaskStart, item.imageTaskEnd);
+        item.queuedImgIdx!.forEach((origIdx, j) => {
+          item.imgFilled![origIdx] = queuedResults[j];
+        });
+        item.imageResults = item.imgFilled as VlmResult[];
         // 失败的图不写缓存，否则一次网络抖动会被固化，后续重试永远拿不到正确结果
         if (!hasParseFailure(item.imageResults) && item.imageKey) {
           setCache(item.imageKey, item.imageResults);

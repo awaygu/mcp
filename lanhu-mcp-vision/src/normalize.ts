@@ -40,6 +40,184 @@ const BOOLEAN_NAME_RE = /^(subtract|union|intersect|difference)([\s_-]?\d*)?$/i;
 const subtreeSize = (n: any): number =>
   1 + (Array.isArray(n?.layers) ? n.layers.reduce((a: number, c: any) => a + subtreeSize(c), 0) : 0);
 
+// ─── 蓝湖新版插件格式（type=sketchPlugin，plVersion 3.x）→ 旧版嵌套树 ───
+// 新稿走新 Sketch 插件（DDS）上传，标注数据是扁平 info[] + parentID 指针，
+// 字段整体换血：isVisible/top/left/ddsImage/font/opacity 0~100…旧解析器一概不认识，
+// 表现为图层树空、无切图。这里把它转成旧格式树，复用 normalizeSketch 全部清洗管线。
+
+// color.a 与 value 字符串里的 alpha 不一致时删掉 a（实测 text styles[].color 的 a=0 是占位错误），
+// 让 applyAlpha 的 ?? 1 兜底、alpha 从 value 解析——两种来源都落在正确值上
+function sanitizeColor(c: any): any {
+  if (!c || typeof c !== 'object' || typeof c.value !== 'string') return c;
+  const m = /rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*([\d.]+)\s*\)/.exec(c.value);
+  if (!m) return c;
+  const fromValue = Number(m[1]);
+  const a = Number(c.a);
+  if (Number.isFinite(a) && Math.abs(a - fromValue) > 1e-3) {
+    const { a: _drop, ...rest } = c;
+    return rest;
+  }
+  return c;
+}
+
+// frame：ddsOriginFrame{x,y,width,height} 与旧格式语义一致且实测可靠；缺了再用 top/left 拼
+function pluginFrameOf(it: any): { x: number; y: number; width: number; height: number } {
+  const o = it.ddsOriginFrame;
+  if (o && Number(o.width) > 0 && Number(o.height) > 0) {
+    return { x: Math.round(Number(o.x) || 0), y: Math.round(Number(o.y) || 0), width: Math.round(Number(o.width) || 0), height: Math.round(Number(o.height) || 0) };
+  }
+  return { x: Math.round(Number(it.left ?? 0)), y: Math.round(Number(it.top ?? 0)), width: Math.round(Number(it.width ?? 0)), height: Math.round(Number(it.height ?? 0)) };
+}
+
+// 圆角：points[].cornerRadius（Sketch 点序 TL,TR,BR,BL）优先，radius 数组兜底；
+// 输出为旧格式 radiusOf 认的 {topLeft,topRight,bottomLeft,bottomRight} 形状
+function pluginCornersOf(it: any): Record<string, number> | null {
+  const seq = Array.isArray(it.points) && it.points.length
+    ? it.points.map((p: any) => Number(p?.cornerRadius ?? 0) || 0)
+    : Array.isArray(it.radius)
+      ? it.radius.map((v: any) => Number(v) || 0)
+      : null;
+  if (!seq || !seq.some(Boolean)) return null;
+  const at = (i: number) => seq[i] ?? seq[0] ?? 0;
+  return { topLeft: at(0), topRight: at(1), bottomRight: at(2), bottomLeft: at(3) };
+}
+
+// text：新格式样式集中在 layer.font{content,size,line,align,color,styles[]}；
+// 重组为旧格式的 text.style{content,color,font{size,name,lineHeight,letterSpacing,align…}}
+function pluginTextToLegacy(it: any): { value: string; style: Record<string, any> } | null {
+  const f = it.font;
+  if (!f || typeof f !== 'object') return null;
+  const fontName = String(f.font || f.displayName || '');
+  const style0 = Array.isArray(f.styles) ? f.styles[0] : null;
+  const decoration = String(style0?.decorationLine || '');
+  const vAlignMap: Record<number, string> = { 0: 'top', 1: 'middle', 2: 'bottom' };
+  const font: Record<string, any> = {
+    size: Number(f.size ?? style0?.size ?? 0) || undefined,
+    name: f.displayName || undefined,
+    postScriptName: f.font || undefined,
+    // 字重没有独立字段，从字体名推断（思源黑体 Bold → 700）；fontFamily 本身也带着后缀，双保险
+    fontWeight: /bold|heavy|black/i.test(fontName) ? 700 : undefined,
+    lineHeight: f.line != null ? { unit: 'PIXELS', value: Number(f.line) || 0 } : undefined,
+    letterSpacing: { value: Number(it.characterSpacing ?? f.kerning ?? 0) || 0 },
+    align: typeof f.align === 'string' ? f.align : undefined,
+    verticalAlignment: vAlignMap[Number(f.verticalAlignment)] || 'top',
+    italic: /italic|oblique/i.test(fontName) || undefined,
+    underline: decoration === 'underline' || undefined,
+    linethrough: decoration === 'line-through' || undefined,
+  };
+  const color = sanitizeColor(f.color) ?? sanitizeColor(style0?.color);
+  return {
+    value: String(f.content ?? style0?.content ?? ''),
+    style: { content: String(f.content ?? style0?.content ?? ''), color, font },
+  };
+}
+
+function convertPluginNode(it: any, childrenOf: Map<string, any[]>): any {
+  const node: any = {
+    id: it.id,
+    name: it.name,
+    type: it.type,
+    frame: pluginFrameOf(it),
+    visible: it.isVisible !== false,
+  };
+  // opacity 新格式 0~100 → 旧格式 0~1
+  if (typeof it.opacity === 'number') node.opacity = it.opacity / 100;
+
+  // 切图/图源：exportable 才是设计者标记的切图（新格式给所有层都生成了 hasExportDDSImage
+  // 缓存渲染图，不能当切图依据——全屏蒙版/背景都有）；bitmap 是真实位图，与旧格式一致给
+  // imageUrl 引用；exportable 但 DDS 未生成图（纯矢量编组）只保留切图标记
+  const ddsUrl = it.ddsImage?.imageUrl;
+  if (ddsUrl && (it.exportable === true || it.type === 'bitmap')) {
+    node.image = { imageUrl: ddsUrl };
+    if (it.exportable === true) node.hasExportImage = true;
+  } else if (it.exportable === true) {
+    node.hasExportImage = true;
+  } else if (it.image?.svgUrl) {
+    // symbol 实例的矢量图源（svgUrl），作为可引用图
+    node.image = it.image;
+  }
+
+  // 样式：fills/borders/shadows 结构与旧格式兼容，但挂在图层顶层，归位到 style；
+  // borders 字段名换血：thickness→width、position（中文）→lineAlignment
+  const style: Record<string, any> = {};
+  if (Array.isArray(it.fills) && it.fills.length) {
+    style.fills = it.fills
+      .filter((x: any) => x.isEnabled !== false)
+      .map((x: any) => {
+        const c = { ...x };
+        if (c.gradient?.colorStops) {
+          c.gradient = { ...c.gradient, stops: c.gradient.colorStops.map((st: any) => ({ position: st.position, color: sanitizeColor(st.color) })) };
+        }
+        c.color = sanitizeColor(c.color);
+        return c;
+      });
+  }
+  if (Array.isArray(it.borders) && it.borders.length) {
+    style.borders = it.borders
+      .filter((x: any) => x.isEnabled !== false)
+      .map((x: any) => ({
+        ...x,
+        width: x.thickness ?? x.width,
+        lineAlignment: x.position === '外边框' ? 'outside' : x.position === '内边框' ? 'inside' : 'center',
+        color: sanitizeColor(x.color),
+      }));
+  }
+  if (Array.isArray(it.shadows) && it.shadows.length) {
+    style.shadows = it.shadows.filter((x: any) => x.isEnabled !== false).map((x: any) => ({ ...x, color: sanitizeColor(x.color) }));
+  }
+  if (Object.keys(style).length) node.style = style;
+
+  const corners = pluginCornersOf(it);
+  if (corners) node.radius = corners;
+  if (it.type === 'text') {
+    const t = pluginTextToLegacy(it);
+    if (t) node.text = t;
+  }
+
+  const children = childrenOf.get(it.id);
+  if (children?.length) node.layers = children.map((c) => convertPluginNode(c, childrenOf));
+  return node;
+}
+
+/**
+ * 新版插件格式检测与转换：不是新格式（无 info 数组）或已是旧格式（有 artboard）时原样返回。
+ * 转换产物 {artboard:{name,frame,layers}} 与旧格式同形，normalizeSketch / collectSlices 直接可用。
+ */
+export function toLegacySketchJson(json: Record<string, any>): Record<string, any> {
+  if (!json || typeof json !== 'object' || json.artboard) return json;
+  const info = json.info;
+  if (!Array.isArray(info) || !info.length) return json;
+
+  const byId = new Map<any, any>();
+  for (const it of info) if (it?.id != null) byId.set(it.id, it);
+  const childrenOf = new Map<string, any[]>();
+  const roots: any[] = [];
+  for (const it of info) {
+    if (!it || typeof it !== 'object') continue;
+    if (it.parentID == null || !byId.has(it.parentID)) roots.push(it);
+    else {
+      const list = childrenOf.get(it.parentID);
+      if (list) list.push(it);
+      else childrenOf.set(it.parentID, [it]);
+    }
+  }
+  if (!roots.length) return json;
+  // 根 = 第一个孤儿（画板）；画板外的散层（罕见）挂到画板子层末尾，保 info 数组顺序 = 绘制顺序
+  const [root, ...stray] = roots;
+  if (stray.length) childrenOf.set(root.id, [...(childrenOf.get(root.id) ?? []), ...stray]);
+
+  const artboardNode = convertPluginNode(root, childrenOf);
+  const { info: _info, ...rest } = json;
+  return {
+    ...rest,
+    artboard: {
+      name: root.name,
+      frame: pluginFrameOf(root),
+      layers: artboardNode?.layers || [],
+    },
+  };
+}
+
 // alpha=1 的颜色用 #hex 表达（信息等价，rgba 形式白费约一半字节）
 const shortColor = (s: string): string => {
   const m = /^rgba\((\d+),\s*(\d+),\s*(\d+),\s*1\)$/.exec(s.trim());
@@ -207,7 +385,9 @@ export function normalizeShape(shape: Record<string, any>): DesignLayer {
 
 // 清洗：过滤无样式纯容器层（省 30-67% 体积），保留扁平数组但加 parentPath 保分组语义
 export function normalizeSketch(json: Record<string, any>): { layers: DesignLayer[]; meta: DesignMeta } {
-  const arr = findLayerArray(json) || [];
+  // 新版插件格式（sketchPlugin 扁平 info[]）先转成旧版嵌套树，后续管线全部复用
+  const legacy = toLegacySketchJson(json);
+  const arr = findLayerArray(legacy) || [];
   const layers: DesignLayer[] = [];
   let droppedCount = 0;
   let walkedCount = 0; // 全树实际遍历的图层数（含被丢弃的容器）
@@ -261,7 +441,7 @@ export function normalizeSketch(json: Record<string, any>): { layers: DesignLaye
   // ② 逐字段一致的堆叠副本（Figma 导出伪影）只留最后出现的——顶层样式才是可见样式
   let cleaned = layers;
   let outsideCanvasLayerCount = 0;
-  const frame = json?.artboard?.frame;
+  const frame = legacy?.artboard?.frame;
   const canvasW = Math.round(Number(frame?.width ?? 0));
   const canvasH = Math.round(Number(frame?.height ?? 0));
   if (canvasW > 0 && canvasH > 0) {
@@ -407,7 +587,7 @@ export function normalizeSketch(json: Record<string, any>): { layers: DesignLaye
     backupLayerCount,
     booleanOperandLayerCount,
     payloadBytes: Buffer.byteLength(JSON.stringify(cleaned)),
-    docName: json?.artboard?.name ?? json?.document?.name ?? json?.name ?? json?.title ?? undefined,
+    docName: legacy?.artboard?.name ?? legacy?.document?.name ?? legacy?.name ?? legacy?.title ?? undefined,
   };
   return { layers: cleaned, meta };
 }
