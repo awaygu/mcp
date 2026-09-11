@@ -265,12 +265,14 @@ server.registerTool(
   {
     description:
       '读取指定工作表并生成各语言的 key→文案 映射 JSON（落盘或直接返回）。' +
-      'key 列自动识别（key/文案名/中文列），语言列按表头自动识别；languages 可只导出指定语言。适合直接喂给前端 i18n 框架。',
+      'key 默认按「txt_中文首字编码+石墨行号」生成（中文缺失退化为 txt_row_行号），与 multilingual-excel-converter 脚本一致；传 keyColumn 则改用指定列的值作为 key。' +
+      '行语义：只有中文有值的行视为分组行不导出（返回 skippedGroups 计数）；其他语言列缺值时用英文兜底，但漏填事实会记录在 missing 字段（行号/中文原文/缺的语言）并附 warning，提醒操作人员补填。' +
+      '含换行的文案自动按行拆成 key_0/key_1…。语言列按表头自动识别；languages 可只导出指定语言。适合直接喂给前端 i18n 框架。',
     inputSchema: {
       url: z.string().optional().describe('石墨文档链接；不传时使用环境变量 SHIMO_URL'),
       sheet: z.string().describe('工作表名'),
       languages: z.array(z.string()).optional().describe('只要这些语言（语言码或表头名）。默认全部识别到的语言'),
-      keyColumn: z.string().optional().describe('作为 key 的列名，默认按 key/文案名/中文 顺序自动识别'),
+      keyColumn: z.string().optional().describe('显式指定作为 key 的列名。不传时默认生成 txt_中文首字编码+行号 形式的 key'),
       rows: z.array(z.number()).optional().describe('只取这些行（石墨 UI 行号）'),
       outputPath: z.string().optional().describe('传了就把每个语言写成 <lang>.json 落盘，返回路径；不传则直接返回 JSON 内容'),
       cookie: z.string().optional(),
@@ -284,21 +286,21 @@ server.registerTool(
       ...(args.languages?.length ? { languages: args.languages } : {}),
       limit: 0,
     });
-    const map = toLanguageMap(data, { ...(args.keyColumn ? { keyColumn: args.keyColumn } : {}) });
+    const { translations, warnings, skippedGroups, missing } = toLanguageMap(data, { ...(args.keyColumn ? { keyColumn: args.keyColumn } : {}) });
 
     if (args.outputPath) {
       const dir = path.resolve(args.outputPath);
       mkdirSync(dir, { recursive: true });
       const files: Array<{ lang: string; file: string; keys: number }> = [];
-      for (const [lang, kv] of Object.entries(map)) {
+      for (const [lang, kv] of Object.entries(translations)) {
         const f = path.join(dir, `${lang}.json`);
         writeFileSync(f, JSON.stringify(kv, null, 2), 'utf8');
         files.push({ lang, file: f, keys: Object.keys(kv).length });
       }
-      return { content: [{ type: 'text', text: JSON.stringify({ sheet: data.sheet, files, totalRows: data.totalRows }) }] };
+      return { content: [{ type: 'text', text: JSON.stringify({ sheet: data.sheet, files, totalRows: data.totalRows, skippedGroups, ...(missing.length ? { missing } : {}), ...(warnings.length ? { warnings } : {}) }) }] };
     }
     return {
-      content: [{ type: 'text', text: JSON.stringify({ sheet: data.sheet, totalRows: data.totalRows, truncated: data.truncated, translations: map }) }],
+      content: [{ type: 'text', text: JSON.stringify({ sheet: data.sheet, totalRows: data.totalRows, skippedGroups, ...(missing.length ? { missing } : {}), truncated: data.truncated, translations, ...(warnings.length ? { warnings } : {}) }) }],
     };
   }
 );

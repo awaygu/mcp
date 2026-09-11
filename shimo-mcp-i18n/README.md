@@ -56,7 +56,7 @@ npm run build    # esbuild 打包到 dist/index.js（单文件）
 | `shimo_read_sheet` ⭐ | 读单个工作表：表头+数据行（带 `_row` 石墨行号），自动识别语言列 | `url?` / `sheet` / `rows?` / `languages?` / `limit?` |
 | `shimo_list_sheets` | 列出全部工作表名（走 xlsx 导出通道解析，约 5~20s） | `url?` |
 | `shimo_export_xlsx` | 导出 xlsx 落盘；传 `sheet` 则从整文档抽取该单个工作表另存为独立 xlsx | `url?` / `sheet?` / `outputPath?` / `fileName?` |
-| `shimo_export_i18n` | 生成各语言 key→文案映射（直接返回或落盘 `<lang>.json`） | `url?` / `sheet` / `languages?` / `keyColumn?` / `outputPath?` |
+| `shimo_export_i18n` | 生成各语言 key→文案映射（key 默认 `txt_中文首字码+行号`，多行文案拆 `key_0/key_1…`；仅中文有值的行视为分组行跳过；其他语言缺值用英文兜底） | `url?` / `sheet` / `languages?` / `keyColumn?` / `outputPath?` |
 
 `url?` 表示可不传：未传时使用环境变量 `SHIMO_URL` 配置的默认文档链接。
 
@@ -85,6 +85,13 @@ shimo_export_i18n({
   sheet: "1v1活动",
   outputPath: "src/i18n/"       // → src/i18n/zh.json, src/i18n/en.json, …
 })
+// key 规则（默认，与 multilingual-excel-converter 脚本一致）：
+//   txt_ + 中文首字符编码 + 石墨行号，如第 5 行「登录」→ "txt_30331_5"
+//   中文缺失 → "txt_row_5"；传 keyColumn 则用该列的值作 key
+//   含换行的文案按行拆分 → "txt_30331_5_0"、"txt_30331_5_1"（空行剔除）
+// 行规则：只有中文有值的行 = 分组行（小节标题），不导出（返回 skippedGroups 计数）；
+//   其他语言列缺值时用英文值兜底（如只有中文+英文，则繁体/印尼语等列都用英文）；
+//   漏填会记入 missing 字段（行号/key/缺的语言）并附 warning，兜底只是补救、漏填仍需补填
 ```
 
 **分页纪律**：`shimo_read_sheet` 默认最多返回 200 行（`truncated:true` 表示还有更多）。
