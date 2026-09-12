@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// index.ts — shimo-mcp-i18n 入口（官方 SDK + stdio 传输）
+// index.ts — shimo-mcp 入口（官方 SDK + stdio 传输）
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -51,7 +51,7 @@ function requireGuid(url?: string): string {
 // ─── Server ─────────────────────────────────────────────────────
 
 const server = new McpServer(
-  { name: 'shimo-mcp-i18n', version: '0.1.0' },
+  { name: 'shimo-mcp', version: '0.1.0' },
   {
     instructions: [
       '石墨文档多语言翻译表读取工作流：',
@@ -316,7 +316,7 @@ async function main(): Promise<void> {
   process.on('SIGINT', async () => {
     process.exit(0);
   });
-  console.error('shimo-mcp-i18n 已启动，等待连接…');
+  console.error('shimo-mcp 已启动，等待连接…');
 }
 
 main().catch((err) => {

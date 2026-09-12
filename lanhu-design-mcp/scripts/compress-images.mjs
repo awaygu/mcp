@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // compress-images.mjs — 存量切图目录批量压到 2x（in-place 覆盖）
-// 背景：lanhu-mcp-vision 的 lanhu_download_slices 现已下载即压 2x；本脚本用于处理
+// 背景：lanhu-design-mcp 的 lanhu_download_slices 现已下载即压 2x；本脚本用于处理
 // 之前下载的 4x 存量图（蓝湖 CDN 固定返回 4x，pixel = 设计尺寸 × 4）。
 // ⚠️ 已经被压缩过的 2x 目录不要再跑（会变 1x）。
 //

@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 
 const LOGIN_URL = process.env.LANHU_LOGIN_URL || 'https://lanhuapp.com/';
 // 默认写到仓库根的 .mcp-local/lanhu.cookie（与 .mcp.json 的 LANHU_COOKIE_FILE 对齐）。
-// 基于脚本自身位置定位（本脚本在 <仓库根>/mcp/lanhu-mcp-vision/ 下，往上两级即仓库根），
+// 基于脚本自身位置定位（本脚本在 <仓库根>/mcp/lanhu-design-mcp/ 下，往上两级即仓库根），
 // 不依赖 CWD——无论从哪个目录运行（README 的 npm run login / 直接 node），都写对位置。
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const OUT = process.env.LANHU_COOKIE_OUT || join(SCRIPT_DIR, '..', '..', '.mcp-local', 'lanhu.cookie');

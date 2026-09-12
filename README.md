@@ -36,9 +36,9 @@ vision_defect_check  →  渲染结果 vs 设计稿验收（缺陷检测 / E2E �
 
 | MCP Server | 一句话 | 杀手级特性 |
 | --- | --- | --- |
-| **[lanhu-mcp-vision](./lanhu-mcp-vision/)** | 蓝湖设计稿读取 + 视觉理解/验收 | 官方 API 结构化图层树（**不靠 OCR 猜小字**）；团队→项目→分组→稿 全层级枚举；切图下载；渲染对比 / UI 缺陷检测 / E2E 失败归因 |
-| **[codesign-mcp-vision](./codesign-mcp-vision/)** | 腾讯 CoDesign 原型 → 结构化 PRD | 一个调用遍历整个需求分组：分段截图 + VLM 解析成纯文本需求文档；大文档自动落盘防撑爆上下文；两级缓存，重跑秒回 |
-| **[shimo-mcp-i18n](./shimo-mcp-i18n/)** | 石墨多语言翻译表 → i18n JSON | Cookie 直调官方 values API（零浏览器依赖）；行号/语言列增量取数；自动识别语言列；`txt_中文首字码+行号` key 规则、分组行识别、漏填预警 |
+| **[lanhu-design-mcp](./lanhu-design-mcp/)** | 蓝湖设计稿读取 + 视觉理解/验收 | 官方 API 结构化图层树（**不靠 OCR 猜小字**）；团队→项目→分组→稿 全层级枚举；切图下载；渲染对比 / UI 缺陷检测 / E2E 失败归因 |
+| **[codesign-prd-mcp](./codesign-prd-mcp/)** | 腾讯 CoDesign 原型 → 结构化 PRD | 一个调用遍历整个需求分组：分段截图 + VLM 解析成纯文本需求文档；大文档自动落盘防撑爆上下文；两级缓存，重跑秒回 |
+| **[shimo-mcp](./shimo-mcp/)** | 石墨多语言翻译表 → i18n JSON | Cookie 直调官方 values API（零浏览器依赖）；行号/语言列增量取数；自动识别语言列；`txt_中文首字码+行号` key 规则、分组行识别、漏填预警 |
 
 三者均为 **stdio MCP server**，可被任意支持 MCP 的宿主接入：Claude Code / Cursor / Trae / opencode / MCP Inspector…
 
@@ -46,7 +46,7 @@ vision_defect_check  →  渲染结果 vs 设计稿验收（缺陷检测 / E2E �
 
 ```bash
 git clone https://github.com/awaygu/mcp-design-toolbox.git
-cd mcp/shimo-mcp-i18n && npm install && npm run build
+cd mcp-design-toolbox/shimo-mcp && npm install && npm run build
 ```
 
 浏览器登录石墨 → F12 → Network → 复制任意请求的 `Cookie` 头，存进 `.mcp-local/shimo.cookie`，然后在项目根 `.mcp.json` 注册：
@@ -56,7 +56,7 @@ cd mcp/shimo-mcp-i18n && npm install && npm run build
   "mcpServers": {
     "shimo-i18n": {
       "command": "node",
-      "args": ["D:/path/to/mcp/shimo-mcp-i18n/dist/index.js"],
+      "args": ["D:/path/to/mcp/shimo-mcp/dist/index.js"],
       "env": {
         "SHIMO_COOKIE_FILE": "D:/path/to/.mcp-local/shimo.cookie",
         "SHIMO_URL": "https://shimo.im/sheets/xxx/yyy"
@@ -82,9 +82,9 @@ cd mcp/shimo-mcp-i18n && npm install && npm run build
 
 ```
 mcp/
-├── lanhu-mcp-vision/      # 蓝湖：读稿 + 视觉验收
-├── codesign-mcp-vision/   # CoDesign：原型 → PRD
-├── shimo-mcp-i18n/        # 石墨：翻译表 → i18n JSON
+├── lanhu-design-mcp/      # 蓝湖：读稿 + 视觉验收
+├── codesign-prd-mcp/   # CoDesign：原型 → PRD
+├── shimo-mcp/        # 石墨：翻译表 → i18n JSON
 └── scripts/               # 仓库级辅助脚本（Inspector 补丁等）
 ```
 

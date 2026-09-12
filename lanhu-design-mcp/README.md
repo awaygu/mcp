@@ -1,4 +1,4 @@
-# lanhu-mcp-vision
+# lanhu-design-mcp
 
 零依赖 stdio MCP server，让任意支持 MCP 的 coding Agent（Claude Code / Cursor / Trae /
 opencode）获得三件事：
@@ -60,7 +60,7 @@ node lanhu-login.mjs
   "mcpServers": {
     "lanhu-vision": {
       "command": "node",
-      "args": ["./mcp/lanhu-mcp-vision/dist/index.js"],
+      "args": ["./mcp/lanhu-design-mcp/dist/index.js"],
       "env": {
         "VLM_API_KEY": "${VLM_API_KEY}",
         "VLM_BASE_URL": "https://api.deepseek.com",
@@ -402,14 +402,14 @@ npm run build       # tsc 编译到 dist/
 ## 三种部署 / 分发方式
 
 ### 方式 A：拷贝即用（最简单，推荐给同事）
-把整个 `lanhu-mcp-vision/` 目录发给对方，对方 `npm install && npm run build` 后，
+把整个 `lanhu-design-mcp/` 目录发给对方，对方 `npm install && npm run build` 后，
 用绝对或相对路径指到 `dist/index.js` 即可。
 
 ### 方式 B：npm 全局安装 / npx
 ```bash
-npm i -g lanhu-mcp-vision     # 发布后；或本地：npm link
-lanhu-mcp-vision              # 等价于 node dist/index.js
-# 或一次性：npx -p lanhu-mcp-vision lanhu-mcp-vision
+npm i -g lanhu-design-mcp     # 发布后；或本地：npm link
+lanhu-design-mcp              # 等价于 node dist/index.js
+# 或一次性：npx -p lanhu-design-mcp lanhu-design-mcp
 ```
 
 ### 方式 C：Docker（团队统一运行时，可选）
@@ -420,7 +420,7 @@ COPY . .
 RUN npm install && npm run build
 CMD ["node", "dist/index.js"]
 ```
-构建：`docker build -t lanhu-mcp-vision .`，运行时通过 `-e VLM_API_KEY=...` 注入密钥。
+构建：`docker build -t lanhu-design-mcp .`，运行时通过 `-e VLM_API_KEY=...` 注入密钥。
 
 ## 接入各 coding Agent
 

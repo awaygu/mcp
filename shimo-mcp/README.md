@@ -1,4 +1,4 @@
-# shimo-mcp-i18n
+# shimo-mcp
 
 零浏览器依赖的 stdio MCP server：读取**石墨文档（shimo.im）多语言翻译表格**的结构化数据，
 供任意 MCP 宿主（Claude Code / Cursor / Trae / opencode）在开发流程中直接取用翻译文案。
@@ -38,7 +38,7 @@ npm run build    # esbuild 打包到 dist/index.js（单文件）
   "mcpServers": {
     "shimo-i18n": {
       "command": "node",
-      "args": ["./mcp/shimo-mcp-i18n/dist/index.js"],
+      "args": ["./mcp/shimo-mcp/dist/index.js"],
       "env": {
         "SHIMO_COOKIE_FILE": "./.mcp-local/shimo.cookie",
         "SHIMO_URL": "https://shimo.im/sheets/xxx/yyy"

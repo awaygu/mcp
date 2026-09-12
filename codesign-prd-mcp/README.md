@@ -23,7 +23,7 @@
 ## 安装与运行
 
 ```bash
-cd codesign-mcp-vision
+cd codesign-prd-mcp
 npm install            # 只装依赖，不再自动构建
 npm run build          # 编译到 dist/index.js（首次或改 src/ 后需手动执行）
 npx playwright install chromium   # 仅首次需要
@@ -47,9 +47,9 @@ npm run test:doc   # 文档输出清理回归：规则去重 / 表格合并 / �
 ```json
 {
   "mcpServers": {
-    "codesign-mcp-vision": {
+    "codesign-prd-mcp": {
       "command": "node",
-      "args": ["/path/to/codesign-mcp-vision/dist/index.js"],
+      "args": ["/path/to/codesign-prd-mcp/dist/index.js"],
       "env": {
         "VLM_API_KEY": "your-api-key",
         "VLM_BASE_URL": "https://api.openai.com/v1",
@@ -60,7 +60,7 @@ npm run test:doc   # 文档输出清理回归：规则去重 / 表格合并 / �
 }
 ```
 
-> 未构建时也可直接跑源码：把 `command` 换成 `npx tsx`、`args` 换成 `["/path/to/codesign-mcp-vision/src/index.ts"]`。
+> 未构建时也可直接跑源码：把 `command` 换成 `npx tsx`、`args` 换成 `["/path/to/codesign-prd-mcp/src/index.ts"]`。
 > `CODESIGN_URL` / `CODESIGN_PASSWORD` 写在 `env` 里后，调用工具时可不传 `url` / `password`。
 
 ## MCP 工具一览

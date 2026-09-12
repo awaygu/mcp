@@ -99,7 +99,7 @@ function errorResult(text: string): CallToolResult {
 
 const server = new McpServer(
   {
-    name: 'codesign-mcp-vision',
+    name: 'codesign-prd-mcp',
     version: packageVersion(import.meta.url, '0.2.0'),
   },
   {

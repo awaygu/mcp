@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// index.ts — lanhu-mcp-vision 入口（官方 SDK + stdio 传输）
+// index.ts — lanhu-design-mcp 入口（官方 SDK + stdio 传输）
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { registerTools } from './tools.js';
@@ -15,7 +15,7 @@ async function main(): Promise<void> {
   });
 
   const server = new McpServer({
-    name: 'lanhu-mcp-vision',
+    name: 'lanhu-design-mcp',
     version: '2.0.0',
   }, {
     // server 级工作流说明：宿主会注入 Agent 系统上下文（README 里的提示词骨架住在这里，
@@ -37,7 +37,7 @@ async function main(): Promise<void> {
 
   // 优雅关闭：收到宿主信号时释放 server/transport，避免上层报"管道断开"
   const shutdown = async (signal: string) => {
-    console.error(`收到 ${signal}，正在关闭 lanhu-mcp-vision…`);
+    console.error(`收到 ${signal}，正在关闭 lanhu-design-mcp…`);
     try { await server.close(); } catch { /* ignore */ }
     process.exit(0);
   };
@@ -45,7 +45,7 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
   process.on('SIGHUP', () => void shutdown('SIGHUP'));
 
-  console.error('lanhu-mcp-vision 已启动，等待连接…');
+  console.error('lanhu-design-mcp 已启动，等待连接…');
 }
 
 main().catch((err) => {

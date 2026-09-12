@@ -1,11 +1,11 @@
 {
-  "name": "shimo-mcp-i18n",
+  "name": "shimo-mcp",
   "version": "0.1.0",
   "description": "MCP server: 读取石墨文档多语言翻译表（Cookie 直调公开版 API），支持按工作表/行/语言取数与 xlsx 导出",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "shimo-mcp-i18n": "dist/index.js"
+    "shimo-mcp": "dist/index.js"
   },
   "files": [
     "dist",
@@ -26,6 +26,19 @@
     "i18n",
     "translation"
   ],
+  "author": {
+    "name": "awaygu",
+    "url": "https://github.com/awaygu"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/awaygu/mcp-design-toolbox.git",
+    "directory": "shimo-mcp"
+  },
+  "homepage": "https://github.com/awaygu/mcp-design-toolbox/tree/main/shimo-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/awaygu/mcp-design-toolbox/issues"
+  },
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
