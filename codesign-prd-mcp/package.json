@@ -59,5 +59,8 @@
   "bugs": {
     "url": "https://github.com/awaygu/mcp-design-toolbox/issues"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  }
 }
