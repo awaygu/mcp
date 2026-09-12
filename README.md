@@ -126,6 +126,18 @@ Cookie 是你的完整登录态，只发往对应服务的官方域名，写入�
 石墨支持 `SHIMO_BASE_URL` 指向私有部署端点；蓝湖/CoDesign 走官方云端 API。有需求欢迎提 issue。
 </details>
 
+<details>
+<summary><b>npx 启动报 404：The requested resource 'xxx@*' could not be found？</b></summary>
+
+你配置了国内 npm 镜像源（报错地址是 mirrors.xxx 而非 registry.npmjs.org），镜像同步官方源有几分钟到几小时的延迟。临时解决——在 MCP 配置的 `args` 里显式指定官方源：
+
+```json
+"args": ["-y", "--registry", "https://registry.npmjs.org", "shimo-mcp"]
+```
+
+或在 `env` 里加 `"npm_config_registry": "https://registry.npmjs.org"`。等镜像同步后可去掉。
+</details>
+
 ## 贡献
 
 欢迎 PR / issue：新增工作流 MCP（在根目录建自包含子目录，参考现有三个的结构与 README 风格）、修复、文档改进都欢迎。顺手点个 ⭐ 就是最大的鼓励！
