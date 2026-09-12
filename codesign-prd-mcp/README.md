@@ -42,14 +42,14 @@ npm run test:doc   # 文档输出清理回归：规则去重 / 表格合并 / �
 
 ## 接入 Agent（MCP 配置）
 
-在 Agent 的 MCP 配置里加上（路径换成你的实际位置）：
+**npm 包（推荐，免 clone 免构建）**：
 
 ```json
 {
   "mcpServers": {
     "codesign-prd-mcp": {
-      "command": "node",
-      "args": ["/path/to/codesign-prd-mcp/dist/index.js"],
+      "command": "npx",
+      "args": ["-y", "codesign-prd-mcp"],
       "env": {
         "VLM_API_KEY": "your-api-key",
         "VLM_BASE_URL": "https://api.openai.com/v1",
@@ -60,6 +60,25 @@ npm run test:doc   # 文档输出清理回归：规则去重 / 表格合并 / �
 }
 ```
 
+**源码方式**（参与开发时用，路径换成你的实际位置）：
+
+```json
+{
+  "mcpServers": {
+    "codesign-prd-mcp": {
+      "command": "node",
+      "args": ["/绝对路径/mcp-design-toolbox/codesign-prd-mcp/dist/index.js"],
+      "env": {
+        "VLM_API_KEY": "your-api-key",
+        "VLM_BASE_URL": "https://api.openai.com/v1",
+        "VLM_MODEL": "gpt-4o"
+      }
+    }
+  }
+}
+```
+
+> 首次使用需安装浏览器内核：`npx playwright install chromium`（爬取 Axure 原型用）。
 > 未构建时也可直接跑源码：把 `command` 换成 `npx tsx`、`args` 换成 `["/path/to/codesign-prd-mcp/src/index.ts"]`。
 > `CODESIGN_URL` / `CODESIGN_PASSWORD` 写在 `env` 里后，调用工具时可不传 `url` / `password`。
 

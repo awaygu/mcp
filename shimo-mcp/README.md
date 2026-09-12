@@ -33,15 +33,33 @@ npm run build    # esbuild 打包到 dist/index.js（单文件）
 
 ## 接入 Agent（项目根 `.mcp.json`）
 
+**npm 包（推荐，免 clone 免构建）**：
+
 ```json
 {
   "mcpServers": {
-    "shimo-i18n": {
-      "command": "node",
-      "args": ["./mcp/shimo-mcp/dist/index.js"],
+    "shimo-mcp": {
+      "command": "npx",
+      "args": ["-y", "shimo-mcp"],
       "env": {
         "SHIMO_COOKIE_FILE": "./.mcp-local/shimo.cookie",
         "SHIMO_URL": "https://shimo.im/sheets/xxx/yyy"
+      }
+    }
+  }
+}
+```
+
+**源码方式**（参与开发时用）：
+
+```json
+{
+  "mcpServers": {
+    "shimo-mcp": {
+      "command": "node",
+      "args": ["/绝对路径/mcp-design-toolbox/shimo-mcp/dist/index.js"],
+      "env": {
+        "SHIMO_COOKIE_FILE": "./.mcp-local/shimo.cookie"
       }
     }
   }

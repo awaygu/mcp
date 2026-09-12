@@ -55,16 +55,34 @@ node lanhu-login.mjs
 
 ### 3. 接入 Agent（项目根 `.mcp.json`）
 
+**npm 包（推荐，免 clone 免构建）**：
+
 ```json
 {
   "mcpServers": {
-    "lanhu-vision": {
-      "command": "node",
-      "args": ["./mcp/lanhu-design-mcp/dist/index.js"],
+    "lanhu-design-mcp": {
+      "command": "npx",
+      "args": ["-y", "lanhu-design-mcp"],
       "env": {
-        "VLM_API_KEY": "${VLM_API_KEY}",
-        "VLM_BASE_URL": "https://api.deepseek.com",
-        "VLM_MODEL": "deepseek-v4-flash-vision-exp",
+        "VLM_API_KEY": "your-api-key",
+        "VLM_BASE_URL": "https://api.openai.com/v1",
+        "LANHU_COOKIE_FILE": "./.mcp-local/lanhu.cookie"
+      }
+    }
+  }
+}
+```
+
+**源码方式**（参与开发时用）：
+
+```json
+{
+  "mcpServers": {
+    "lanhu-design-mcp": {
+      "command": "node",
+      "args": ["/绝对路径/mcp-design-toolbox/lanhu-design-mcp/dist/index.js"],
+      "env": {
+        "VLM_API_KEY": "your-api-key",
         "LANHU_COOKIE_FILE": "./.mcp-local/lanhu.cookie"
       }
     }
@@ -73,7 +91,7 @@ node lanhu-login.mjs
 ```
 
 `LANHU_COOKIE_FILE` 指向本地 cookie 文件（内容为完整 cookie 串，已 gitignore）；
-`${VLM_API_KEY}` 从 shell 环境变量展开。两者都不入库。
+`VLM_API_KEY` 也可从 shell 环境变量展开。两者都不入库。
 
 ## 工具一览
 
