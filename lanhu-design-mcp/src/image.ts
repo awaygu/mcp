@@ -1,17 +1,22 @@
 // image.ts — sharp 图片压缩：切图 4x→2x、封面→1x JPEG、视觉喂图 shrink
 import sharp from 'sharp';
 
-// 蓝湖 CDN 固定返回 4x，压到设计尺寸 2x；调色板 PNG 保 alpha，实测约 1/4 体积
-export async function compressSlicePng(buf: Buffer, designW: number, designH: number): Promise<Buffer> {
-  const targetW = designW > 0 ? Math.round(designW * 2) : undefined;
-  const targetH = designH > 0 ? Math.round(designH * 2) : undefined;
+// 调色板 PNG 重编码（保 alpha，实测约 1/4 体积）；targetW/H 缺省时只重编码不改尺寸
+export async function palettePng(buf: Buffer, targetW?: number, targetH?: number): Promise<Buffer> {
   let pipeline = sharp(buf);
-  if (targetW && targetH) {
+  if (targetW && targetH && targetW > 0 && targetH > 0) {
     pipeline = pipeline.resize(targetW, targetH, {
       fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 },
     });
   }
   return pipeline.png({ palette: true, compressionLevel: 9, quality: 90 }).toBuffer();
+}
+
+// 蓝湖 CDN 固定返回 4x，压到设计尺寸 2x
+export async function compressSlicePng(buf: Buffer, designW: number, designH: number): Promise<Buffer> {
+  const targetW = designW > 0 ? Math.round(designW * 2) : undefined;
+  const targetH = designH > 0 ? Math.round(designH * 2) : undefined;
+  return palettePng(buf, targetW, targetH);
 }
 
 // 封面压到设计稿 1x 喂视觉模型；viewport 缺失时按最长边 1024 兜底

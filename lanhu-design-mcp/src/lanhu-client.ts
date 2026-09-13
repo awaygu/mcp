@@ -5,7 +5,9 @@ import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { normalizeSketch, toLegacySketchJson } from './normalize.js';
-import { compressSlicePng, coverTo1xJpeg } from './image.js';
+import { compressSlicePng, coverTo1xJpeg, palettePng } from './image.js';
+import { AssetGuardError, buildScaleUrls, fetchAssetBytes, inspectAsset } from './asset-guard.js';
+import type { AssetMeta } from './asset-guard.js';
 import type { Credentials, DesignLayer, DesignMeta, DesignResult, SectorInfo, SliceInfo } from './types.js';
 
 const LANHU_API_BASE = 'https://lanhuapp.com';
@@ -473,14 +475,24 @@ export async function downloadSlices(
     sector?: string;
     sliceNames?: string[];
     skipExisting?: boolean;
+    scale?: '1x' | '2x' | '3x' | 'original';   // 落盘倍率，默认 2x
+    withScaleUrls?: boolean;                    // 结果附带全平台倍率 URL（1x/2x/3x/iOS/Android）
   }
 ): Promise<{
   scope: string;          // 单稿=稿名，分组=分组名
   outputDir: string;
   downloaded: number;
   skipped: { dup: number; exist: number };
-  failed: Array<{ name: string; url: string; status: number }>;
-  slices: Array<{ name: string; file: string; bytes: number; w: number; h: number; x: number; y: number }>;
+  failed: Array<{ name: string; url: string; status: number; reason?: string }>;
+  slices: Array<{
+    name: string; file: string; bytes: number; w: number; h: number; x: number; y: number;
+    scale: string;          // 落盘倍率
+    format: string;         // 字节级验证出的真实格式
+    pixelW: number; pixelH: number;  // 落盘文件实际像素
+    sha256: string;         // 落盘内容哈希（缓存对账用）
+    sourceScale?: number;   // CDN 源图实测倍率（源像素/设计尺寸，警惕"2x 不一定是 2x"）
+    scaleUrls?: Record<string, string>;
+  }>;
   designErrors?: string[]; // 分组模式下读取失败的稿（尽力而为：其余稿照常下载）
 }> {
   const skipExist = opts.skipExisting !== false; // 默认 true
@@ -550,9 +562,12 @@ export async function downloadSlices(
     pending.push({ ...s, imageUrl: src });
   }
 
-  const out: Array<{ name: string; file: string; bytes: number; w: number; h: number; x: number; y: number }> = [];
-  const failed: Array<{ name: string; url: string; status: number }> = [];
+  const out: Array<{ name: string; file: string; bytes: number; w: number; h: number; x: number; y: number; scale: string; format: string; pixelW: number; pixelH: number; sha256: string; sourceScale?: number; scaleUrls?: Record<string, string> }> = [];
+  const failed: Array<{ name: string; url: string; status: number; reason?: string }> = [];
   let existCount = 0;
+
+  const scale = opts.scale || '2x';
+  const scaleNum = scale === 'original' ? 0 : Number(scale.replace('x', '')); // 1|2|3
 
   // 并发池（默认 6）：串行每张图 RTT 叠加太严重，分组内切图多时会慢到不可用
   const concurrency = Number(process.env.LANHU_SLICE_CONCURRENCY) || 6;
@@ -564,33 +579,66 @@ export async function downloadSlices(
       const src = s.imageUrl;
       const cleanName = String(s.name).replace(/[/\\:*?"<>|]/g, '_').replace(/\s+/g, '_');
       const hash = shortHash(src);
-      const fileName = `${cleanName}_${hash}.png`;
-      const filePath = path.join(dir, fileName);
+      // 全平台倍率 URL：original/2x 走原图直出；1x/3x 拼 OSS resize 参数在线出图，省 4x 全量下载的流量
+      const scaleUrls = buildScaleUrls(src, s.w, s.h);
+      const downloadUrl = scale === '1x' || scale === '3x' ? scaleUrls[scale] : src;
+      const suffix = scale === '2x' ? '' : `@${scale}`;
+      // 落盘目标像素：2x/1x/3x 按倍率构造；original 以验真实测为准
+      const expectW = scaleNum ? Math.round(s.w * scaleNum) : 0;
+      const expectH = scaleNum ? Math.round(s.h * scaleNum) : 0;
 
-      // skipExisting：本地已存在就跳过
-      if (skipExist && existsSync(filePath)) {
+      // 预测落盘文件名：2x/1x/3x 最终必为 PNG（OSS format,png / sharp 调色板重编码），
+      // 存在性检查可先于下载；original 的真实格式要验真后才知道，检查挪到验真之后
+      const predictedPath = scale === 'original' ? null : path.join(dir, `${cleanName}_${hash}${suffix}.png`);
+      if (predictedPath && skipExist && existsSync(predictedPath)) {
         existCount++;
-        out[idx] = { name: s.name, file: filePath, bytes: 0, w: s.w, h: s.h, x: s.x, y: s.y };
+        out[idx] = { name: s.name, file: predictedPath, bytes: 0, w: s.w, h: s.h, x: s.x, y: s.y, scale, format: 'png', pixelW: expectW, pixelH: expectH, sha256: '' };
         continue;
       }
 
-      let res: Response;
+      // 下载（host 白名单/重定向逐跳校验/大小上限/瞬态重试）+ 字节级验真
+      let buf: Buffer;
+      let meta: AssetMeta;
       try {
-        res = await fetch(src, { headers: { Referer: 'https://lanhuapp.com/' } });
-      } catch {
-        failed.push({ name: s.name, url: src, status: 0 });
+        const res = await fetchAssetBytes(downloadUrl, { cookie: opts.cookie });
+        meta = await inspectAsset(res.bytes);
+        buf = res.bytes;
+      } catch (e) {
+        const code = e instanceof AssetGuardError ? e.code : 'download_failed';
+        const m = /^http_(\d+)$/.exec(code);
+        failed.push({ name: s.name, url: src, status: m ? Number(m[1]) : 0, reason: code });
         continue;
       }
-      if (!res.ok) {
-        failed.push({ name: s.name, url: src, status: res.status });
+
+      const finalExt = meta.format === 'jpeg' ? 'jpg' : meta.format;
+      const filePath = predictedPath ? predictedPath : path.join(dir, `${cleanName}_${hash}${suffix}.${finalExt}`);
+      // 验真后扩展名与预测不一致（original 且非 png）→ 用真实名字重查存在性
+      if (filePath !== predictedPath && skipExist && existsSync(filePath)) {
+        existCount++;
+        out[idx] = { name: s.name, file: filePath, bytes: 0, w: s.w, h: s.h, x: s.x, y: s.y, scale, format: meta.format, pixelW: meta.width || 0, pixelH: meta.height || 0, sha256: meta.sha256 };
         continue;
       }
-      const buf = Buffer.from(await res.arrayBuffer());
-      // CDN 切图固定 4x（实测 pixel = design frame × 4）：压到设计尺寸的 2x 落盘
+
+      // 落盘：original 保原字节不压缩；2x 下载 4x 原图本地压（兼容旧路径）；1x/3x OSS 已出目标尺寸，本地只做调色板重编码
       let final: Buffer = buf;
-      try { final = await compressSlicePng(buf, s.w, s.h); } catch { final = buf; }
+      try {
+        if (scale === '2x') final = await compressSlicePng(buf, s.w, s.h);
+        else if (scale === '1x' || scale === '3x') final = await palettePng(buf, expectW, expectH);
+      } catch { final = buf; }
       writeFileSync(filePath, final);
-      out[idx] = { name: s.name, file: filePath, bytes: final.length, w: s.w, h: s.h, x: s.x, y: s.y };
+
+      // 源图实测倍率：声明只是声明，真实像素/设计尺寸才是事实（"2x 不一定是 2x"）
+      const sourceScale = s.w > 0 && meta.width ? Math.round((meta.width / s.w) * 10) / 10 : undefined;
+      out[idx] = {
+        name: s.name, file: filePath, bytes: final.length, w: s.w, h: s.h, x: s.x, y: s.y,
+        scale,
+        format: scale === 'original' ? meta.format : 'png',
+        pixelW: scale === 'original' ? (meta.width || 0) : expectW,
+        pixelH: scale === 'original' ? (meta.height || 0) : expectH,
+        sha256: createHash('sha256').update(final).digest('hex'),
+        ...(sourceScale !== undefined ? { sourceScale } : {}),
+        ...(opts.withScaleUrls ? { scaleUrls } : {}),
+      };
     }
   };
   const workers = Array.from(

@@ -102,7 +102,7 @@ node lanhu-login.mjs
 | `lanhu_list_teams` | 列出账号加入的全部团队（多团队发现入口） | `cookie` |
 | `lanhu_list_directory` | 一次拉团队目录（项目→分组）。约 1.6k tokens | `url?`(提 tid) / `teamId?` / `cookie` |
 | `lanhu_read_sector` | 按分组名列出稿目录（稿名/尺寸/层数，不含图层树——全量会撑爆上下文） | `url`(链接/UUID) / `sector` / `cookie` |
-| `lanhu_download_slices` | 下载切图到本地目录（单稿或分组批量，三层去重，并发下载，下载即压 2x） | `url` / `outputPath` / `sector?` / `sliceNames?` / `skipExisting?` |
+| `lanhu_download_slices` | 下载切图到本地目录（单稿或分组批量，三层去重，并发下载，默认落盘 2x；`scale` 可选 1x/3x/original）。host 白名单 + 重定向逐跳校验 + 字节级验真（HTML 伪装/格式/实际像素），验真不过不落盘。`withScaleUrls` 可附带全平台倍率 URL（1x/2x/3x/iOS/Android，OSS 在线出图） | `url` / `outputPath` / `sector?` / `sliceNames?` / `skipExisting?` / `scale?` / `withScaleUrls?` |
 | `lanhu_verify_spec` | **设计稿验收**：图层树期望值 ↔ 页面计算样式，逐字段 diff 出偏差清单 | `designUrl` / `pageUrl` / `waitFor?` / `maxDiffs?` |
 | `lanhu_verify_render` | 渲染页 vs 设计稿 语义对比（主观线索，不作验收结论；不传 designImagePath 时退化为单图一致性检查） | `actualImagePath` / `designImagePath?` / `context?`(已知刻意差异，跳过不报)；base64 兜底 |
 | `vision_defect_check` | 整页/局部 UI 缺陷检测（12 类缺陷枚举） | `imagePath` / `context?` / `language?`；base64 兜底 |
@@ -379,6 +379,7 @@ vision_e2e_triage({ screenshotPath: "失败截图.png", domSnapshot: "<DOM>", er
 | `LANHU_VISION_TIMEOUT_MS` | 否 | `120000` | 单次视觉模型请求超时（毫秒） |
 | `VISION_USE_V1` | 否 | — | 设为 `0` 时端点用文档原生的 `/chat/completions`，默认 `/v1/chat/completions` |
 | `LANHU_SLICE_CONCURRENCY` | 否 | `6` | 切图下载并发数（分组批量下载时生效） |
+| `LANHU_ALLOWED_ASSET_HOSTS` | 否 | — | 切图资源主机白名单的追加项（逗号分隔）。默认只放行 `lanhuapp.com`/`*.lanhuapp.com` 与 `aliyuncs.com`/`*.aliyuncs.com`，白名单外主机一律拒绝下载 |
 | `LANHU_MIN_VISIBLE_FRACTION` | 否 | `0.25` | 出画窄条剔除阈值：可见面积占比低于它的矩形被剔除，设 `0` 关闭该规则 |
 | `LANHU_PRUNE_FRAGMENTS` | 否 | `1` | 设 `0` 关闭碎片装饰带剔除（同容器一排首尾相接的微小矢量段） |
 | `LANHU_COOKIE` | 官方 api 模式必填（与 `LANHU_COOKIE_FILE` 二选一） | — | 蓝湖登录 Cookie 串（F12 复制） |
