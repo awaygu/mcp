@@ -311,8 +311,9 @@ export function registerTools(server: McpServer): void {
     {
       description:
         '下载蓝湖设计稿切图到本地目录。两种范围（二选一）：传 url 下单稿切图；传 sector + url(项目UUID或该分组任一稿链接) 下整个分组所有稿的切图（跨稿公共 icon 只下一次）。三层去重：URL 去重（同图只下一次，默认开）、skipExisting（本地已存在则跳过，默认开）、sliceNames（只下指定名字的切图）。' +
+        '倍率由蓝湖 OSS 在线出图（x-oss-process），下载到的字节原样落盘、本地不做二次处理：scale 默认 2x（设计尺寸×2），original=CDN 存储原图（实测 4x）。' +
         '安全与校验：下载走 host 白名单 + 重定向逐跳校验；每个文件下载后做字节级验真（HTML 伪装/格式/实际像素），验真不过不落盘并记入 failed.reason。' +
-        'scale 控制落盘倍率（默认 2x=设计尺寸两倍；original=CDN 原图，实测约 4x）；withScaleUrls=true 时结果附带每个切图的全平台倍率 URL（1x/2x/3x/iOS/Android，OSS 在线出图，可直接按需自取）。返回下载明细（含真实格式/像素/sha256/源图实测倍率）、跳过统计、失败列表。',
+        'withScaleUrls=true 时结果附带每个切图的全平台倍率 URL（1x/2x/3x/iOS/Android 密度），需要其它倍率时不必重新调用。返回下载明细（含验真后的真实格式/像素/sha256）、跳过统计、失败列表。',
       inputSchema: {
         url: z.string().describe('设计稿 URL（含 image_id）或纯 image_id；分组模式传项目 UUID 或该分组任一稿链接'),
         outputPath: z.string().describe('本地输出目录，如 src/assets/activity-xxx/'),
@@ -320,7 +321,7 @@ export function registerTools(server: McpServer): void {
         sector: z.string().optional().describe('分组名或分组 id：传了就下载该分组所有稿的切图（跨稿合并去重）'),
         sliceNames: z.array(z.string()).optional().describe('只下载指定名字的切图（同名不同 URL 都下，因为它们是不同的图）'),
         skipExisting: z.boolean().optional().describe('本地已存在同名文件则跳过，默认 true（避免重下公共 icon）'),
-        scale: z.enum(['1x', '2x', '3x', 'original']).optional().describe('落盘倍率，默认 2x（设计尺寸×2）。original=CDN 原图不压缩（实测 4x，供 iOS @3x/高清素材场景）'),
+        scale: z.enum(['1x', '2x', '3x', 'original']).optional().describe('落盘倍率，默认 2x（设计尺寸×2，OSS 在线出图）。original=CDN 存储原图（实测 4x，供 iOS @3x/高清素材场景）'),
         withScaleUrls: z.boolean().optional().describe('结果附带每个切图的全平台倍率下载 URL（1x/2x/3x/iOS/Android 密度），需要其它倍率时不必重新调用'),
         cookie: z.string().optional(),
       },

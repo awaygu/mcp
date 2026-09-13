@@ -5,7 +5,7 @@ import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { normalizeSketch, toLegacySketchJson } from './normalize.js';
-import { compressSlicePng, coverTo1xJpeg, palettePng } from './image.js';
+import { coverTo1xJpeg } from './image.js';
 import { AssetGuardError, buildScaleUrls, fetchAssetBytes, inspectAsset } from './asset-guard.js';
 import type { AssetMeta } from './asset-guard.js';
 import type { Credentials, DesignLayer, DesignMeta, DesignResult, SectorInfo, SliceInfo } from './types.js';
@@ -488,9 +488,8 @@ export async function downloadSlices(
     name: string; file: string; bytes: number; w: number; h: number; x: number; y: number;
     scale: string;          // 落盘倍率
     format: string;         // 字节级验证出的真实格式
-    pixelW: number; pixelH: number;  // 落盘文件实际像素
+    pixelW: number; pixelH: number;  // 落盘文件实际像素（验真实测）
     sha256: string;         // 落盘内容哈希（缓存对账用）
-    sourceScale?: number;   // CDN 源图实测倍率（源像素/设计尺寸，警惕"2x 不一定是 2x"）
     scaleUrls?: Record<string, string>;
   }>;
   designErrors?: string[]; // 分组模式下读取失败的稿（尽力而为：其余稿照常下载）
@@ -581,7 +580,8 @@ export async function downloadSlices(
       const hash = shortHash(src);
       // 全平台倍率 URL：original/2x 走原图直出；1x/3x 拼 OSS resize 参数在线出图，省 4x 全量下载的流量
       const scaleUrls = buildScaleUrls(src, s.w, s.h);
-      const downloadUrl = scale === '1x' || scale === '3x' ? scaleUrls[scale] : src;
+      // 下载即最终字节：倍率交给 OSS 在线出图（original 直取原图），本地不做二次压缩
+      const downloadUrl = scale === 'original' ? scaleUrls.original : scaleUrls[scale] || src;
       const suffix = scale === '2x' ? '' : `@${scale}`;
       // 落盘目标像素：2x/1x/3x 按倍率构造；original 以验真实测为准
       const expectW = scaleNum ? Math.round(s.w * scaleNum) : 0;
@@ -619,24 +619,15 @@ export async function downloadSlices(
         continue;
       }
 
-      // 落盘：original 保原字节不压缩；2x 下载 4x 原图本地压（兼容旧路径）；1x/3x OSS 已出目标尺寸，本地只做调色板重编码
-      let final: Buffer = buf;
-      try {
-        if (scale === '2x') final = await compressSlicePng(buf, s.w, s.h);
-        else if (scale === '1x' || scale === '3x') final = await palettePng(buf, expectW, expectH);
-      } catch { final = buf; }
-      writeFileSync(filePath, final);
-
-      // 源图实测倍率：声明只是声明，真实像素/设计尺寸才是事实（"2x 不一定是 2x"）
-      const sourceScale = s.w > 0 && meta.width ? Math.round((meta.width / s.w) * 10) / 10 : undefined;
+      // 下载到的字节就是最终文件，原样落盘（不重编码、不缩放）
+      writeFileSync(filePath, buf);
       out[idx] = {
-        name: s.name, file: filePath, bytes: final.length, w: s.w, h: s.h, x: s.x, y: s.y,
+        name: s.name, file: filePath, bytes: buf.length, w: s.w, h: s.h, x: s.x, y: s.y,
         scale,
-        format: scale === 'original' ? meta.format : 'png',
-        pixelW: scale === 'original' ? (meta.width || 0) : expectW,
-        pixelH: scale === 'original' ? (meta.height || 0) : expectH,
-        sha256: createHash('sha256').update(final).digest('hex'),
-        ...(sourceScale !== undefined ? { sourceScale } : {}),
+        format: meta.format,
+        pixelW: meta.width || 0,
+        pixelH: meta.height || 0,
+        sha256: meta.sha256,
         ...(opts.withScaleUrls ? { scaleUrls } : {}),
       };
     }

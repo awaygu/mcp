@@ -102,7 +102,7 @@ node lanhu-login.mjs
 | `lanhu_list_teams` | 列出账号加入的全部团队（多团队发现入口） | `cookie` |
 | `lanhu_list_directory` | 一次拉团队目录（项目→分组）。约 1.6k tokens | `url?`(提 tid) / `teamId?` / `cookie` |
 | `lanhu_read_sector` | 按分组名列出稿目录（稿名/尺寸/层数，不含图层树——全量会撑爆上下文） | `url`(链接/UUID) / `sector` / `cookie` |
-| `lanhu_download_slices` | 下载切图到本地目录（单稿或分组批量，三层去重，并发下载，默认落盘 2x；`scale` 可选 1x/3x/original）。host 白名单 + 重定向逐跳校验 + 字节级验真（HTML 伪装/格式/实际像素），验真不过不落盘。`withScaleUrls` 可附带全平台倍率 URL（1x/2x/3x/iOS/Android，OSS 在线出图） | `url` / `outputPath` / `sector?` / `sliceNames?` / `skipExisting?` / `scale?` / `withScaleUrls?` |
+| `lanhu_download_slices` | 下载切图到本地目录（单稿或分组批量，三层去重，并发下载）。倍率由蓝湖 OSS 在线出图（`scale` 可选 1x/2x/3x/original），下载字节原样落盘、本地零二次处理。host 白名单 + 重定向逐跳校验 + 字节级验真（HTML 伪装/格式/实际像素），验真不过不落盘。`withScaleUrls` 可附带全平台倍率 URL | `url` / `outputPath` / `sector?` / `sliceNames?` / `skipExisting?` / `scale?` / `withScaleUrls?` |
 | `lanhu_verify_spec` | **设计稿验收**：图层树期望值 ↔ 页面计算样式，逐字段 diff 出偏差清单 | `designUrl` / `pageUrl` / `waitFor?` / `maxDiffs?` |
 | `lanhu_verify_render` | 渲染页 vs 设计稿 语义对比（主观线索，不作验收结论；不传 designImagePath 时退化为单图一致性检查） | `actualImagePath` / `designImagePath?` / `context?`(已知刻意差异，跳过不报)；base64 兜底 |
 | `vision_defect_check` | 整页/局部 UI 缺陷检测（12 类缺陷枚举） | `imagePath` / `context?` / `language?`；base64 兜底 |
